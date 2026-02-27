@@ -187,7 +187,24 @@ export async function handleTelegramWebhookRequest(
   if (webhookSecret !== undefined) {
     const providedSecret = request.headers["x-telegram-bot-api-secret-token"];
     if (providedSecret !== webhookSecret) {
-      console.log("[stavrobot] Telegram webhook rejected: invalid or missing secret token.");
+      const debug = process.env.STAVROBOT_DEBUG === "1";
+      let reason = "unknown";
+      if (providedSecret === undefined) {
+        reason = "missing_header";
+      } else if (Array.isArray(providedSecret)) {
+        reason = "multiple_header_values";
+      } else if (typeof providedSecret !== "string") {
+        reason = "non_string_header";
+      } else {
+        reason = "wrong_secret";
+      }
+      console.log(`[stavrobot] Telegram webhook rejected: ${reason}`);
+      if (debug) {
+        const expectedFingerprint = webhookSecret.slice(0, 8);
+        const providedFingerprint = typeof providedSecret === "string" ? providedSecret.slice(0, 8) : String(providedSecret);
+        console.log(`[stavrobot] [debug] Secret mismatch: expected=${expectedFingerprint}..., provided=${providedFingerprint}...`);
+        console.log(`[stavrobot] [debug] Request metadata: remoteAddress=${request.socket?.remoteAddress}, x-forwarded-for=${request.headers["x-forwarded-for"]}, user-agent=${request.headers["user-agent"]}, content-length=${request.headers["content-length"]}`);
+      }
       response.writeHead(403, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: "Forbidden" }));
       return;
@@ -395,6 +412,9 @@ async function main(): Promise<void> {
       throw new Error("Config must specify publicHostname when telegram is configured.");
     }
     telegramWebhookSecret = await registerTelegramWebhook(config.telegram, config.publicHostname);
+    if (process.env.STAVROBOT_DEBUG === "1") {
+      console.log(`[stavrobot] [debug] Telegram webhook secret loaded: fingerprint=${telegramWebhookSecret.slice(0, 8)}..., bootTime=${new Date().toISOString()}`);
+    }
   }
 
   const server = http.createServer((request: http.IncomingMessage, response: http.ServerResponse): void => {

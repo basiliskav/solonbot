@@ -994,8 +994,15 @@ export function filterToolsForSubagent(tools: AgentTool[], allowedTools: string[
         ...tool,
         execute: async (toolCallId, params, signal, onUpdate) => {
           const action = (params as Record<string, unknown>)["action"];
-          if (typeof action === "string" && !allowedActions.has(action)) {
-            const list = [...allowedActions].sort().join(", ");
+          const list = [...allowedActions].sort().join(", ");
+          if (typeof action !== "string") {
+            const errorMessage = `Tool "${toolName}" requires an action parameter because it is scoped to specific actions. Allowed actions: ${list}.`;
+            return {
+              content: [{ type: "text" as const, text: errorMessage }],
+              details: { message: errorMessage },
+            };
+          }
+          if (!allowedActions.has(action)) {
             const errorMessage = `Action "${action}" is not allowed on tool "${toolName}". Allowed actions: ${list}.`;
             return {
               content: [{ type: "text" as const, text: errorMessage }],

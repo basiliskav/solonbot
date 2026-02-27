@@ -259,13 +259,28 @@ describe("filterToolsForSubagent", () => {
     expect(included).toBe(tool);
   });
 
-  it("passes through calls with no action param without error", async () => {
+  it("rejects calls with no action param when tool is action-scoped", async () => {
     const tool = makeTool("some_tool");
     const result = filterToolsForSubagent([tool], ["some_tool.list"]);
     const wrapped = result.find((t) => t.name === "some_tool");
-    // No action field in params: should delegate to original execute.
-    await wrapped!.execute("id1", { query: "SELECT 1" });
-    expect(tool.execute).toHaveBeenCalled();
+    // No action field in params: should be rejected, not delegated.
+    const response = await wrapped!.execute("id1", { query: "SELECT 1" }) as AgentToolResult<{ message: string }>;
+    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("requires an action parameter") });
+    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("some_tool") });
+    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("list") });
+    expect(tool.execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects calls with action: undefined when tool is action-scoped", async () => {
+    const tool = makeTool("some_tool");
+    const result = filterToolsForSubagent([tool], ["some_tool.list"]);
+    const wrapped = result.find((t) => t.name === "some_tool");
+    // Explicit action: undefined should also be rejected.
+    const response = await wrapped!.execute("id1", { action: undefined }) as AgentToolResult<{ message: string }>;
+    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("requires an action parameter") });
+    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("some_tool") });
+    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("list") });
+    expect(tool.execute).not.toHaveBeenCalled();
   });
 
   it("returns empty list (except send_agent_message) when allowed list is empty", () => {

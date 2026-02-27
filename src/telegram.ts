@@ -143,8 +143,10 @@ function isTelegramMessage(value: unknown): value is TelegramMessage {
 }
 
 export async function registerTelegramWebhook(config: TelegramConfig, publicHostname: string): Promise<string> {
+  const debug = process.env.STAVROBOT_DEBUG === "1";
   const webhookUrl = `${publicHostname}/telegram/webhook`;
   const secret = randomUUID();
+  const secretFingerprint = secret.slice(0, 8);
   console.log("[stavrobot] Registering Telegram webhook:", webhookUrl);
 
   const response = await fetch(
@@ -163,6 +165,32 @@ export async function registerTelegramWebhook(config: TelegramConfig, publicHost
   }
 
   console.log("[stavrobot] Telegram webhook registered successfully.");
+
+  if (debug) {
+    console.log(`[stavrobot] [debug] setWebhook: url=${webhookUrl}, secret=${secretFingerprint}..., status=${response.status}`);
+
+    // Verify the webhook state Telegram actually stored.
+    const infoResponse = await fetch(
+      `https://api.telegram.org/bot${config.botToken}/getWebhookInfo`
+    );
+    const info = await infoResponse.json() as {
+      ok: boolean;
+      result?: {
+        url?: string;
+        has_custom_certificate?: boolean;
+        pending_update_count?: number;
+        last_error_date?: number;
+        last_error_message?: string;
+      };
+    };
+    if (info.ok && info.result !== undefined) {
+      const r = info.result;
+      console.log(`[stavrobot] [debug] getWebhookInfo: url=${r.url}, pending=${r.pending_update_count}, lastError=${r.last_error_message ?? "none"}, customCert=${r.has_custom_certificate}`);
+    } else {
+      console.log("[stavrobot] [debug] getWebhookInfo: failed or empty result");
+    }
+  }
+
   return secret;
 }
 
@@ -220,6 +248,11 @@ export async function handleTelegramWebhook(
 
   const message = rawMessage;
   const chatId = message.chat.id;
+
+  if (process.env.STAVROBOT_DEBUG === "1") {
+    const updateType = message.voice || message.audio ? "voice" : message.photo ? "photo" : message.document ? "document" : message.text ? "text" : "unknown";
+    console.log(`[stavrobot] [debug] Webhook accepted: chatId=${chatId}, type=${updateType}`);
+  }
 
   if (!config.allowedChatIds.includes(chatId)) {
     console.log("[stavrobot] Telegram message from disallowed chat ID:", chatId);
