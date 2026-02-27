@@ -51,7 +51,7 @@ class RequestCounter:
 
 def load_config() -> dict:
     """Load and parse the TOML configuration file."""
-    config_path = "/app/config.toml"
+    config_path = "/app/config/config.toml"
     with open(config_path, "rb") as file:
         config = tomllib.load(file)
     return config
@@ -243,7 +243,6 @@ def send_signal_message_with_attachment(
 
 
 def make_send_handler(
-    allowed_numbers: list[str],
     request_counter: RequestCounter,
 ) -> type[http.server.BaseHTTPRequestHandler]:
     """Return a request handler class closed over the given state."""
@@ -272,10 +271,6 @@ def make_send_handler(
 
             if not isinstance(recipient, str) or not recipient:
                 self.send_error_response(400, "Missing or invalid recipient")
-                return
-
-            if recipient not in allowed_numbers:
-                self.send_error_response(403, "Recipient not in allowed numbers")
                 return
 
             attachment_b64 = body.get("attachment")
@@ -418,11 +413,10 @@ def make_send_handler(
 
 
 def start_http_server(
-    allowed_numbers: list[str],
     request_counter: RequestCounter,
 ) -> None:
     """Start the HTTP server on port 8081 in a background daemon thread."""
-    handler_class = make_send_handler(allowed_numbers, request_counter)
+    handler_class = make_send_handler(request_counter)
     server = http.server.HTTPServer(("0.0.0.0", 8081), handler_class)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -450,7 +444,6 @@ def parse_sse_event(lines: list[str]) -> dict | None:
 
 def process_signal_event(
     event_data: dict,
-    allowed_numbers: list[str],
     request_counter: RequestCounter,
 ) -> None:
     """Process a Signal receive event and handle the message."""
@@ -462,10 +455,6 @@ def process_signal_event(
 
     if not data_message:
         log(f"No dataMessage in envelope, skipping (source={source_number})")
-        return
-
-    if source_number not in allowed_numbers:
-        log(f"Ignoring message from unauthorized number: {source_number}")
         return
 
     message_text: str | None = data_message.get("message")
@@ -574,7 +563,6 @@ def process_signal_event(
 
 
 def listen_to_sse_stream(
-    allowed_numbers: list[str],
     request_counter: RequestCounter,
 ) -> None:
     """Connect to signal-cli SSE stream and process incoming messages."""
@@ -600,7 +588,7 @@ def listen_to_sse_stream(
             if event_lines:
                 event_data = parse_sse_event(event_lines)
                 if event_data:
-                    process_signal_event(event_data, allowed_numbers, request_counter)
+                    process_signal_event(event_data, request_counter)
                 event_lines = []
         else:
             event_lines.append(line)
@@ -617,33 +605,20 @@ def main() -> None:
         log("Error: [signal] section must be a table in config.toml")
         sys.exit(1)
     account = signal_config.get("account")
-    allowed_numbers = signal_config.get("allowedNumbers", [])
 
-    if not isinstance(account, str):
-        log("Error: account must be a string in [signal] section")
+    if not isinstance(account, str) or not account:
+        log("Error: account must be a non-empty string in [signal] section")
         sys.exit(1)
-
-    if not isinstance(allowed_numbers, list) or not all(isinstance(number, str) for number in allowed_numbers):
-        log("Error: allowedNumbers must be a list of strings in [signal] section")
-        sys.exit(1)
-
-    if not account:
-        log("Error: No account configured in [signal] section")
-        sys.exit(1)
-
-    if not allowed_numbers:
-        log("Warning: No allowed numbers configured, will ignore all messages")
 
     log(f"Account: {account}")
-    log(f"Allowed numbers: {allowed_numbers}")
 
     signal_cli_process = start_signal_cli(account)
     request_counter = RequestCounter()
 
     try:
         wait_for_signal_cli_ready()
-        start_http_server(allowed_numbers, request_counter)
-        listen_to_sse_stream(allowed_numbers, request_counter)
+        start_http_server(request_counter)
+        listen_to_sse_stream(request_counter)
     except KeyboardInterrupt:
         log("Received interrupt, shutting down...")
     except Exception as error:

@@ -22,15 +22,20 @@ vi.mock("./database.js", () => ({
   resolveInterlocutor: vi.fn(),
   loadAgent: vi.fn().mockResolvedValue(null),
 }));
+vi.mock("./allowlist.js", () => ({
+  isInAllowlist: vi.fn().mockReturnValue(false),
+}));
 
 import { handlePrompt } from "./agent.js";
 import { getMainAgentId, isOwnerIdentity, resolveInterlocutor } from "./database.js";
+import { isInAllowlist } from "./allowlist.js";
 import { initializeQueue, enqueueMessage } from "./queue.js";
 
 const mockHandlePrompt = vi.mocked(handlePrompt);
 const mockGetMainAgentId = vi.mocked(getMainAgentId);
 const mockIsOwnerIdentity = vi.mocked(isOwnerIdentity);
 const mockResolveInterlocutor = vi.mocked(resolveInterlocutor);
+const mockIsInAllowlist = vi.mocked(isInAllowlist);
 
 // Minimal stubs — the queue only passes these through to handlePrompt, which is mocked.
 const stubAgent = {} as unknown as Agent;
@@ -41,6 +46,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockGetMainAgentId.mockReturnValue(1);
   mockIsOwnerIdentity.mockReturnValue(false);
+  mockIsInAllowlist.mockReturnValue(false);
   mockHandlePrompt.mockResolvedValue("");
   initializeQueue(stubAgent, stubPool, stubConfig);
 });
@@ -143,6 +149,7 @@ describe("message routing", () => {
   });
 
   it("resolves non-owner messages via the interlocutor_identities table", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
     mockResolveInterlocutor.mockResolvedValue({
       interlocutorId: 42,
       identityId: 10,
@@ -162,7 +169,18 @@ describe("message routing", () => {
     expect(routingArg.senderIdentityId).toBe(10);
   });
 
+  it("drops messages from senders not in the allowlist", async () => {
+    // isInAllowlist already returns false from beforeEach.
+    const result = await enqueueMessage("hi", "signal", "+0000000000");
+
+    expect(result).toBe("");
+    expect(mockHandlePrompt).not.toHaveBeenCalled();
+    // The message must be dropped before the DB lookup.
+    expect(mockResolveInterlocutor).not.toHaveBeenCalled();
+  });
+
   it("drops messages from unknown interlocutors and resolves with empty string", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
     mockResolveInterlocutor.mockResolvedValue(null);
 
     const result = await enqueueMessage("hi", "signal", "+0000000000");

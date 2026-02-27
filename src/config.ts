@@ -43,12 +43,12 @@ export interface CoderConfig {
 
 export interface SignalConfig {
   account: string;
-  allowedNumbers: string[];
+  allowedNumbers?: string[];
 }
 
 export interface TelegramConfig {
   botToken: string;
-  allowedChatIds: number[];
+  allowedChatIds?: number[];
 }
 
 export interface OwnerConfig {
@@ -76,16 +76,6 @@ export interface Config {
   signal?: SignalConfig;
   telegram?: TelegramConfig;
   owner: OwnerConfig;
-}
-
-export function isInAllowlist(config: Config, service: string, identifier: string): boolean {
-  if (service === "signal") {
-    return config.signal?.allowedNumbers.includes(identifier) ?? false;
-  }
-  if (service === "telegram") {
-    return config.telegram?.allowedChatIds.includes(Number(identifier)) ?? false;
-  }
-  return false;
 }
 
 export function loadConfig(): Config {

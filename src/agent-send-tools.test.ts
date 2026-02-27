@@ -9,7 +9,14 @@ vi.mock("./database.js", () => ({
   resolveInterlocutorByName: vi.fn(),
 }));
 
+// Mock the allowlist module so tests can control which identifiers are allowed
+// without touching the filesystem or module-level state.
+vi.mock("./allowlist.js", () => ({
+  isInAllowlist: vi.fn(),
+}));
+
 import { resolveRecipient, resolveInterlocutorByName } from "./database.js";
+import { isInAllowlist } from "./allowlist.js";
 
 function makeText(result: { content: Array<{ type: string; text?: string }> }): string {
   const block = result.content[0];
@@ -28,8 +35,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     baseSystemPrompt: "You are a bot.",
     baseAgentPrompt: "You are a bot.",
     owner: { name: "Owner" },
-    signal: { account: "+1111111111", allowedNumbers: ["+1234567890"] },
-    telegram: { botToken: "test-token", allowedChatIds: [99999] },
+    signal: { account: "+1111111111" },
+    telegram: { botToken: "test-token" },
     ...overrides,
   } as Config;
 }
@@ -67,8 +74,9 @@ describe("isInAllowlist (via send tools)", () => {
   it("send_signal_message rejects when recipient is not in allowlist", async () => {
     vi.mocked(resolveRecipient).mockResolvedValue(null);
     vi.mocked(resolveInterlocutorByName).mockResolvedValue(null);
+    vi.mocked(isInAllowlist).mockReturnValue(false);
     const pool = makeIdentityFoundPool("+9999999999");
-    const config = makeConfig({ signal: { account: "+1111111111", allowedNumbers: ["+1234567890"] } });
+    const config = makeConfig({ signal: { account: "+1111111111" } });
     const tool = createSendSignalMessageTool(pool, config);
     const result = await tool.execute("call-1", { recipient: "+9999999999", message: "hello" });
     expect(makeText(result)).toContain("not in the Signal allowlist");
@@ -77,8 +85,9 @@ describe("isInAllowlist (via send tools)", () => {
   it("send_telegram_message rejects when recipient is not in allowlist", async () => {
     vi.mocked(resolveRecipient).mockResolvedValue(null);
     vi.mocked(resolveInterlocutorByName).mockResolvedValue(null);
+    vi.mocked(isInAllowlist).mockReturnValue(false);
     const pool = makeIdentityFoundPool("11111");
-    const config = makeConfig({ telegram: { botToken: "tok", allowedChatIds: [99999] } });
+    const config = makeConfig({ telegram: { botToken: "tok" } });
     const tool = createSendTelegramMessageTool(pool, config);
     const result = await tool.execute("call-1", { recipient: "11111", message: "hello" });
     expect(makeText(result)).toContain("not in the Telegram allowlist");
@@ -120,8 +129,9 @@ describe("send_signal_message — recipient resolution", () => {
 
   it("rejects when display name resolves but resolved identifier is not in allowlist", async () => {
     vi.mocked(resolveRecipient).mockResolvedValue({ identifier: "+9999999999" });
+    vi.mocked(isInAllowlist).mockReturnValue(false);
     const pool = makeEmptyPool();
-    const config = makeConfig({ signal: { account: "+1111111111", allowedNumbers: ["+1234567890"] } });
+    const config = makeConfig({ signal: { account: "+1111111111" } });
     const tool = createSendSignalMessageTool(pool, config);
     const result = await tool.execute("call-1", { recipient: "Mom", message: "hello" });
     expect(makeText(result)).toContain("not in the Signal allowlist");
@@ -129,6 +139,7 @@ describe("send_signal_message — recipient resolution", () => {
 
   it("rejects when signal config is missing (no allowlist)", async () => {
     vi.mocked(resolveRecipient).mockResolvedValue({ identifier: "+1234567890" });
+    vi.mocked(isInAllowlist).mockReturnValue(false);
     const pool = makeEmptyPool();
     const config = makeConfig({ signal: undefined });
     const tool = createSendSignalMessageTool(pool, config);
@@ -204,8 +215,9 @@ describe("send_telegram_message — recipient resolution", () => {
 
   it("rejects when display name resolves but resolved identifier is not in allowlist", async () => {
     vi.mocked(resolveRecipient).mockResolvedValue({ identifier: "11111" });
+    vi.mocked(isInAllowlist).mockReturnValue(false);
     const pool = makeEmptyPool();
-    const config = makeConfig({ telegram: { botToken: "tok", allowedChatIds: [99999] } });
+    const config = makeConfig({ telegram: { botToken: "tok" } });
     const tool = createSendTelegramMessageTool(pool, config);
     const result = await tool.execute("call-1", { recipient: "Mom", message: "hello" });
     expect(makeText(result)).toContain("not in the Telegram allowlist");
@@ -259,6 +271,7 @@ describe("send_signal_message — rate limiting", () => {
 
   beforeEach(() => {
     vi.mocked(resolveRecipient).mockResolvedValue({ identifier: "+1234567890" });
+    vi.mocked(isInAllowlist).mockReturnValue(true);
   });
 
   afterEach(() => {

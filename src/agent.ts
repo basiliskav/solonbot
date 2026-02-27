@@ -4,7 +4,7 @@ import pg from "pg";
 import { Type, getModel, type TextContent, type ImageContent, type AssistantMessage, type ToolCall, complete } from "@mariozechner/pi-ai";
 import { Agent, type AgentTool, type AgentToolResult, type AgentMessage } from "@mariozechner/pi-agent-core";
 import type { Config, TtsConfig } from "./config.js";
-import { isInAllowlist } from "./config.js";
+import { isInAllowlist } from "./allowlist.js";
 import type { FileAttachment } from "./uploads.js";
 import { transcribeAudio } from "./stt.js";
 import { getApiKey } from "./auth.js";
@@ -415,8 +415,8 @@ export function createSendSignalMessageTool(pool: pg.Pool, config: Config): Agen
         recipient = recipientInput;
       }
 
-      // Hard gate: recipient must be in the config allowlist.
-      if (!isInAllowlist(config, "signal", recipient)) {
+      // Hard gate: recipient must be in the allowlist.
+      if (!isInAllowlist("signal", recipient)) {
         const errorMessage = `Error: recipient '${recipient}' is not in the Signal allowlist.`;
         console.warn("[stavrobot] send_signal_message rejected:", errorMessage);
         return {
@@ -603,8 +603,8 @@ export function createSendTelegramMessageTool(pool: pg.Pool, config: Config): Ag
         recipient = recipientInput;
       }
 
-      // Hard gate: recipient must be in the config allowlist.
-      if (!isInAllowlist(config, "telegram", recipient)) {
+      // Hard gate: recipient must be in the allowlist.
+      if (!isInAllowlist("telegram", recipient)) {
         const errorMessage = `Error: recipient '${recipient}' is not in the Telegram allowlist.`;
         console.warn("[stavrobot] send_telegram_message rejected:", errorMessage);
         return {

@@ -126,7 +126,6 @@ describe("checkBasicAuth", () => {
 describe("handleTelegramWebhookRequest secret verification", () => {
   const telegramConfig: TelegramConfig = {
     botToken: "test-token",
-    allowedChatIds: [123],
   };
   const webhookSecret = "test-secret-uuid";
 

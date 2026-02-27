@@ -2,7 +2,8 @@ import http from "http";
 import { fileURLToPath } from "url";
 import type { Pool } from "pg";
 import { loadConfig } from "./config.js";
-import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath } from "./database.js";
+import { loadAllowlist, isInAllowlist } from "./allowlist.js";
+import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath, isOwnerIdentity } from "./database.js";
 import { createAgent } from "./agent.js";
 import { initializeQueue, enqueueMessage } from "./queue.js";
 import { initializeScheduler } from "./scheduler.js";
@@ -27,6 +28,12 @@ import {
   handlePluginRemoveRequest,
   handlePluginConfigureRequest,
 } from "./plugins.js";
+import {
+  serveSettingsHubPage,
+  serveAllowlistPage,
+  handleGetAllowlistRequest,
+  handlePutAllowlistRequest,
+} from "./settings.js";
 
 function isPublicRoute(method: string, pathname: string): boolean {
   if (method === "POST" && pathname === "/telegram/webhook") {
@@ -106,6 +113,22 @@ async function handleChatRequest(
       }
     }
 
+    const source = "source" in parsedBody && typeof parsedBody.source === "string" ? parsedBody.source : undefined;
+    const sender = "sender" in parsedBody && typeof parsedBody.sender === "string" ? parsedBody.sender : undefined;
+
+    // Reject non-allowlisted external senders before doing any file I/O. We return 200
+    // rather than 403 to avoid signalling to the rejected sender that they are blocked.
+    // When source or sender is absent the request comes from an authenticated API caller
+    // (HTTP basic auth), so the allowlist check does not apply.
+    if (source !== undefined && sender !== undefined) {
+      if (!isOwnerIdentity(source, sender) && !isInAllowlist(source, sender)) {
+        console.log(`[stavrobot] Dropping message from sender not in allowlist: source=${source}, sender=${sender}`);
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ response: null }));
+        return;
+      }
+    }
+
     // Parse raw file data sent by external callers (e.g. the Signal bridge) that
     // cannot write to the app container's filesystem directly.
     interface RawFileEntry {
@@ -148,8 +171,6 @@ async function handleChatRequest(
       return;
     }
 
-    const source = "source" in parsedBody && typeof parsedBody.source === "string" ? parsedBody.source : undefined;
-    const sender = "sender" in parsedBody && typeof parsedBody.sender === "string" ? parsedBody.sender : undefined;
     const audioContentType = "audioContentType" in parsedBody && typeof parsedBody.audioContentType === "string" ? parsedBody.audioContentType : undefined;
 
     console.log("[stavrobot] Incoming request:", { message, source, sender, hasAudio: audio !== undefined, audioContentType, attachmentCount: combinedAttachments?.length ?? 0 });
@@ -393,6 +414,7 @@ async function handlePageRequest(
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  loadAllowlist(config);
   const pool = await connectDatabase();
   await initializeSchema(pool);
   await initializeMemoriesSchema(pool);
@@ -459,23 +481,34 @@ async function main(): Promise<void> {
         response.end(JSON.stringify({ error: "Not found" }));
       }
     } else if (request.method === "GET" && pathname === "/plugins") {
+      response.writeHead(302, { "Location": "/settings/plugins" });
+      response.end();
+    } else if (request.method === "GET" && pathname === "/settings/plugins") {
       servePluginsPage(response);
-    } else if (request.method === "GET" && pathname === "/api/plugins/list") {
+    } else if (request.method === "GET" && pathname === "/api/settings/plugins/list") {
       void handlePluginsListRequest(response);
-    } else if (request.method === "GET" && pathname.startsWith("/api/plugins/") && pathname.endsWith("/detail")) {
-      const name = decodeURIComponent(pathname.slice("/api/plugins/".length, -"/detail".length));
+    } else if (request.method === "GET" && pathname.startsWith("/api/settings/plugins/") && pathname.endsWith("/detail")) {
+      const name = decodeURIComponent(pathname.slice("/api/settings/plugins/".length, -"/detail".length));
       void handlePluginDetailRequest(response, name);
-    } else if (request.method === "GET" && pathname.startsWith("/api/plugins/") && pathname.endsWith("/config")) {
-      const name = decodeURIComponent(pathname.slice("/api/plugins/".length, -"/config".length));
+    } else if (request.method === "GET" && pathname.startsWith("/api/settings/plugins/") && pathname.endsWith("/config")) {
+      const name = decodeURIComponent(pathname.slice("/api/settings/plugins/".length, -"/config".length));
       void handlePluginConfigRequest(response, name, config.password);
-    } else if (request.method === "POST" && pathname === "/api/plugins/install") {
+    } else if (request.method === "POST" && pathname === "/api/settings/plugins/install") {
       void handlePluginInstallRequest(request, response);
-    } else if (request.method === "POST" && pathname === "/api/plugins/update") {
+    } else if (request.method === "POST" && pathname === "/api/settings/plugins/update") {
       void handlePluginUpdateRequest(request, response);
-    } else if (request.method === "POST" && pathname === "/api/plugins/remove") {
+    } else if (request.method === "POST" && pathname === "/api/settings/plugins/remove") {
       void handlePluginRemoveRequest(request, response);
-    } else if (request.method === "POST" && pathname === "/api/plugins/configure") {
+    } else if (request.method === "POST" && pathname === "/api/settings/plugins/configure") {
       void handlePluginConfigureRequest(request, response);
+    } else if (request.method === "GET" && pathname === "/settings/allowlist") {
+      serveAllowlistPage(response);
+    } else if (request.method === "GET" && pathname === "/settings") {
+      serveSettingsHubPage(response);
+    } else if (request.method === "GET" && pathname === "/api/settings/allowlist") {
+      handleGetAllowlistRequest(response, config);
+    } else if (request.method === "PUT" && pathname === "/api/settings/allowlist") {
+      void handlePutAllowlistRequest(request, response, config);
     } else if (request.method === "GET" && pathname.startsWith("/api/pages/") && pathname.includes("/queries/")) {
       void handlePageQueryRequest(request, response, pathname, config.password, pool, url);
     } else if (request.method === "GET" && pathname.startsWith("/pages/")) {

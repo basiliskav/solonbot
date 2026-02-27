@@ -35,18 +35,19 @@ name = "Stavros"
 # telegram = "123456789"
 
 # Signal integration. account is the phone number registered with signal-cli.
-# allowedNumbers is the allowlist of numbers permitted to message the agent.
+# The allowlist of numbers permitted to message the agent is managed via the
+# /settings web UI and stored in allowlist.json (not in this file).
 [signal]
 account = "+1234567890"
-allowedNumbers = ["+1234567890"]
 
 # Telegram integration. Create a bot via @BotFather on Telegram to get a token.
 # To find your chat ID, message @userinfobot on Telegram.
 # The webhook is registered at <publicHostname>/telegram/webhook on startup.
 # publicHostname (top-level) must be set when using Telegram.
+# The allowlist of chat IDs permitted to message the agent is managed via the
+# /settings web UI and stored in allowlist.json (not in this file).
 [telegram]
 botToken = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-allowedChatIds = [123456789]
 
 # Text-to-speech configuration. Used by the text_to_speech tool.
 [tts]

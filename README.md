@@ -19,6 +19,7 @@ A personal AI assistant with persistent memory, sandboxed code execution, and Si
 - **Web search and fetch.** Optional tools for searching the web and fetching/analyzing URLs via sub-agent LLM calls.
 - **Database explorer.** A web UI at `/explorer` for browsing PostgreSQL tables, viewing schemas, and paginating through rows.
 - **Plugin manager.** A web UI at `/plugins` for browsing installed plugins, installing new ones from git URLs, updating, deleting, and editing plugin configuration.
+- **Settings.** A web UI at `/settings` for managing Signal and Telegram allowlists.
 - **Apps.** The agent can create dynamic web apps. Apps are private (auth-required) by default, with an option to make individual pages public.
 - **Conversation compaction.** Auto-summarizes long conversation histories to stay within context limits.
 
@@ -49,15 +50,17 @@ Signal requires a **separate phone number** — not your personal one. A prepaid
 3. Exec into the signal-bridge container: `docker compose exec signal-bridge bash`
 4. Register: `signal-cli -u +YOUR_NUMBER register`
 5. Verify with the code you receive: `signal-cli -u +YOUR_NUMBER verify CODE`
-6. Set `[signal].account` and `[signal].allowedNumbers` in your config.
-7. See the [signal-cli quickstart](https://github.com/AsamK/signal-cli/wiki/Quickstart) for details.
+6. Set `[signal].account` in your config.
+7. After first startup, add allowed numbers via the `/settings` web UI.
+8. See the [signal-cli quickstart](https://github.com/AsamK/signal-cli/wiki/Quickstart) for details.
 
 ### Telegram setup
 
 1. Message @BotFather on Telegram, create a new bot, and copy the token.
 2. Message @userinfobot on Telegram to get your chat ID.
-3. Set `[telegram].botToken`, `[telegram].webhookHost`, and `[telegram].allowedChatIds` in your config.
-4. The webhook is registered automatically when the app starts.
+3. Set `[telegram].botToken` in your config.
+4. After first startup, add allowed chat IDs via the `/settings` web UI.
+5. The webhook is registered automatically when the app starts.
 
 ### Running
 
@@ -125,10 +128,10 @@ your main chat. When the task is done, it disables the contact and reports back 
 
 To keep things safe, messaging is controlled by two layers:
 
-**Config allowlist (you control this).** You decide who the bot is allowed to contact by
-adding phone numbers or chat IDs to `allowedNumbers` (Signal) or `allowedChatIds`
-(Telegram) in `config.toml`. The bot cannot modify this list or message anyone not on
-it, no matter what.
+**Allowlist (you control this).** You decide who the bot is allowed to contact by adding
+phone numbers or chat IDs via the `/settings` web UI. The list is stored in
+`allowlist.json` and is not accessible to the LLM agent. The bot cannot modify this list
+or message anyone not on it, no matter what.
 
 **Contact records (the bot controls these).** Within the people you've approved, the bot
 manages its own contact list in the database. It creates a contact when it needs to talk
@@ -136,8 +139,8 @@ to someone, and disables it when the conversation is done. A disabled contact bl
 messaging in both directions, so the bot can't accidentally keep chatting with someone
 after a task is finished. Re-enabling a contact later picks up where things left off.
 
-A typical flow looks like this: you add your friend's phone number to the config
-allowlist once, then tell the bot "find a time for dinner with Alex next week". The bot
+A typical flow looks like this: you add your friend's phone number to the allowlist via
+`/settings` once, then tell the bot "find a time for dinner with Alex next week". The bot
 creates a contact record for Alex, spins up a subagent, messages Alex on Signal, goes
 back and forth to find a date, and reports the result to you.
 

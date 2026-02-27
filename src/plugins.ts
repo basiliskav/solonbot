@@ -386,7 +386,7 @@ const PLUGINS_PAGE_HTML = `<!DOCTYPE html>
       const listEl = document.getElementById("plugin-list");
       listEl.innerHTML = '<div id="loading">Loading plugins...</div>';
 
-      const listResponse = await fetch("/api/plugins/list");
+      const listResponse = await fetch("/api/settings/plugins/list");
       const listData = await listResponse.json();
       const plugins = listData.plugins || [];
 
@@ -398,8 +398,8 @@ const PLUGINS_PAGE_HTML = `<!DOCTYPE html>
       // Fetch detail and config for all plugins in parallel.
       const pluginData = await Promise.all(plugins.map(async (plugin) => {
         const [detailResponse, configResponse] = await Promise.all([
-          fetch(\`/api/plugins/\${encodeURIComponent(plugin.name)}/detail\`),
-          fetch(\`/api/plugins/\${encodeURIComponent(plugin.name)}/config\`),
+          fetch(\`/api/settings/plugins/\${encodeURIComponent(plugin.name)}/detail\`),
+          fetch(\`/api/settings/plugins/\${encodeURIComponent(plugin.name)}/config\`),
         ]);
         const detail = await detailResponse.json();
         const config = await configResponse.json();
@@ -519,7 +519,7 @@ const PLUGINS_PAGE_HTML = `<!DOCTYPE html>
       msgEl.textContent = "";
       msgEl.className = "";
 
-      const response = await fetch("/api/plugins/install", {
+      const response = await fetch("/api/settings/plugins/install", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -542,7 +542,7 @@ const PLUGINS_PAGE_HTML = `<!DOCTYPE html>
 
     async function updatePlugin(name) {
       showCardMessage(name, "Updating...", false);
-      const response = await fetch("/api/plugins/update", {
+      const response = await fetch("/api/settings/plugins/update", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
@@ -559,7 +559,7 @@ const PLUGINS_PAGE_HTML = `<!DOCTYPE html>
     async function deletePlugin(name) {
       if (!window.confirm("Delete plugin \\"" + name + "\\"? This cannot be undone.")) return;
       showCardMessage(name, "Deleting...", false);
-      const response = await fetch("/api/plugins/remove", {
+      const response = await fetch("/api/settings/plugins/remove", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
@@ -580,7 +580,7 @@ const PLUGINS_PAGE_HTML = `<!DOCTYPE html>
         config[input.dataset.key] = input.value;
       }
       showCardMessage(name, "Saving...", false);
-      const response = await fetch("/api/plugins/configure", {
+      const response = await fetch("/api/settings/plugins/configure", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, config }),

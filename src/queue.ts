@@ -3,6 +3,7 @@ import type { Agent } from "@mariozechner/pi-agent-core";
 import type { Config } from "./config.js";
 import { handlePrompt } from "./agent.js";
 import { AuthError } from "./auth.js";
+import { isInAllowlist } from "./allowlist.js";
 import { sendSignalMessage } from "./signal.js";
 import { sendTelegramMessage } from "./telegram-api.js";
 import type { FileAttachment } from "./uploads.js";
@@ -133,6 +134,13 @@ async function resolveTargetAgent(
       senderLabel: "owner",
       isMainAgent: true,
     };
+  }
+
+  // Hard gate: sender must be in the allowlist. Owner messages bypass this
+  // check above, and internal sources are handled earlier in this function.
+  if (!isInAllowlist(source, sender)) {
+    console.log(`[stavrobot] Dropping message from sender not in allowlist: source=${source}, sender=${sender}`);
+    return null;
   }
 
   // Look up the sender in the interlocutor_identities table (soft gate).

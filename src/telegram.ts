@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Marked, type RendererObject, type Tokens } from "marked";
 import type { TelegramConfig } from "./config.js";
+import { isInAllowlist } from "./allowlist.js";
 import { enqueueMessage } from "./queue.js";
 import { saveAttachment, type FileAttachment } from "./uploads.js";
 
@@ -254,7 +255,7 @@ export async function handleTelegramWebhook(
     console.log(`[stavrobot] [debug] Webhook accepted: chatId=${chatId}, type=${updateType}`);
   }
 
-  if (!config.allowedChatIds.includes(chatId)) {
+  if (!isInAllowlist("telegram", String(chatId))) {
     console.log("[stavrobot] Telegram message from disallowed chat ID:", chatId);
     return;
   }

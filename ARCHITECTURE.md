@@ -62,7 +62,7 @@ A Python script that bridges Signal messages to the agent. Only starts when the 
 - **Inbound:** Receives Signal messages via SSE, forwards them to `app:3001/chat` with `source: "signal"`.
 - **Outbound:** Exposes `POST /send` on port 8081 for the app's `send_signal_message` tool to call. Converts markdown to Signal text styles. Supports text and file attachments.
 
-Mounts: `./data/main/config.toml:/app/config.toml:ro`, `./data/signal-cli:/root/.local/share/signal-cli`.
+Mounts: `./data/main:/app/config:ro`, `./data/signal-cli:/root/.local/share/signal-cli`. The bridge reads `config.toml` from `/app/config/config.toml`.
 
 ### pg-backup
 
@@ -307,7 +307,7 @@ Subagents only see the tools in their `allowed_tools` whitelist plus `send_agent
 
 Action-based tools (`manage_knowledge`, `manage_cron`, `manage_files`, `manage_pages`, `manage_uploads`, `manage_plugins`) support a `help` action that returns detailed documentation.
 
-Send tools (`send_signal_message`, `send_telegram_message`) resolve display names to channel identifiers via the `interlocutors` and `interlocutor_identities` tables. Both the soft gate (interlocutor must exist in the DB) and the hard gate (identifier must be in the config allowlist) are enforced on outbound sends.
+Send tools (`send_signal_message`, `send_telegram_message`) resolve display names to channel identifiers via the `interlocutors` and `interlocutor_identities` tables. Both the soft gate (interlocutor must exist in the DB) and the hard gate (identifier must be in the allowlist) are enforced on outbound sends.
 
 ## Conversation compaction
 
@@ -405,18 +405,18 @@ The LLM agent can write config via `configure_plugin` but can never read config 
 - Plugin names are validated against `[a-z0-9-]+` to prevent path traversal, shell injection, and username derivation issues.
 - Page queries are validated as read-only SQL (must start with SELECT or WITH, no multi-statement injection).
 - Upload file paths are validated to be within the uploads directory.
-- Telegram chat IDs and Signal phone numbers are checked against allowlists.
+- Telegram chat IDs and Signal phone numbers are checked against the allowlist in `allowlist.json`.
 
 ### Two-layer access control for interlocutors
 
 Inbound and outbound messages to non-owner interlocutors are subject to two independent gates:
 
-- **Hard gate (config allowlist):** The `[signal].allowedNumbers` and `[telegram].allowedChatIds` lists in `config.toml`. This is the safety boundary the bot cannot override — it is only changed by editing the config file and restarting.
+- **Hard gate (allowlist):** The allowlist of permitted Signal phone numbers and Telegram chat IDs, managed via the `/settings` web UI and stored in `allowlist.json` (path overridable via `ALLOWLIST_PATH` env var). Loaded and managed by `src/allowlist.ts`. This is the safety boundary the bot cannot override — the LLM agent has no access to this file. The owner's identities are auto-seeded from the `[owner]` config section on startup.
 - **Soft gate (interlocutor_identities table):** The bot-managed directory of known senders. The bot can add or remove entries via `manage_interlocutors`, but only within the hard gate boundary. The soft gate resolves to an `agent_id` via the interlocutor's `agent_id` column. If no agent is assigned, the message is dropped.
 
 Both gates apply in both directions:
-- **Inbound:** A message must first pass the config allowlist (enforced by the signal-bridge and Telegram webhook handler), then match an entry in `interlocutor_identities`. If either check fails, the message is dropped silently.
-- **Outbound:** When a send tool resolves a recipient, the resolved identifier must be in `interlocutor_identities` and in the config allowlist. If either check fails, the tool returns an error.
+- **Inbound:** A message must first pass the allowlist (enforced by the app's message queue and Telegram webhook handler), then match an entry in `interlocutor_identities`. If either check fails, the message is dropped silently.
+- **Outbound:** When a send tool resolves a recipient, the resolved identifier must be in `interlocutor_identities` and in the allowlist. If either check fails, the tool returns an error.
 
 ### Owner identity
 
@@ -460,15 +460,16 @@ Defines the owner's identity. Used on startup to upsert the owner interlocutor r
 - `[webSearch]` — Web search sub-agent.
 - `[webFetch]` — Web fetch sub-agent.
 - `[coder]` — Self-programming agent (Claude Code model alias).
-- `[telegram]` — Telegram bot integration.
-- `[signal]` — Signal integration (read by signal-bridge, not the app).
+- `[telegram]` — Telegram bot integration. The allowlist is in `allowlist.json`, not here.
+- `[signal]` — Signal integration (read by signal-bridge, not the app). The allowlist is in `allowlist.json`, not here.
 
 ## File structure
 
 ```
 src/
   index.ts              — HTTP server, routing, entry point. Two servers: external (3000) and internal (3001).
-  config.ts             — Loads config.toml and Postgres config from environment. Defines OwnerConfig, isInAllowlist.
+  config.ts             — Loads config.toml and Postgres config from environment. Defines Config, OwnerConfig, and service config interfaces.
+  allowlist.ts          — Loads, validates, and persists the allowlist from allowlist.json (path overridable via ALLOWLIST_PATH env var). Provides isInAllowlist() and getOwnerIdentities(). Migrates legacy config.toml allowlist fields on first run.
   database.ts           — PostgreSQL connection, schema initialization, CRUD for all tables. Owns agent and owner seeding, interlocutor and agent resolution.
   agent.ts              — Agent creation, tool definitions, prompt handling, compaction.
   queue.ts              — Sequential message processing queue with retry logic and agent routing.
@@ -490,7 +491,12 @@ src/
   pages.ts              — Agent tool for page management.
   uploads.ts            — File upload handling and storage.
   upload-tools.ts       — Agent tool for upload management.
+  files.ts              — Agent tool for ephemeral temp-directory file management (read/write/list/delete).
+  search.ts             — Agent tool for full-text search across the database.
+  toon.ts               — Serialises structured data to TOON format for LLM-readable output.
+  temp-dir.ts           — Shared constant for the ephemeral temp directory path.
   explorer.ts           — Database explorer web UI and API.
+  settings.ts           — Settings web UI and allowlist management API endpoints (/settings, /api/settings/allowlist).
 
 plugin-runner/
   src/index.ts      — Plugin runner server (manages, executes plugins).
