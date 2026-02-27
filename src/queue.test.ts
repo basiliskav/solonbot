@@ -205,6 +205,19 @@ describe("message routing", () => {
     expect(mockResolveInterlocutor).not.toHaveBeenCalled();
   });
 
+  it("routes non-gated external sources to the main agent without allowlist or interlocutor checks", async () => {
+    // isInAllowlist returns false from beforeEach, but pendant should bypass it.
+    await enqueueMessage("hello", "pendant", "device-123");
+
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+    const routingArg = mockHandlePrompt.mock.calls[0][4] as RoutingResult;
+    expect(routingArg.isMainAgent).toBe(true);
+    expect(routingArg.agentId).toBe(1);
+    expect(routingArg.senderLabel).toBe("pendant");
+    expect(mockIsInAllowlist).not.toHaveBeenCalled();
+    expect(mockResolveInterlocutor).not.toHaveBeenCalled();
+  });
+
   it("routes agent-to-agent messages to the target agent", async () => {
     mockResolveInterlocutor.mockResolvedValue(null);
 

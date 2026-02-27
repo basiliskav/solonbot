@@ -12,6 +12,10 @@ import { getMainAgentId, isOwnerIdentity, resolveInterlocutor, loadAgent } from 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 30_000;
 
+// Sources that require allowlist + interlocutor lookup before routing.
+// All other external sources route directly to the main agent.
+const GATED_SOURCES: string[] = ["signal", "telegram"];
+
 export interface RoutingResult {
   agentId: number;
   senderIdentityId: number | undefined;
@@ -132,6 +136,18 @@ async function resolveTargetAgent(
       senderIdentityId: undefined,
       senderAgentId: undefined,
       senderLabel: "owner",
+      isMainAgent: true,
+    };
+  }
+
+  // Non-gated external sources (e.g. pendant) route directly to the main agent
+  // without allowlist or interlocutor checks.
+  if (!GATED_SOURCES.includes(source)) {
+    return {
+      agentId: mainAgentId,
+      senderIdentityId: undefined,
+      senderAgentId: undefined,
+      senderLabel: source,
       isMainAgent: true,
     };
   }

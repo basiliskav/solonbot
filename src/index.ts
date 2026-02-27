@@ -2,8 +2,8 @@ import http from "http";
 import { fileURLToPath } from "url";
 import type { Pool } from "pg";
 import { loadConfig } from "./config.js";
-import { loadAllowlist, isInAllowlist } from "./allowlist.js";
-import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath, isOwnerIdentity } from "./database.js";
+import { loadAllowlist } from "./allowlist.js";
+import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath } from "./database.js";
 import { createAgent } from "./agent.js";
 import { initializeQueue, enqueueMessage } from "./queue.js";
 import { initializeScheduler } from "./scheduler.js";
@@ -116,19 +116,6 @@ async function handleChatRequest(
 
     const source = "source" in parsedBody && typeof parsedBody.source === "string" ? parsedBody.source : undefined;
     const sender = "sender" in parsedBody && typeof parsedBody.sender === "string" ? parsedBody.sender : undefined;
-
-    // Reject non-allowlisted external senders before doing any file I/O. We return 200
-    // rather than 403 to avoid signalling to the rejected sender that they are blocked.
-    // When source or sender is absent the request comes from an authenticated API caller
-    // (HTTP basic auth), so the allowlist check does not apply.
-    if (source !== undefined && sender !== undefined) {
-      if (!isOwnerIdentity(source, sender) && !isInAllowlist(source, sender)) {
-        console.log(`[stavrobot] Dropping message from sender not in allowlist: source=${source}, sender=${sender}`);
-        response.writeHead(200, { "Content-Type": "application/json" });
-        response.end(JSON.stringify({ response: null }));
-        return;
-      }
-    }
 
     // Parse raw file data sent by external callers (e.g. the Signal bridge) that
     // cannot write to the app container's filesystem directly.
