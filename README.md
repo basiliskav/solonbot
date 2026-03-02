@@ -6,20 +6,20 @@ A personal AI assistant with persistent memory, sandboxed code execution, and Si
 
 ## Features
 
-- **Security.** The bot runs in isolated containers with no access to the host system. Code execution is sandboxed with no access to secrets. Signal and Telegram allowlists restrict who can interact with the agent. You can run it on your personal PC with no fear.
-- **Low token usage.** Various optimizations have been made to be light on token usage. We even use [TOON](https://github.com/toon-format/toon) internally.
-- **Plugins.** Install plugins and extend Stavrobot's capabilities by just giving it a git repo URL. Plugins are isolated from each other — each runs as a dedicated system user with no access to other plugins' files or configuration.
 - **Signal integration.** Two-way messaging via signal-cli, including voice note transcription (OpenAI STT).
 - **Telegram integration.** Two-way messaging via a Telegram bot webhook, including voice note transcription (OpenAI STT).
 - **WhatsApp integration.** Two-way messaging via the Baileys library (unofficial WhatsApp Web API), running in-process. Includes voice note transcription (OpenAI STT).
 - **Three-tier knowledge.** Tier 1 (memories): a self-managed memory store injected into the system prompt every turn — for things the agent needs constantly. Tier 2 (scratchpad): titled entries whose titles are always in context but whose bodies are loaded on demand — for important but less-frequently needed knowledge. Tier 3 (database): full read/write access to PostgreSQL via unrestricted SQL — the agent can create tables, query, and store anything.
+- **Security.** The bot runs in isolated containers with no access to the host system. Code execution is sandboxed with no access to secrets. Signal and Telegram allowlists restrict who can interact with the agent. You can run it on your personal PC with no fear. Plugins have a permission system so you can give the agent access to e.g. read your email but not delete or send any.
+- **Low token usage.** Various optimizations have been made to be light on token usage. We even use [TOON](https://github.com/toon-format/toon) internally.
+- **Plugins.** Install plugins and extend Stavrobot's capabilities by just giving it a git repo URL. Plugins are isolated from each other — each runs as a dedicated system user with no access to other plugins' files or configuration.
+- **Plugin manager.** A web UI at `/plugins` for browsing installed plugins, installing new ones from git URLs, updating, deleting, and editing plugin configuration.
 - **Subagents.** The main agent can create subagents with their own conversation context, system prompt, and restricted tool access. Useful for talking to outside people to complete tasks or arrange things, while having a buffer between the outside person and the main agent.
 - **Self-programming.** The agent can request a secondary coding agent to create new tools at runtime. Tools are executable scripts with a JSON manifest, discovered and invoked by the main agent.
 - **Sandboxed Python execution.** Arbitrary Python with pip dependencies via `uv`, isolated from the host environment.
-- **Cron scheduling.** The agent can schedule its own recurring or one-shot reminders.
+- **Scheduling.** The agent can schedule its own recurring or one-shot tasks.
 - **Web search and fetch.** Optional tools for searching the web and fetching/analyzing URLs via sub-agent LLM calls.
 - **Database explorer.** A web UI at `/explorer` for browsing PostgreSQL tables, viewing schemas, and paginating through rows.
-- **Plugin manager.** A web UI at `/plugins` for browsing installed plugins, installing new ones from git URLs, updating, deleting, and editing plugin configuration.
 - **Settings.** A web UI at `/settings` for managing messaging allowlists (Signal, Telegram, and WhatsApp) and installed plugins.
 - **Apps.** The agent can create dynamic web apps. Apps are private (auth-required) by default, with an option to make individual pages public.
 - **Conversation compaction.** Auto-summarizes long conversation histories to stay within context limits.
