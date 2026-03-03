@@ -106,10 +106,27 @@ export async function handlePutAllowlistRequest(
     return;
   }
 
+  if (obj.notes !== undefined) {
+    if (typeof obj.notes !== "object" || obj.notes === null || Array.isArray(obj.notes)) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "'notes' must be a plain object" }));
+      return;
+    }
+    const notesObj = obj.notes as Record<string, unknown>;
+    if (!Object.values(notesObj).every((value) => typeof value === "string")) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "'notes' values must be strings" }));
+      return;
+    }
+  }
+
+  const submittedNotes = (obj.notes ?? {}) as Record<string, string>;
+
   const submitted: Allowlist = {
     signal: [...new Set(trimmedSignal)],
     telegram: [...new Set(obj.telegram as (number | string)[])],
     whatsapp: [...new Set(trimmedWhatsapp)],
+    notes: submittedNotes,
   };
 
   // Ensure owner identities are always present even if the UI omitted them.
@@ -129,6 +146,21 @@ export async function handlePutAllowlistRequest(
       submitted.whatsapp.push(ownerWhatsapp);
     }
   }
+
+  // Prune notes whose keys don't correspond to any entry in any service list.
+  // Telegram entries are numbers in the array but string keys in the notes map.
+  const allEntryKeys = new Set<string>([
+    ...submitted.signal,
+    ...submitted.telegram.map((entry) => String(entry)),
+    ...submitted.whatsapp,
+  ]);
+  const prunedNotes: Record<string, string> = {};
+  for (const [key, value] of Object.entries(submitted.notes)) {
+    if (allEntryKeys.has(key)) {
+      prunedNotes[key] = value;
+    }
+  }
+  submitted.notes = prunedNotes;
 
   saveAllowlist(submitted);
   log.debug("[stavrobot] handlePutAllowlistRequest: allowlist saved", submitted);
@@ -191,6 +223,10 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       font-size: 12px;
       color: #888;
       font-style: italic;
+    }
+    .note-text {
+      font-size: 13px;
+      color: #888;
     }
     .add-row {
       display: flex;
@@ -262,6 +298,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       <ul class="entry-list" id="signal-list"></ul>
       <div class="add-row">
         <input type="text" id="signal-input" placeholder="+1234567890" />
+        <input type="text" id="signal-note-input" placeholder="Note (optional)" />
         <button class="btn" onclick="addSignalEntry()">Add</button>
       </div>
     </div>
@@ -271,6 +308,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       <ul class="entry-list" id="telegram-list"></ul>
       <div class="add-row">
         <input type="text" id="telegram-input" placeholder="Chat ID (e.g. 123456789)" />
+        <input type="text" id="telegram-note-input" placeholder="Note (optional)" />
         <button class="btn" onclick="addTelegramEntry()">Add</button>
       </div>
     </div>
@@ -280,6 +318,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       <ul class="entry-list" id="whatsapp-list"></ul>
       <div class="add-row">
         <input type="text" id="whatsapp-input" placeholder="+1234567890" />
+        <input type="text" id="whatsapp-note-input" placeholder="Note (optional)" />
         <button class="btn" onclick="addWhatsappEntry()">Add</button>
       </div>
     </div>
@@ -294,6 +333,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
     let ownerSignal = [];
     let ownerTelegram = [];
     let ownerWhatsapp = [];
+    let notes = {};
 
     function escapeHtml(text) {
       const div = document.createElement("div");
@@ -309,8 +349,10 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       }
       list.innerHTML = signalEntries.map((entry, index) => {
         const isOwner = ownerSignal.includes(entry);
+        const note = notes[entry];
         return \`<li>
           <span class="entry-value">\${escapeHtml(entry)}</span>
+          \${note ? \`<span class="note-text">\${escapeHtml(note)}</span>\` : ""}
           \${isOwner
             ? '<span class="owner-label">(owner)</span>'
             : \`<button class="btn btn-danger" onclick="removeSignalEntry(\${index})">Delete</button>\`
@@ -327,8 +369,11 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       }
       list.innerHTML = telegramEntries.map((entry, index) => {
         const isOwner = ownerTelegram.includes(entry);
+        const key = String(entry);
+        const note = notes[key];
         return \`<li>
           <span class="entry-value">\${escapeHtml(String(entry))}</span>
+          \${note ? \`<span class="note-text">\${escapeHtml(note)}</span>\` : ""}
           \${isOwner
             ? '<span class="owner-label">(owner)</span>'
             : \`<button class="btn btn-danger" onclick="removeTelegramEntry(\${index})">Delete</button>\`
@@ -345,8 +390,10 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       }
       list.innerHTML = whatsappEntries.map((entry, index) => {
         const isOwner = ownerWhatsapp.includes(entry);
+        const note = notes[entry];
         return \`<li>
           <span class="entry-value">\${escapeHtml(entry)}</span>
+          \${note ? \`<span class="note-text">\${escapeHtml(note)}</span>\` : ""}
           \${isOwner
             ? '<span class="owner-label">(owner)</span>'
             : \`<button class="btn btn-danger" onclick="removeWhatsappEntry(\${index})">Delete</button>\`
@@ -355,26 +402,46 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
       }).join("");
     }
 
+    function isIdentifierInAnyList(key) {
+      return signalEntries.includes(key) ||
+        telegramEntries.map(String).includes(key) ||
+        whatsappEntries.includes(key);
+    }
+
     function removeSignalEntry(index) {
+      const entry = signalEntries[index];
       signalEntries.splice(index, 1);
+      if (!isIdentifierInAnyList(entry)) {
+        delete notes[entry];
+      }
       renderSignalList();
       saveAllowlist();
     }
 
     function removeTelegramEntry(index) {
+      const entry = telegramEntries[index];
+      const key = String(entry);
       telegramEntries.splice(index, 1);
+      if (!isIdentifierInAnyList(key)) {
+        delete notes[key];
+      }
       renderTelegramList();
       saveAllowlist();
     }
 
     function removeWhatsappEntry(index) {
+      const entry = whatsappEntries[index];
       whatsappEntries.splice(index, 1);
+      if (!isIdentifierInAnyList(entry)) {
+        delete notes[entry];
+      }
       renderWhatsappList();
       saveAllowlist();
     }
 
     function addSignalEntry() {
       const input = document.getElementById("signal-input");
+      const noteInput = document.getElementById("signal-note-input");
       const value = input.value.replace(/[\\u200B-\\u200F\\u2028-\\u202F\\u2060-\\u206F\\uFEFF]/g, "").trim();
       if (!value) return;
       if (value !== "*" && !/^\\+[1-9]\\d{1,14}$/.test(value)) {
@@ -385,8 +452,13 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
         setStatus("That number is already in the list.", true);
         return;
       }
+      const note = noteInput.value.trim();
+      if (note) {
+        notes[value] = note;
+      }
       signalEntries.push(value);
       input.value = "";
+      noteInput.value = "";
       renderSignalList();
       setStatus("", false);
       saveAllowlist();
@@ -394,6 +466,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
 
     function addTelegramEntry() {
       const input = document.getElementById("telegram-input");
+      const noteInput = document.getElementById("telegram-note-input");
       const raw = input.value.trim();
       if (!raw) return;
       if (raw === "*") {
@@ -401,8 +474,13 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
           setStatus("That chat ID is already in the list.", true);
           return;
         }
+        const note = noteInput.value.trim();
+        if (note) {
+          notes["*"] = note;
+        }
         telegramEntries.push("*");
         input.value = "";
+        noteInput.value = "";
         renderTelegramList();
         setStatus("", false);
         saveAllowlist();
@@ -417,8 +495,13 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
         setStatus("That chat ID is already in the list.", true);
         return;
       }
+      const note = noteInput.value.trim();
+      if (note) {
+        notes[String(value)] = note;
+      }
       telegramEntries.push(value);
       input.value = "";
+      noteInput.value = "";
       renderTelegramList();
       setStatus("", false);
       saveAllowlist();
@@ -426,6 +509,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
 
     function addWhatsappEntry() {
       const input = document.getElementById("whatsapp-input");
+      const noteInput = document.getElementById("whatsapp-note-input");
       const value = input.value.replace(/[\\u200B-\\u200F\\u2028-\\u202F\\u2060-\\u206F\\uFEFF]/g, "").trim();
       if (!value) return;
       if (value !== "*" && !/^\\+[1-9]\\d{1,14}$/.test(value)) {
@@ -436,8 +520,13 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
         setStatus("That number is already in the list.", true);
         return;
       }
+      const note = noteInput.value.trim();
+      if (note) {
+        notes[value] = note;
+      }
       whatsappEntries.push(value);
       input.value = "";
+      noteInput.value = "";
       renderWhatsappList();
       setStatus("", false);
       saveAllowlist();
@@ -462,6 +551,7 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
         signalEntries = data.allowlist.signal.slice();
         telegramEntries = data.allowlist.telegram.slice();
         whatsappEntries = data.allowlist.whatsapp.slice();
+        notes = Object.assign({}, data.allowlist.notes);
         ownerSignal = data.ownerIdentities.signal.slice();
         ownerTelegram = data.ownerIdentities.telegram.slice();
         ownerWhatsapp = data.ownerIdentities.whatsapp.slice();
@@ -484,13 +574,14 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
         const response = await fetch("/api/settings/allowlist", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ signal: signalEntries, telegram: telegramEntries, whatsapp: whatsappEntries }),
+          body: JSON.stringify({ signal: signalEntries, telegram: telegramEntries, whatsapp: whatsappEntries, notes }),
         });
         const data = await response.json();
         if (response.ok) {
           signalEntries = data.allowlist.signal.slice();
           telegramEntries = data.allowlist.telegram.slice();
           whatsappEntries = data.allowlist.whatsapp.slice();
+          notes = Object.assign({}, data.allowlist.notes);
           ownerSignal = data.ownerIdentities.signal.slice();
           ownerTelegram = data.ownerIdentities.telegram.slice();
           ownerWhatsapp = data.ownerIdentities.whatsapp.slice();
@@ -509,12 +600,21 @@ const SETTINGS_PAGE_HTML = `<!DOCTYPE html>
     document.getElementById("signal-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter") addSignalEntry();
     });
+    document.getElementById("signal-note-input").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") addSignalEntry();
+    });
 
     document.getElementById("telegram-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter") addTelegramEntry();
     });
+    document.getElementById("telegram-note-input").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") addTelegramEntry();
+    });
 
     document.getElementById("whatsapp-input").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") addWhatsappEntry();
+    });
+    document.getElementById("whatsapp-note-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter") addWhatsappEntry();
     });
 

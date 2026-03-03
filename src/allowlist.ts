@@ -6,11 +6,12 @@ export interface Allowlist {
   signal: string[];
   telegram: (number | string)[];
   whatsapp: string[];
+  notes: Record<string, string>;
 }
 
 const ALLOWLIST_PATH = process.env.ALLOWLIST_PATH ?? "allowlist.json";
 
-let currentAllowlist: Allowlist = { signal: [], telegram: [], whatsapp: [] };
+let currentAllowlist: Allowlist = { signal: [], telegram: [], whatsapp: [], notes: {} };
 
 function validateAllowlist(value: unknown): Allowlist {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -32,7 +33,21 @@ function validateAllowlist(value: unknown): Allowlist {
   if (!Array.isArray(whatsapp) || !whatsapp.every((item) => typeof item === "string")) {
     throw new Error("allowlist.json: 'whatsapp' must be an array of strings");
   }
-  return { signal: obj.signal as string[], telegram: obj.telegram as (number | string)[], whatsapp: whatsapp as string[] };
+  // The notes field is optional for the same backward-compat reason as whatsapp.
+  const notes = obj.notes ?? {};
+  if (typeof notes !== "object" || notes === null || Array.isArray(notes)) {
+    throw new Error("allowlist.json: 'notes' must be a plain object");
+  }
+  const notesObj = notes as Record<string, unknown>;
+  if (!Object.values(notesObj).every((value) => typeof value === "string")) {
+    throw new Error("allowlist.json: 'notes' values must be strings");
+  }
+  return {
+    signal: obj.signal as string[],
+    telegram: obj.telegram as (number | string)[],
+    whatsapp: whatsapp as string[],
+    notes: notesObj as Record<string, string>,
+  };
 }
 
 export function loadAllowlist(config: Config): Allowlist {
@@ -52,7 +67,7 @@ export function loadAllowlist(config: Config): Allowlist {
       );
     }
 
-    currentAllowlist = { signal: migratedSignal, telegram: migratedTelegram, whatsapp: [] };
+    currentAllowlist = { signal: migratedSignal, telegram: migratedTelegram, whatsapp: [], notes: {} };
     saveAllowlist(currentAllowlist);
   }
 
@@ -92,7 +107,12 @@ export function saveAllowlist(allowlist: Allowlist): void {
 }
 
 export function getAllowlist(): Allowlist {
-  return { signal: [...currentAllowlist.signal], telegram: [...currentAllowlist.telegram], whatsapp: [...currentAllowlist.whatsapp] };
+  return {
+    signal: [...currentAllowlist.signal],
+    telegram: [...currentAllowlist.telegram],
+    whatsapp: [...currentAllowlist.whatsapp],
+    notes: { ...currentAllowlist.notes },
+  };
 }
 
 export function isInAllowlist(service: string, identifier: string): boolean {

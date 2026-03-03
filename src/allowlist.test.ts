@@ -114,6 +114,30 @@ describe("loadAllowlist — malformed file", () => {
     const { loadAllowlist } = await import("./allowlist.js");
     expect(() => loadAllowlist(makeConfig())).toThrow("'telegram' must be an array of numbers");
   });
+
+  it("throws when notes is not a plain object", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify({ signal: [], telegram: [], notes: "not-an-object" }));
+
+    const { loadAllowlist } = await import("./allowlist.js");
+    expect(() => loadAllowlist(makeConfig())).toThrow("'notes' must be a plain object");
+  });
+
+  it("throws when notes is an array", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify({ signal: [], telegram: [], notes: [] }));
+
+    const { loadAllowlist } = await import("./allowlist.js");
+    expect(() => loadAllowlist(makeConfig())).toThrow("'notes' must be a plain object");
+  });
+
+  it("throws when notes contains non-string values", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify({ signal: [], telegram: [], notes: { "+1111111111": 42 } }));
+
+    const { loadAllowlist } = await import("./allowlist.js");
+    expect(() => loadAllowlist(makeConfig())).toThrow("'notes' values must be strings");
+  });
 });
 
 describe("loadAllowlist", () => {
@@ -140,6 +164,30 @@ describe("loadAllowlist", () => {
     const allowlist = loadAllowlist(makeConfig());
 
     expect(allowlist.whatsapp).toEqual([]);
+  });
+
+  it("defaults notes to {} when field is absent in existing allowlist.json", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify({ signal: ["+1111111111"], telegram: [42] }));
+    mockWriteFileSync.mockImplementation(() => undefined);
+
+    const { loadAllowlist } = await import("./allowlist.js");
+    const allowlist = loadAllowlist(makeConfig());
+
+    expect(allowlist.notes).toEqual({});
+  });
+
+  it("loads notes from file when present", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ signal: ["+1111111111"], telegram: [42], notes: { "+1111111111": "Mom" } }),
+    );
+    mockWriteFileSync.mockImplementation(() => undefined);
+
+    const { loadAllowlist } = await import("./allowlist.js");
+    const allowlist = loadAllowlist(makeConfig());
+
+    expect(allowlist.notes).toEqual({ "+1111111111": "Mom" });
   });
 
   it("creates an empty allowlist when file does not exist and no config values", async () => {
@@ -271,6 +319,21 @@ describe("getAllowlist", () => {
     const allowlist = getAllowlist();
     expect(allowlist.signal).toEqual(["+1111111111"]);
     expect(allowlist.telegram).toEqual([42]);
+    expect(allowlist.notes).toEqual({});
+  });
+
+  it("includes notes in the returned copy", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ signal: ["+1111111111"], telegram: [42], notes: { "+1111111111": "Mom" } }),
+    );
+    mockWriteFileSync.mockImplementation(() => undefined);
+
+    const { loadAllowlist, getAllowlist } = await import("./allowlist.js");
+    loadAllowlist(makeConfig());
+
+    const allowlist = getAllowlist();
+    expect(allowlist.notes).toEqual({ "+1111111111": "Mom" });
   });
 });
 
@@ -284,13 +347,28 @@ describe("saveAllowlist", () => {
     const config = makeConfig();
     loadAllowlist(config);
 
-    const newAllowlist = { signal: ["+5555555555"], telegram: [99], whatsapp: ["+7777777777"] };
+    const newAllowlist = { signal: ["+5555555555"], telegram: [99], whatsapp: ["+7777777777"], notes: { "+5555555555": "Test note" } };
     saveAllowlist(newAllowlist);
 
     const written = mockWriteFileSync.mock.calls[0][1] as string;
     expect(written).toContain("\n");
     expect(JSON.parse(written)).toEqual(newAllowlist);
     expect(getAllowlist()).toEqual(newAllowlist);
+  });
+
+  it("writes notes to the file", async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify({ signal: [], telegram: [] }));
+    mockWriteFileSync.mockImplementation(() => undefined);
+
+    const { loadAllowlist, saveAllowlist } = await import("./allowlist.js");
+    loadAllowlist(makeConfig());
+
+    saveAllowlist({ signal: ["+1111111111"], telegram: [], whatsapp: [], notes: { "+1111111111": "Work" } });
+
+    const written = mockWriteFileSync.mock.calls[0][1] as string;
+    const parsed = JSON.parse(written);
+    expect(parsed.notes).toEqual({ "+1111111111": "Work" });
   });
 });
 
