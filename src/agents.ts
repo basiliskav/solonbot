@@ -48,7 +48,7 @@ Guidance on creating subagents:
 - Give agents the minimum tool privileges needed for their task. Start with fewer tools; the subagent can ask for more via send_agent_message.
 - send_agent_message is always available to all agents regardless of their allowed_tools list — do not include it in the list.
 - The allowed_tools field is a whitelist: [] means no tools, and an explicit list like ["send_telegram_message"] means only those tools. Use dot notation to restrict to specific actions: ["manage_uploads.read", "manage_uploads.write"] allows only read and write.
-- For plugin access, prefer granting specific tools over whole plugins. Use dot notation: ["hackernews.get_front_page"] rather than ["hackernews"]. Only use ["*"] or bare plugin names when the agent genuinely needs broad access.
+- Always scope plugin access to the specific tools needed. Use dot notation: ["caldav.list_events", "caldav.get_event"] rather than ["caldav"]. Granting a whole plugin or ["*"] gives the subagent access to every tool in that plugin, including destructive ones — only do this when every tool is genuinely needed.
 - The subagent's system prompt automatically includes the list of available plugins and their tools, so the subagent will know what it can use — you do not need to describe the plugins in the system_prompt.
 - Provide the subagent with all the information it needs to perform its task in the system_prompt field, but no more than necessary. Information about the person it's talking to, the places or facts of the task, etc are especially helpful.
 - Instruct the subagent to ask the main agent (agent 1) if it needs information or tools it doesn't have.

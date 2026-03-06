@@ -484,7 +484,7 @@ Each installed plugin is rendered as a collapsible `.plugin-card` div:
 - `unknown` instead of `any` for untyped data; narrow with type guards.
 - Interfaces for object shapes; `camelCase` for variables/functions; `PascalCase` for interfaces/types.
 - Standalone `async` functions, not classes, for application logic.
-- `console.log` with `[stavrobot]` prefix for tracing; `console.error` for errors.
+- All logging goes through the `log` object exported from `src/log.ts` (not `console.*` directly). Log level is controlled by the `STAVROBOT_LOG_LEVEL` env var (`error`, `warn`, `info`, `debug`; default `info`). All log lines use the `[stavrobot]` prefix.
 - Errors propagate; try/catch only at HTTP boundaries.
 - Double quotes, `const` by default, trailing commas, semicolons, 2-space indentation.
 
