@@ -23,7 +23,7 @@ interface TableResult {
 
 export function createSearchTool(pool: pg.Pool): AgentTool {
   return {
-    name: "search",
+    name: "db_search",
     label: "Search",
     description: "Search all database tables for a text string. Searches across all text columns in all tables.",
     parameters: Type.Object({
