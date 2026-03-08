@@ -224,16 +224,9 @@ import sys
 from pathlib import Path
 
 
-KNOWN_PARAMS = {"text"}
-
-
 def main() -> None:
     """Convert text to speech and write the audio file to the output directory."""
     params = json.load(sys.stdin)
-    unknown = set(params) - KNOWN_PARAMS
-    if unknown:
-        print(f"Unknown parameters: {', '.join(sorted(unknown))}", file=sys.stderr)
-        sys.exit(1)
 
     from gtts import gTTS
 
@@ -285,19 +278,11 @@ Tool entrypoint:
 
 import json
 import sys
-from pathlib import Path
-
-
-KNOWN_PARAMS = {"audio"}
 
 
 def main() -> None:
     """Transcribe an audio file passed as a file path."""
     params = json.load(sys.stdin)
-    unknown = set(params) - KNOWN_PARAMS
-    if unknown:
-        print(f"Unknown parameters: {', '.join(sorted(unknown))}", file=sys.stderr)
-        sys.exit(1)
 
     import whisper
 
@@ -373,12 +358,12 @@ Any executable works — use a shebang line. Node.js and Python are available in
 
 ## Parameter validation
 
-Tools must validate their input parameters:
+The plugin runner automatically validates parameters before the tool script runs:
 
-- Reject unknown parameters by checking that all keys in the input object are declared in the tool manifest. Return an error (non-zero exit, message on stderr) listing the unexpected keys.
-- Validate that all required parameters are present and have the expected type.
+- Unknown keys (not declared in the tool manifest's `parameters`) are rejected with HTTP 400. The error response includes the full parameter schema so the caller can self-correct.
+- Wrong types are rejected for `string`, `number`, `integer`, and `boolean` parameters. `file` parameters are exempt because they are already handled by the file materialization code.
 
-This keeps the tool contract strict and ensures the agent gets clear feedback when it passes the wrong parameters, rather than having errors surface later or go unnoticed.
+Tools no longer need to implement unknown-parameter rejection or type validation themselves. Existing validation code in tools is harmless and can be left in place, but new tools do not need it.
 
 ## Example: a complete tool
 
@@ -394,16 +379,9 @@ import json
 import sys
 
 
-KNOWN_PARAMS = {"query"}
-
-
 def main() -> None:
     """Read a query from stdin and return a result."""
     params = json.load(sys.stdin)
-    unknown = set(params) - KNOWN_PARAMS
-    if unknown:
-        print(f"Unknown parameters: {', '.join(sorted(unknown))}", file=sys.stderr)
-        sys.exit(1)
     query = params["query"]
     result = f"You asked: {query}"
     json.dump({"result": result}, sys.stdout)

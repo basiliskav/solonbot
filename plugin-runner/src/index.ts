@@ -78,12 +78,17 @@ interface BundleManifest {
   init?: { entrypoint: string; async?: boolean };
 }
 
+interface ToolParamSchema {
+  type: string;
+  description: string;
+}
+
 interface ToolManifest {
   name: string;
   description: string;
   entrypoint: string;
   async?: boolean;
-  [key: string]: unknown;
+  parameters: Record<string, ToolParamSchema>;
 }
 
 // A bundle manifest has no entrypoint; a tool manifest does.
@@ -117,13 +122,34 @@ function isBundleManifest(manifest: unknown): manifest is BundleManifest {
 }
 
 function isToolManifest(manifest: unknown): manifest is ToolManifest {
-  return (
-    typeof manifest === "object" &&
-    manifest !== null &&
-    typeof (manifest as Record<string, unknown>)["name"] === "string" &&
-    typeof (manifest as Record<string, unknown>)["description"] === "string" &&
-    typeof (manifest as Record<string, unknown>)["entrypoint"] === "string"
-  );
+  if (
+    typeof manifest !== "object" ||
+    manifest === null ||
+    typeof (manifest as Record<string, unknown>)["name"] !== "string" ||
+    typeof (manifest as Record<string, unknown>)["description"] !== "string" ||
+    typeof (manifest as Record<string, unknown>)["entrypoint"] !== "string"
+  ) {
+    return false;
+  }
+
+  const parameters = (manifest as Record<string, unknown>)["parameters"];
+  if (typeof parameters !== "object" || parameters === null || Array.isArray(parameters)) {
+    return false;
+  }
+
+  // Each entry must have a string "type" and string "description".
+  for (const value of Object.values(parameters as Record<string, unknown>)) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      typeof (value as Record<string, unknown>)["type"] !== "string" ||
+      typeof (value as Record<string, unknown>)["description"] !== "string"
+    ) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 interface LoadedBundle {
@@ -258,7 +284,18 @@ function loadBundles(): void {
       const rawToolManifest = readJsonFile(toolManifestPath);
 
       if (!isToolManifest(rawToolManifest)) {
-        // Could be a non-tool subdirectory or a mismatched name; skip silently.
+        // Only warn if the manifest looks like a tool (has name and entrypoint),
+        // so we don't spam warnings for non-tool subdirectories like node_modules.
+        if (
+          typeof rawToolManifest === "object" &&
+          rawToolManifest !== null &&
+          typeof (rawToolManifest as Record<string, unknown>)["name"] === "string" &&
+          typeof (rawToolManifest as Record<string, unknown>)["entrypoint"] === "string"
+        ) {
+          console.warn(
+            `[stavrobot-plugin-runner] Skipping tool "${(rawToolManifest as Record<string, unknown>)["name"] as string}" in bundle "${bundleName}": manifest.json failed validation (missing or invalid "parameters")`
+          );
+        }
         continue;
       }
 
@@ -801,6 +838,60 @@ async function handleRunTool(
       }
 
       stdinBody = JSON.stringify(params);
+    }
+
+    // Validate parameters: reject unknown keys and wrong types. File params are
+    // already materialized to path strings at this point, so skip type-checking
+    // them — the file handling code above already validated their structure.
+    const schema = manifest.parameters;
+
+    for (const key of Object.keys(params)) {
+      if (!(key in schema)) {
+        fs.rmSync(pluginTempDir, { recursive: true, force: true });
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          error: `Unknown parameter: "${key}"`,
+          parameters: schema,
+        }));
+        return;
+      }
+    }
+
+    for (const [key, paramSchema] of Object.entries(schema)) {
+      if (!(key in params)) {
+        continue;
+      }
+      const value = params[key];
+      const expectedType = paramSchema.type;
+
+      if (expectedType === "file") {
+        // File params have already been materialized to path strings; skip type check.
+        continue;
+      }
+
+      let typeOk: boolean;
+      if (expectedType === "string") {
+        typeOk = typeof value === "string";
+      } else if (expectedType === "number") {
+        typeOk = typeof value === "number";
+      } else if (expectedType === "integer") {
+        typeOk = typeof value === "number" && Number.isInteger(value);
+      } else if (expectedType === "boolean") {
+        typeOk = typeof value === "boolean";
+      } else {
+        // Unknown type in schema — skip validation for forward compatibility.
+        typeOk = true;
+      }
+
+      if (!typeOk) {
+        fs.rmSync(pluginTempDir, { recursive: true, force: true });
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          error: `Parameter "${key}" must be of type "${expectedType}"`,
+          parameters: schema,
+        }));
+        return;
+      }
     }
   }
 
