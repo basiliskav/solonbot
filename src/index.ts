@@ -3,6 +3,7 @@ import { fileURLToPath } from "url";
 import type { Pool } from "pg";
 import { loadConfig } from "./config.js";
 import { loadAllowlist } from "./allowlist.js";
+import { initInternalFetch } from "./internal-fetch.js";
 import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, seedNightlyReview, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath } from "./database.js";
 import { createAgent } from "./agent.js";
 import { initializeQueue, enqueueMessage } from "./queue.js";
@@ -425,6 +426,7 @@ async function main(): Promise<void> {
   if (config.password === undefined) {
     throw new Error("Config must specify a password.");
   }
+  initInternalFetch(config.password);
   loadAllowlist(config);
   const pool = await connectDatabase();
   await initializeSchema(pool);
@@ -544,19 +546,6 @@ async function main(): Promise<void> {
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   server.listen(port, () => {
     log.info(`Server listening on port ${port}`);
-  });
-
-  const internalServer = http.createServer((request: http.IncomingMessage, response: http.ServerResponse): void => {
-    if (request.method === "POST" && new URL(request.url || "/", "http://localhost").pathname === "/chat") {
-      void handleChatRequest(request, response);
-    } else {
-      response.writeHead(404, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: "Not found" }));
-    }
-  });
-
-  internalServer.listen(3001, () => {
-    log.info("[stavrobot] Internal server listening on port 3001");
   });
 }
 

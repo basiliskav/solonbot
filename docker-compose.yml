@@ -50,6 +50,8 @@ services:
     environment:
       TZ: ${TZ:-UTC}
     restart: unless-stopped
+    volumes:
+      - ./data/main:/root/config:ro
 
   plugin-runner:
     build: ./plugin-runner
@@ -57,7 +59,7 @@ services:
       TZ: ${TZ:-UTC}
     restart: unless-stopped
     volumes:
-      - ./data/main:/config
+      - ./data/main:/root/config:ro
       - ./data/plugins:/plugins
       - ./cache/plugins:/cache
 
@@ -67,7 +69,7 @@ services:
       TZ: ${TZ:-UTC}
     restart: unless-stopped
     volumes:
-      - ./data/main:/config
+      - ./data/main:/root/config:ro
       - ./data/coder:/home/coder/.claude
       - ./data/plugins:/plugins
       - ./cache/plugins:/cache
@@ -99,7 +101,7 @@ services:
     mem_limit: 256m
     restart: unless-stopped
     volumes:
-      - ./data/main:/app/config:ro
+      - ./data/main:/root/config:ro
       - ./data/signal-cli:/root/.local/share/signal-cli
     depends_on:
       app:

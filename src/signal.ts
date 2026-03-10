@@ -1,9 +1,10 @@
 import { log } from "./log.js";
+import { internalFetch } from "./internal-fetch.js";
 
 export async function sendSignalMessage(recipient: string, message: string): Promise<"ok" | "rate_limited"> {
   log.debug("[stavrobot] sendSignalMessage called:", { recipient, messageLength: message.length });
 
-  const response = await fetch("http://signal-bridge:8081/send", {
+  const response = await internalFetch("http://signal-bridge:8081/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ recipient, message }),

@@ -23,6 +23,7 @@ import { convertMarkdownToTelegramHtml } from "./telegram.js";
 import { encodeToToon } from "./toon.js";
 import { sendSignalMessage } from "./signal.js";
 import { sendTelegramMessage } from "./telegram-api.js";
+import { internalFetch } from "./internal-fetch.js";
 import { getWhatsappSocket, e164ToJid, sendWhatsappTextMessage } from "./whatsapp-api.js";
 import { TEMP_ATTACHMENTS_DIR } from "./temp-dir.js";
 import { log } from "./log.js";
@@ -378,7 +379,7 @@ export function createSendSignalMessageTool(pool: pg.Pool, config: Config): Agen
         // The path check above guarantees this is a temp file, so always delete it.
         await fs.unlink(resolvedAttachmentPath);
 
-        const response = await fetch("http://signal-bridge:8081/send", {
+        const response = await internalFetch("http://signal-bridge:8081/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -1406,7 +1407,7 @@ interface PluginManifest {
 
 async function fetchPluginList(): Promise<PluginEntry[] | undefined> {
   try {
-    const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
+    const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
     if (!response.ok) {
       log.warn(`[stavrobot] fetchPluginList: plugin runner returned ${response.status}`);
       return undefined;
@@ -1436,7 +1437,7 @@ async function fetchPluginDetails(
   const results = await Promise.all(
     pluginNames.map(async (name): Promise<[string, string[]] | null> => {
       try {
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${name}`);
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${name}`);
         if (!response.ok) {
           log.warn(`[stavrobot] fetchPluginDetails: plugin runner returned ${response.status} for plugin "${name}"`);
           return null;

@@ -5,6 +5,7 @@ import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { encodeToToon } from "./toon.js";
 import { TEMP_ATTACHMENTS_DIR } from "./temp-dir.js";
 import { log } from "./log.js";
+import { internalFetch } from "./internal-fetch.js";
 
 const PLUGIN_RUNNER_BASE_URL = "http://plugin-runner:3003";
 const CLAUDE_CODE_BASE_URL = "http://coder:3002";
@@ -172,7 +173,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
           };
         }
         const url = raw.url;
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/install`, {
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/install`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url }),
@@ -194,7 +195,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
           };
         }
         const name = raw.name;
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/update`, {
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/update`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name }),
@@ -216,7 +217,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
           };
         }
         const name = raw.name;
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/remove`, {
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/remove`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name }),
@@ -261,7 +262,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
         if (typeof parsedConfig === "object" && parsedConfig !== null) {
           delete (parsedConfig as Record<string, unknown>)["permissions"];
         }
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/configure`, {
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/configure`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, config: parsedConfig }),
@@ -275,7 +276,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
       }
 
       if (action === "list") {
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
         const responseText = await response.text();
         let result: string;
         try {
@@ -321,7 +322,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
           };
         }
         const name = raw.name;
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${name}`);
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${name}`);
         if (response.status === 404) {
           const result = `Plugin '${name}' not found.`;
           return {
@@ -393,7 +394,7 @@ export function createManagePluginsTool(options: { coderEnabled: boolean }): Age
         }
         const name = raw.name;
         const description = raw.plugin_description;
-        const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/create`, {
+        const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/create`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, description }),
@@ -481,7 +482,7 @@ export function createRunPluginToolTool(): AgentTool {
       const { plugin, tool, parameters } = params as { plugin: string; tool: string; parameters: string };
       const parsedParameters = JSON.parse(parameters) as unknown;
 
-      const bundleResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${plugin}`);
+      const bundleResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${plugin}`);
       if (bundleResponse.status === 404) {
         const result = `Plugin '${plugin}' not found.`;
         return {
@@ -526,7 +527,7 @@ export function createRunPluginToolTool(): AgentTool {
 
       const resolvedParameters = await resolveFileParameters(plugin, tool, manifest, parsedParameters);
 
-      const response = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${plugin}/tools/${tool}/run`, {
+      const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${plugin}/tools/${tool}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(resolvedParameters),
@@ -596,7 +597,7 @@ export function createRequestCodingTaskTool(): AgentTool {
     ): Promise<AgentToolResult<{ result: string }>> => {
       const { plugin, message } = params as { plugin: string; message: string };
 
-      const bundleResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${plugin}`);
+      const bundleResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${plugin}`);
       if (bundleResponse.status === 404) {
         const result = `Plugin '${plugin}' not found. Create it first with manage_plugins (action: create).`;
         return {
@@ -627,7 +628,7 @@ export function createRequestCodingTaskTool(): AgentTool {
 
       const taskId = crypto.randomUUID();
       log.debug("[stavrobot] request_coding_task submitting: taskId", taskId, "plugin:", plugin, "message:", message);
-      await fetch(`${CLAUDE_CODE_BASE_URL}/code`, {
+      await internalFetch(`${CLAUDE_CODE_BASE_URL}/code`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ taskId, plugin, message }),

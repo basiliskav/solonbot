@@ -1,6 +1,7 @@
 import http from "http";
 import { log } from "./log.js";
 import { getBaseStyles } from "./theme.js";
+import { internalFetch } from "./internal-fetch.js";
 
 const SIGNAL_CAPTCHA_PAGE_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -180,7 +181,7 @@ export async function handleSignalCaptchaSubmit(
 
   log.debug("[stavrobot] handleSignalCaptchaSubmit: proxying captcha to signal-bridge");
 
-  const bridgeResponse = await fetch("http://signal-bridge:8081/challenge", {
+  const bridgeResponse = await internalFetch("http://signal-bridge:8081/challenge", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ captcha: captcha.trim() }),

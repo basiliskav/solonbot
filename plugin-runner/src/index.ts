@@ -2,15 +2,16 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import { execFileSync, spawn } from "child_process";
+import { fileURLToPath } from "url";
 
 const PLUGINS_DIR = "/plugins";
-const CONFIG_TOML_PATH = "/config/config.toml";
+const CONFIG_TOML_PATH = "/root/config/config.toml";
 const TOOL_TIMEOUT_MS = 30_000;
 const ASYNC_TIMEOUT_MS = 300_000; // 5 minutes for async scripts.
-const APP_INTERNAL_URL = "http://app:3001/chat";
+const APP_INTERNAL_URL = "http://app:3000/chat";
 const INSTRUCTIONS_MAX_LENGTH = 5000;
 
-// Loaded once at startup. Undefined if the config file is missing or has no password field.
+// Loaded once at startup. The process refuses to start if the password cannot be read.
 let appPassword: string | undefined;
 
 // Return true if the URL uses a scheme that git clone accepts safely. The
@@ -578,9 +579,13 @@ async function postCallback(source: string, message: string, files?: Transported
         mimeType: mimeTypeFromFilename(file.filename),
       }));
     }
+    const credentials = Buffer.from(`:${appPassword}`).toString("base64");
     const response = await fetch(APP_INTERNAL_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Basic ${credentials}`,
+      },
       body: JSON.stringify(body),
     });
     console.log(`[stavrobot-plugin-runner] Callback posted, status: ${response.status}`);
@@ -603,38 +608,19 @@ function isEditable(pluginName: string): boolean {
 }
 
 function loadAppPassword(): void {
-  try {
-    fs.chmodSync(CONFIG_TOML_PATH, 0o600);
-    const content = fs.readFileSync(CONFIG_TOML_PATH, "utf-8");
-    const match = content.match(/^password\s*=\s*"([^"]+)"$/m);
-    if (match === null) {
-      console.warn("[stavrobot-plugin-runner] No password field found in config.toml; config endpoint will be unavailable");
-      return;
-    }
-    appPassword = match[1];
-    console.log("[stavrobot-plugin-runner] App password loaded from config.toml");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[stavrobot-plugin-runner] Could not read config.toml: ${message}; config endpoint will be unavailable`);
+  const content = fs.readFileSync(CONFIG_TOML_PATH, "utf-8");
+  const match = content.match(/^password\s*=\s*"([^"]+)"$/m);
+  if (match === null) {
+    throw new Error("No password field found in config.toml; refusing to start");
   }
+  appPassword = match[1];
+  console.log("[stavrobot-plugin-runner] App password loaded from config.toml");
 }
 
-// This endpoint is auth-gated because config values may contain secrets (API keys, tokens).
+// This endpoint returns config values that may contain secrets (API keys, tokens).
 // It must never be exposed to the LLM agent — only the admin UI may call it.
-function handleGetBundleConfig(bundleName: string, request: http.IncomingMessage, response: http.ServerResponse): void {
-  if (appPassword === undefined) {
-    response.writeHead(401, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ error: "Config endpoint unavailable: no password configured" }));
-    return;
-  }
-
-  const authHeader = request.headers["authorization"];
-  if (typeof authHeader !== "string" || authHeader !== `Bearer ${appPassword}`) {
-    response.writeHead(401, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ error: "Unauthorized" }));
-    return;
-  }
-
+// Auth is enforced uniformly at the handleRequest level.
+function handleGetBundleConfig(bundleName: string, response: http.ServerResponse): void {
   loadBundles();
 
   const bundle = findBundle(bundleName);
@@ -1691,6 +1677,24 @@ async function handleRequest(
 
   console.log(`[stavrobot-plugin-runner] ${method} ${url}`);
 
+  if (appPassword === undefined) {
+    response.writeHead(500, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "Server misconfigured: no password set" }));
+    return;
+  }
+
+  const authHeader = request.headers["authorization"];
+  const expectedCredentials = Buffer.from(`:${appPassword}`).toString("base64");
+  if (
+    typeof authHeader !== "string" ||
+    !authHeader.startsWith("Basic ") ||
+    authHeader.slice("Basic ".length) !== expectedCredentials
+  ) {
+    response.writeHead(401, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "Unauthorized" }));
+    return;
+  }
+
   try {
     if (method === "GET" && url === "/bundles") {
       handleListBundles(response);
@@ -1705,7 +1709,7 @@ async function handleRequest(
 
     const getBundleConfigMatch = url.match(/^\/bundles\/([^/]+)\/config$/);
     if (method === "GET" && getBundleConfigMatch !== null) {
-      handleGetBundleConfig(getBundleConfigMatch[1], request, response);
+      handleGetBundleConfig(getBundleConfigMatch[1], response);
       return;
     }
 
@@ -1765,4 +1769,7 @@ async function main(): Promise<void> {
   });
 }
 
-main();
+// Only run main() when this file is the entry point, not when imported by tests.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main();
+}

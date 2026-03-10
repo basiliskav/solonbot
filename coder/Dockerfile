@@ -23,6 +23,7 @@ ENV PATH="/home/coder/.local/bin:${PATH}"
 USER root
 COPY entrypoint.sh server.py system-prompt.txt PLUGIN.md /app/
 RUN chmod +x /app/entrypoint.sh
+RUN chmod 700 /root
 
 EXPOSE 3002
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -1,8 +1,14 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { createRunPluginToolTool, createManagePluginsTool, createRequestCodingTaskTool } from "./plugin-tools.js";
+import { initInternalFetch } from "./internal-fetch.js";
 import fs from "fs/promises";
 import path from "path";
 import { TEMP_ATTACHMENTS_DIR } from "./temp-dir.js";
+
+// Initialize internalFetch with a dummy password so tests can call it without
+// going through main(). The actual password value does not matter here because
+// tests stub the global fetch and never make real HTTP requests.
+initInternalFetch("test-password");
 
 vi.mock("fs/promises", () => ({
   default: {
@@ -742,6 +748,9 @@ describe("createRequestCodingTaskTool", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "http://plugin-runner:3003/bundles/myplugin",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Authorization": expect.stringMatching(/^Basic /) }),
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,

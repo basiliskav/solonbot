@@ -1,6 +1,7 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { log } from "./log.js";
+import { internalFetch } from "./internal-fetch.js";
 
 const PYTHON_RUNNER_URL = "http://python-runner:3003/run";
 
@@ -30,7 +31,7 @@ export function createRunPythonTool(): AgentTool {
 
       let output: string;
       try {
-        const response = await fetch(PYTHON_RUNNER_URL, {
+        const response = await internalFetch(PYTHON_RUNNER_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code, dependencies }),

@@ -1,24 +1,49 @@
 """HTTP server that receives coding task requests and spawns claude -p as a subprocess."""
 
+import base64
 import http.server
 import json
 import os
 import re
 import shutil
 import subprocess
+import tomllib
 import urllib.request
 from threading import Thread
 from http import HTTPStatus
 
 
-APP_CHAT_URL = "http://app:3001/chat"
-CODER_ENV_PATH = "/run/coder-env"
+APP_CHAT_URL = "http://app:3000/chat"
+CONFIG_PATH = "/root/config/config.toml"
 SYSTEM_PROMPT_PATH = "/app/system-prompt.txt"
 PLUGINS_DIR = "/plugins/"
 TASK_TIMEOUT_SECONDS = 600
 MAX_USERNAME_LENGTH = 32
 CODER_CREDENTIALS_PATH = "/home/coder/.claude/.credentials.json"
 PLUGIN_NAME_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+def load_config() -> tuple[str, str]:
+    """Read config.toml and return (password, model).
+
+    Raises SystemExit if the password is missing, since the server must not
+    start without authentication configured.
+    """
+    with open(CONFIG_PATH, "rb") as f:
+        config = tomllib.load(f)
+
+    password = config.get("password")
+    if not password:
+        print("[stavrobot-coder] Fatal: 'password' is missing from config.toml")
+        raise SystemExit(1)
+
+    coder_section = config.get("coder", {})
+    model = coder_section["model"]
+
+    return password, model
+
+
+PASSWORD, MODEL = load_config()
 
 
 def ensure_plugin_user(plugin_name: str, uid: int, gid: int) -> None:
@@ -96,16 +121,13 @@ def teardown_plugin_credentials(plugin_dir: str) -> None:
     shutil.rmtree(plugin_claude_dir, ignore_errors=True)
 
 
-def read_coder_env() -> dict[str, str]:
-    """Read model from the coder-env file written by entrypoint.sh."""
-    env: dict[str, str] = {}
-    with open(CODER_ENV_PATH) as f:
-        for line in f:
-            line = line.strip()
-            if "=" in line:
-                key, value = line.split("=", 1)
-                env[key] = value
-    return env
+def make_auth_header() -> str:
+    """Return the Basic Auth header value for outbound requests to the app.
+
+    The format is Basic Auth with an empty username: base64(":password").
+    """
+    token = base64.b64encode(f":{PASSWORD}".encode()).decode()
+    return f"Basic {token}"
 
 
 def post_result(message: str) -> None:
@@ -116,7 +138,10 @@ def post_result(message: str) -> None:
         "sender": "coder-agent",
     }).encode()
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": make_auth_header(),
+    }
 
     request = urllib.request.Request(
         APP_CHAT_URL,
@@ -134,9 +159,6 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
         raise ValueError(f"Invalid plugin name: {plugin!r}")
 
     print(f"[stavrobot-coder] Starting coding task {task_id} for plugin {plugin!r}")
-
-    env = read_coder_env()
-    model = env["MODEL"]
 
     cwd = os.path.join(PLUGINS_DIR, plugin)
 
@@ -188,7 +210,7 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
                 "--dangerously-skip-permissions",
                 "--append-system-prompt-file", SYSTEM_PROMPT_PATH,
                 "--no-session-persistence",
-                "--model", model,
+                "--model", MODEL,
             ],
             cwd=cwd,
             capture_output=True,
@@ -214,7 +236,8 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
 
             if subtype != "success" or is_error:
                 errors = output.get("errors", [])
-                result_text = "Coding task failed: " + "\n".join(str(e) for e in errors)
+                error_detail = "\n".join(str(e) for e in errors) if errors else output.get("result", "unknown error")
+                result_text = "Coding task failed: " + error_detail
             else:
                 result_text = output.get("result", "")
                 usage_footer = (
@@ -240,6 +263,21 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
     post_result(result_text)
 
 
+def check_auth(auth_header: str | None) -> bool:
+    """Return True if the Authorization header contains the correct Basic Auth password."""
+    if not auth_header:
+        return False
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[len("Basic "):]).decode()
+    except Exception:
+        return False
+    # The format is ":password" (empty username).
+    _, _, provided_password = decoded.partition(":")
+    return provided_password == PASSWORD
+
+
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for the claude-code server."""
 
@@ -257,6 +295,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """Handle POST requests."""
         if self.path == "/code":
+            if not check_auth(self.headers.get("Authorization")):
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
             payload = json.loads(body)

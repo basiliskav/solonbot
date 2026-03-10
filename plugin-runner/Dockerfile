@@ -13,6 +13,7 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv python install
 # Plugin directories are owned by per-plugin system users, but git commands run as root.
 RUN git config --global --add safe.directory '*'
+RUN chmod 700 /root
 WORKDIR /app
 COPY --from=build /app/package.json /app/package-lock.json* ./
 RUN npm install --omit=dev

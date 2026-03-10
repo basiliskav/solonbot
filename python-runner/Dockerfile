@@ -8,6 +8,7 @@ ENV PYTHONUNBUFFERED=1
 RUN uv python install
 
 RUN useradd --system --no-create-home pythonrunner
+RUN chmod 700 /root
 
 COPY server.py /app/server.py
 

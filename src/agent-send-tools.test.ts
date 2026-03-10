@@ -2,6 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Pool, QueryResult } from "pg";
 import { createSendSignalMessageTool, createSendTelegramMessageTool, createSendWhatsappMessageTool } from "./agent.js";
 import type { Config } from "./config.js";
+import { initInternalFetch } from "./internal-fetch.js";
+
+// Initialize internalFetch with a dummy password so tests can call it without
+// going through main(). The actual password value does not matter here because
+// tests stub the global fetch and never make real HTTP requests.
+initInternalFetch("test-password");
 
 // Mock the database module so resolveRecipient and resolveInterlocutorByName can be controlled per test.
 vi.mock("./database.js", () => ({

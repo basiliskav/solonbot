@@ -28,6 +28,24 @@ from signal_to_markdown import convert_signal_to_markdown
 _rate_limit_token: str | None = None
 _rate_limit_retry_after_seconds: int | None = None
 
+# Set in main() after reading config. Used by send_agent_request for outbound auth.
+_password: str = ""
+
+
+def check_auth(auth_header: str | None, password: str) -> bool:
+    """Return True if the Authorization header contains the correct Basic Auth password."""
+    if not auth_header:
+        return False
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[len("Basic "):]).decode()
+    except Exception:
+        return False
+    # The format is ":password" (empty username).
+    _, _, provided_password = decoded.partition(":")
+    return provided_password == password
+
 
 def log(message: str) -> None:
     """Log a message to stdout with timestamp."""
@@ -52,7 +70,7 @@ class RequestCounter:
 
 def load_config() -> dict:
     """Load and parse the TOML configuration file."""
-    config_path = "/app/config/config.toml"
+    config_path = "/root/config/config.toml"
     with open(config_path, "rb") as file:
         config = tomllib.load(file)
     return config
@@ -104,14 +122,18 @@ def send_agent_request(message_text: str | None, source_number: str, files: list
     At least one of message_text or files must be provided.
     """
     log(f"send_agent_request: sending to agent API (message length={len(message_text) if message_text else 0}, files={len(files) if files else 0}, sender={source_number})")
-    connection = http.client.HTTPConnection("app", 3001, timeout=60)
+    connection = http.client.HTTPConnection("app", 3000, timeout=60)
     payload: dict = {"source": "signal", "sender": source_number}
     if message_text is not None:
         payload["message"] = message_text
     if files is not None:
         payload["files"] = files
     body = json.dumps(payload)
-    headers: dict[str, str] = {"Content-Type": "application/json"}
+    auth_token = base64.b64encode(f":{_password}".encode()).decode()
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {auth_token}",
+    }
     connection.request("POST", "/chat", body, headers)
     response = connection.getresponse()
     response_data = response.read()
@@ -243,11 +265,16 @@ def send_signal_message_with_attachment(
 
 def make_send_handler(
     request_counter: RequestCounter,
+    password: str,
 ) -> type[http.server.BaseHTTPRequestHandler]:
     """Return a request handler class closed over the given state."""
 
     class SendHandler(http.server.BaseHTTPRequestHandler):
         def do_POST(self) -> None:
+            if not check_auth(self.headers.get("Authorization"), password):
+                self.send_error_response(401, "Unauthorized")
+                return
+
             if self.path == "/send":
                 self._handle_send()
             elif self.path == "/challenge":
@@ -415,9 +442,10 @@ def make_send_handler(
 
 def start_http_server(
     request_counter: RequestCounter,
+    password: str,
 ) -> None:
     """Start the HTTP server on port 8081 in a background daemon thread."""
-    handler_class = make_send_handler(request_counter)
+    handler_class = make_send_handler(request_counter, password)
     server = http.server.HTTPServer(("0.0.0.0", 8081), handler_class)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -576,9 +604,16 @@ def listen_to_sse_stream(
 
 def main() -> None:
     """Main entry point for the signal bridge."""
+    global _password
     log("Starting signal bridge...")
 
     config = load_config()
+
+    password = config.get("password")
+    if not isinstance(password, str) or not password:
+        log("Error: 'password' is missing from config.toml")
+        sys.exit(1)
+    _password = password
 
     signal_config = config.get("signal", {})
     if not isinstance(signal_config, dict):
@@ -597,7 +632,7 @@ def main() -> None:
 
     try:
         wait_for_signal_cli_ready()
-        start_http_server(request_counter)
+        start_http_server(request_counter, password)
         listen_to_sse_stream(request_counter)
     except KeyboardInterrupt:
         log("Received interrupt, shutting down...")

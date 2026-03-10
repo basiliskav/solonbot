@@ -1,5 +1,6 @@
 """HTTP server that accepts Python code and executes it via uv run."""
 
+import base64
 import http.server
 import json
 import os
@@ -8,12 +9,49 @@ import signal
 import subprocess
 import sys
 import tempfile
+import tomllib
 from http import HTTPStatus
 
 
 PORT = 3003
 TIMEOUT_SECONDS = 30
 SIGKILL_GRACE_SECONDS = 5
+CONFIG_PATH = "/root/config/config.toml"
+
+
+def load_config() -> str:
+    """Read config.toml and return the password.
+
+    Raises SystemExit if the password is missing, since the server must not
+    start without authentication configured.
+    """
+    with open(CONFIG_PATH, "rb") as config_file:
+        config = tomllib.load(config_file)
+
+    password = config.get("password")
+    if not password:
+        print("[python-runner] Fatal: 'password' is missing from config.toml", file=sys.stderr)
+        raise SystemExit(1)
+
+    return password
+
+
+PASSWORD = load_config()
+
+
+def check_auth(auth_header: str | None) -> bool:
+    """Return True if the Authorization header contains the correct Basic Auth password."""
+    if not auth_header:
+        return False
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[len("Basic "):]).decode()
+    except Exception:
+        return False
+    # The format is ":password" (empty username).
+    _, _, provided_password = decoded.partition(":")
+    return provided_password == PASSWORD
 
 
 def get_pythonrunner_ids() -> tuple[int, int]:
@@ -141,6 +179,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         """Handle POST /run requests."""
+        if not check_auth(self.headers.get("Authorization")):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+
         if self.path != "/run":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return

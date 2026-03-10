@@ -20,15 +20,17 @@ services:
       - {{ HM_DATA_DIR }}/main:/app/config
       - {{ HM_DATA_DIR }}/app:/app/data
       - {{ HM_DATA_DIR }}/whatsapp:/app/data/whatsapp
-  python-runner: {}
+  python-runner:
+    volumes:
+      - {{ HM_DATA_DIR }}/main:/root/config:ro
   plugin-runner:
     volumes:
-      - {{ HM_DATA_DIR }}/main:/config
+      - {{ HM_DATA_DIR }}/main:/root/config:ro
       - {{ HM_DATA_DIR }}/plugins:/plugins
       - {{ HM_CACHE_DIR }}/plugins:/cache
   coder:
     volumes:
-      - {{ HM_DATA_DIR }}/main:/config
+      - {{ HM_DATA_DIR }}/main:/root/config:ro
       - {{ HM_DATA_DIR }}/coder:/home/coder/.claude
       - {{ HM_DATA_DIR }}/plugins:/plugins
       - {{ HM_CACHE_DIR }}/plugins:/cache
@@ -39,5 +41,5 @@ services:
   signal-bridge:
     profiles: ["signal"]
     volumes:
-      - {{ HM_DATA_DIR }}/main:/app/config:ro
+      - {{ HM_DATA_DIR }}/main:/root/config:ro
       - {{ HM_DATA_DIR }}/signal-cli:/root/.local/share/signal-cli

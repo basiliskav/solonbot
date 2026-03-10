@@ -1,6 +1,7 @@
 import http from "http";
 import { log } from "./log.js";
 import { getBaseStyles } from "./theme.js";
+import { internalFetch } from "./internal-fetch.js";
 
 const PLUGIN_RUNNER_BASE_URL = "http://plugin-runner:3003";
 
@@ -16,7 +17,7 @@ export async function handlePluginsListRequest(
   response: http.ServerResponse,
 ): Promise<void> {
   log.debug("[stavrobot] handlePluginsListRequest: proxying GET /bundles");
-  const pluginResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
+  const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
   const body = await pluginResponse.text();
   log.debug("[stavrobot] handlePluginsListRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
@@ -28,7 +29,7 @@ export async function handlePluginDetailRequest(
   pluginName: string,
 ): Promise<void> {
   log.debug("[stavrobot] handlePluginDetailRequest: proxying GET /bundles/:name for", pluginName);
-  const pluginResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${encodeURIComponent(pluginName)}`);
+  const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${encodeURIComponent(pluginName)}`);
   const body = await pluginResponse.text();
   log.debug("[stavrobot] handlePluginDetailRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
@@ -48,11 +49,8 @@ export async function handlePluginConfigRequest(
     return;
   }
   log.debug("[stavrobot] handlePluginConfigRequest: proxying GET /bundles/:name/config for", pluginName);
-  const pluginResponse = await fetch(
+  const pluginResponse = await internalFetch(
     `${PLUGIN_RUNNER_BASE_URL}/bundles/${encodeURIComponent(pluginName)}/config`,
-    {
-      headers: { "Authorization": `Bearer ${password}` },
-    },
   );
   const body = await pluginResponse.text();
   log.debug("[stavrobot] handlePluginConfigRequest: response status", pluginResponse.status);
@@ -66,7 +64,7 @@ export async function handlePluginInstallRequest(
 ): Promise<void> {
   const body = await readRequestBody(request);
   log.debug("[stavrobot] handlePluginInstallRequest: proxying POST /install");
-  const pluginResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/install`, {
+  const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/install`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
@@ -83,7 +81,7 @@ export async function handlePluginUpdateRequest(
 ): Promise<void> {
   const body = await readRequestBody(request);
   log.debug("[stavrobot] handlePluginUpdateRequest: proxying POST /update");
-  const pluginResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/update`, {
+  const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/update`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
@@ -100,7 +98,7 @@ export async function handlePluginRemoveRequest(
 ): Promise<void> {
   const body = await readRequestBody(request);
   log.debug("[stavrobot] handlePluginRemoveRequest: proxying POST /remove");
-  const pluginResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/remove`, {
+  const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/remove`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
@@ -117,7 +115,7 @@ export async function handlePluginConfigureRequest(
 ): Promise<void> {
   const body = await readRequestBody(request);
   log.debug("[stavrobot] handlePluginConfigureRequest: proxying POST /configure");
-  const pluginResponse = await fetch(`${PLUGIN_RUNNER_BASE_URL}/configure`, {
+  const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/configure`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,

@@ -21,6 +21,7 @@ RUN curl -L "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI
 # Copy the bridge script and supporting modules.
 COPY . /app/
 RUN chmod +x /app/bridge.py
+RUN chmod 700 /root
 
 WORKDIR /app
 
