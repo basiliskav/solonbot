@@ -57,10 +57,22 @@ def setup_plugin_credentials(plugin_dir: str, uid: int, gid: int) -> None:
     if os.path.islink(plugin_claude_dir):
         os.remove(plugin_claude_dir)
     os.makedirs(plugin_claude_dir, exist_ok=True)
+    # Re-check after makedirs to close the TOCTOU window between the symlink removal
+    # above and the directory creation: a racing plugin could have replaced the newly
+    # created directory with a symlink before we get here.
+    if os.path.islink(plugin_claude_dir):
+        raise RuntimeError(f"Race condition detected: {plugin_claude_dir} is a symlink after makedirs")
+    # Guard against the credentials file itself being a symlink, which would cause
+    # shutil.copy2 (running as root) to overwrite the symlink target instead of
+    # creating a regular file.
+    if os.path.islink(plugin_credentials):
+        os.unlink(plugin_credentials)
     shutil.copy2(CODER_CREDENTIALS_PATH, plugin_credentials)
-    os.chown(plugin_claude_dir, uid, gid)
+    # Use lchown instead of chown so that if a symlink somehow exists at these paths
+    # we change ownership of the symlink itself rather than following it.
+    os.lchown(plugin_claude_dir, uid, gid)
     os.chmod(plugin_claude_dir, 0o700)
-    os.chown(plugin_credentials, uid, gid)
+    os.lchown(plugin_credentials, uid, gid)
     os.chmod(plugin_credentials, 0o600)
 
 
@@ -74,7 +86,13 @@ def teardown_plugin_credentials(plugin_dir: str) -> None:
         os.remove(plugin_claude_dir)
         return
     if os.path.exists(plugin_credentials):
-        shutil.copy2(plugin_credentials, CODER_CREDENTIALS_PATH)
+        # The plugin's claude subprocess ran as the plugin user and could have replaced
+        # .credentials.json with a symlink. Since this copy runs as root, following a
+        # symlink here would allow the plugin to read arbitrary root-owned files.
+        if os.path.islink(plugin_credentials):
+            print(f"[stavrobot-coder] Warning: {plugin_credentials} is a symlink; skipping credential copy-back")
+        else:
+            shutil.copy2(plugin_credentials, CODER_CREDENTIALS_PATH)
     shutil.rmtree(plugin_claude_dir, ignore_errors=True)
 
 
@@ -144,7 +162,10 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
         # Ensure the per-plugin cache directory exists and is owned by the plugin user.
         cache_dir = f"/cache/{plugin}/uv"
         os.makedirs(cache_dir, exist_ok=True)
-        subprocess.run(["chown", "-R", f"{uid}:{gid}", f"/cache/{plugin}"], check=True)
+        # The -h flag makes chown change ownership of symlinks themselves rather than
+        # following them, preventing a plugin from using a symlink in its cache directory
+        # to cause root to chown an arbitrary file.
+        subprocess.run(["chown", "-R", "-h", f"{uid}:{gid}", f"/cache/{plugin}"], check=True)
 
         username = f"plug_{plugin.replace('-', '_')}"[:MAX_USERNAME_LENGTH]
         subprocess_env = {

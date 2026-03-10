@@ -180,6 +180,23 @@ interface LoadedTool {
 // In-memory registry, reloaded from disk on each request.
 let bundles: LoadedBundle[] = [];
 
+// Remove a path if it is currently a symlink, so that subsequent writes
+// create a regular file rather than following the link to an attacker-chosen
+// target. Uses lstatSync (not statSync) because statSync follows symlinks and
+// would defeat the purpose. ENOENT is silently ignored — the file simply
+// doesn't exist yet and no guard is needed.
+function removeIfSymlink(filePath: string): void {
+  try {
+    if (fs.lstatSync(filePath).isSymbolicLink()) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
 async function readRequestBody(request: http.IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
@@ -220,6 +237,7 @@ function migratePermissions(bundleDir: string, pluginName: string): string[] {
 
   // Write the default permissions. Existing config keys are preserved.
   const merged = { ...configObject, permissions: ["*"] };
+  removeIfSymlink(configPath);
   fs.writeFileSync(configPath, JSON.stringify(merged, null, 2));
 
   // Fix ownership so the plugin user can read the file.
@@ -383,11 +401,11 @@ function migrateExistingPlugins(): void {
 
     try {
       const { uid, gid } = ensurePluginUser(pluginName);
-      execFileSync("chown", ["-R", `${uid}:${gid}`, bundleDir], { stdio: "pipe" });
+      execFileSync("chown", ["-R", "-h", `${uid}:${gid}`, bundleDir], { stdio: "pipe" });
       fs.chmodSync(bundleDir, 0o700);
       const cacheDir = `/cache/${pluginName}`;
       if (fs.existsSync(cacheDir)) {
-        execFileSync("chown", ["-R", `${uid}:${gid}`, cacheDir], { stdio: "pipe" });
+        execFileSync("chown", ["-R", "-h", `${uid}:${gid}`, cacheDir], { stdio: "pipe" });
       }
       console.log(`[stavrobot-plugin-runner] Migrated plugin "${pluginName}" to user "${derivePluginUsername(pluginName)}"`);
     } catch (error) {
@@ -452,10 +470,12 @@ async function runScript(
   const pluginName = path.relative(PLUGINS_DIR, cwd).split(path.sep)[0];
   const uvCacheDir = `/cache/${pluginName}/uv`;
   const homeDir = `/cache/${pluginName}/home`;
+  removeIfSymlink(uvCacheDir);
   fs.mkdirSync(uvCacheDir, { recursive: true });
+  removeIfSymlink(homeDir);
   fs.mkdirSync(homeDir, { recursive: true });
   fs.chmodSync(homeDir, 0o700);
-  execFileSync("chown", ["-R", `${uid}:${gid}`, `/cache/${pluginName}`], { stdio: "pipe" });
+  execFileSync("chown", ["-R", "-h", `${uid}:${gid}`, `/cache/${pluginName}`], { stdio: "pipe" });
 
   return new Promise<ScriptResult>((resolve) => {
     const child = spawn(entrypoint, [], {
@@ -1105,6 +1125,7 @@ function applyConfigDefaults(
     return appliedKeys;
   }
 
+  removeIfSymlink(configPath);
   fs.writeFileSync(configPath, JSON.stringify(merged, null, 2));
   fs.chownSync(configPath, uid, gid);
 
@@ -1213,7 +1234,7 @@ async function handleInstall(
   }
 
   const { uid, gid } = ensurePluginUser(pluginName);
-  execFileSync("chown", ["-R", `${uid}:${gid}`, destDir], { stdio: "pipe" });
+  execFileSync("chown", ["-R", "-h", `${uid}:${gid}`, destDir], { stdio: "pipe" });
   fs.chmodSync(destDir, 0o700);
 
   const isAsyncInit = rawManifest.init?.async === true;
@@ -1384,7 +1405,7 @@ async function handleUpdate(
 
   // Re-apply ownership after the git reset to fix any new/changed files.
   const { uid, gid } = getPluginUserIds(pluginName);
-  execFileSync("chown", ["-R", `${uid}:${gid}`, pluginDir], { stdio: "pipe" });
+  execFileSync("chown", ["-R", "-h", `${uid}:${gid}`, pluginDir], { stdio: "pipe" });
 
   // Read the manifest from disk after the git reset so we have the updated
   // init config before loadBundles() is called.
@@ -1646,6 +1667,7 @@ async function handleConfigure(
     }
   }
 
+  removeIfSymlink(configPath);
   fs.writeFileSync(configPath, JSON.stringify(mergedConfig, null, 2));
 
   // Fix ownership of config.json so the plugin user can read it.
