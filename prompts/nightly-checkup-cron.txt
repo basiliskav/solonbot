@@ -18,3 +18,12 @@ WHERE m.role IN ('user', 'assistant')
 ORDER BY m.created_at
 
 The user messages already contain Source:, Sender:, and Time: metadata in their text. Cross-reference the results with your memories and system prompt instructions to identify anything you were supposed to do but didn't - for example, updating a diary, updating a memory, sending a message, or any other commitment that was made but not followed through on. For each missed item, do it now. Do not notify the user, unless something goes wrong or you need information from them.
+
+After completing the above review, identify any mistakes, missed tasks, wrong assumptions, incorrect information given, or things handled poorly during the day's conversations. For each failure, append a dated entry to the "Failures log" scratchpad entry (create one if it doesn't exist) with:
+
+- Date
+- Brief description of what went wrong
+- Why it went wrong (what was missing or misunderstood)
+- What would have prevented it (e.g. a memory entry, a different scratchpad structure, a missing check)
+
+If there were no failures, do not add anything to the scratchpad.

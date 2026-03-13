@@ -4,7 +4,7 @@ import type { Pool } from "pg";
 import { loadConfig } from "./config.js";
 import { loadAllowlist } from "./allowlist.js";
 import { initInternalFetch } from "./internal-fetch.js";
-import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, seedNightlyReview, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath } from "./database.js";
+import { connectDatabase, initializeSchema, initializeMemoriesSchema, initializeCompactionsSchema, initializeCronSchema, seedCronEntries, initializePagesSchema, initializeScratchpadSchema, initializeAgentsSchema, seedOwner, getPageByPath, getPageQueryByPath } from "./database.js";
 import { createAgent } from "./agent.js";
 import { initializeQueue, enqueueMessage } from "./queue.js";
 import { initializeScheduler } from "./scheduler.js";
@@ -438,7 +438,7 @@ async function main(): Promise<void> {
   await initializeMemoriesSchema(pool);
   await initializeCompactionsSchema(pool);
   await initializeCronSchema(pool);
-  await seedNightlyReview(pool);
+  await seedCronEntries(pool);
   await initializePagesSchema(pool);
   await initializeScratchpadSchema(pool);
   await initializeAgentsSchema(pool);

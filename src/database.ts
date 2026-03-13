@@ -630,45 +630,65 @@ export async function initializeCronSchema(pool: pg.Pool): Promise<void> {
   `);
 }
 
-const NIGHTLY_CHECKUP_CRON_PATH = "prompts/nightly-checkup-cron.txt";
-const NIGHTLY_REVIEW_MARKER = "[nightly-review]";
-const NIGHTLY_REVIEW_CRON_EXPRESSION = "0 3 * * *";
+interface SeededCronEntry {
+  marker: string;
+  cronExpression: string;
+  promptFile: string;
+}
 
-export async function seedNightlyReview(pool: pg.Pool): Promise<void> {
-  let promptText: string;
-  try {
-    promptText = fs.readFileSync(NIGHTLY_CHECKUP_CRON_PATH, "utf-8").trimEnd();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      log.warn(`[stavrobot] ${NIGHTLY_CHECKUP_CRON_PATH} not found, skipping nightly review seed.`);
-      return;
+const SEEDED_CRON_ENTRIES: SeededCronEntry[] = [
+  {
+    marker: "[nightly-review]",
+    cronExpression: "0 3 * * *",
+    promptFile: "prompts/nightly-checkup-cron.txt",
+  },
+  {
+    marker: "[daily-maintenance]",
+    cronExpression: "0 4 * * *",
+    promptFile: "prompts/daily-maintenance-cron.txt",
+  },
+];
+
+export async function seedCronEntries(pool: pg.Pool): Promise<void> {
+  for (const entry of SEEDED_CRON_ENTRIES) {
+    let promptText: string;
+    try {
+      promptText = fs.readFileSync(entry.promptFile, "utf-8").trimEnd();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        log.warn(`[stavrobot] ${entry.promptFile} not found, skipping cron seed for ${entry.marker}.`);
+        continue;
+      }
+      throw error;
     }
-    throw error;
-  }
 
-  const note = `${NIGHTLY_REVIEW_MARKER} ${promptText}`;
+    const note = `${entry.marker} ${promptText}`;
+    const manualFreezePrefix = `${entry.marker}[manual]`;
 
-  const existing = await pool.query<{ id: number; note: string }>(
-    "SELECT id, note FROM cron_entries WHERE note LIKE $1",
-    [`${NIGHTLY_REVIEW_MARKER}%`],
-  );
-
-  if (existing.rows.length === 0) {
-    await pool.query(
-      "INSERT INTO cron_entries (cron_expression, note) VALUES ($1, $2)",
-      [NIGHTLY_REVIEW_CRON_EXPRESSION, note],
+    const existing = await pool.query<{ id: number; note: string }>(
+      "SELECT id, note FROM cron_entries WHERE note LIKE $1",
+      [`${entry.marker}%`],
     );
-    log.info("[stavrobot] Nightly review cron entry created.");
-  } else {
-    const row = existing.rows[0];
-    if (row.note !== note) {
+
+    if (existing.rows.length === 0) {
       await pool.query(
-        "UPDATE cron_entries SET note = $1 WHERE id = $2",
-        [note, row.id],
+        "INSERT INTO cron_entries (cron_expression, note) VALUES ($1, $2)",
+        [entry.cronExpression, note],
       );
-      log.info("[stavrobot] Nightly review cron entry updated.");
+      log.info(`[stavrobot] Cron entry created for ${entry.marker}.`);
     } else {
-      log.info("[stavrobot] Nightly review cron entry is up to date.");
+      const row = existing.rows[0];
+      if (row.note.startsWith(manualFreezePrefix)) {
+        log.info(`[stavrobot] Cron entry for ${entry.marker} is manually frozen, skipping update.`);
+      } else if (row.note !== note) {
+        await pool.query(
+          "UPDATE cron_entries SET note = $1 WHERE id = $2",
+          [note, row.id],
+        );
+        log.info(`[stavrobot] Cron entry updated for ${entry.marker}.`);
+      } else {
+        log.info(`[stavrobot] Cron entry for ${entry.marker} is up to date.`);
+      }
     }
   }
 }

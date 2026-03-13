@@ -12,8 +12,10 @@ vi.mock("./log.js", () => ({
 vi.mock("./toon.js", () => ({
   encodeToToon: vi.fn(),
 }));
+vi.mock("fs");
 
-import { resolveInterlocutor, seedOwner } from "./database.js";
+import fs from "fs";
+import { resolveInterlocutor, seedOwner, seedCronEntries } from "./database.js";
 import type { OwnerConfig } from "./config.js";
 
 // Seed the owner so getOwnerInterlocutorId() doesn't throw. The mock pool
@@ -235,5 +237,144 @@ describe("resolveInterlocutor — non-email services (exact match)", () => {
     );
     const result = await resolveInterlocutor(pool, "signal", "+1234567890");
     expect(result).toBeNull();
+  });
+});
+
+describe("seedCronEntries", () => {
+  const readFileSyncMock = vi.mocked(fs.readFileSync);
+
+  it("inserts a new cron entry when none exists", async () => {
+    readFileSyncMock.mockReturnValue("do the nightly review");
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const pool = makeMockPool((text, values) => {
+      queries.push({ text, values: values ?? [] });
+      // SELECT returns no existing rows.
+      if (text.includes("SELECT")) {
+        return Promise.resolve({ rows: [], rowCount: 0 } as unknown as QueryResult);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 } as unknown as QueryResult);
+    });
+
+    await seedCronEntries(pool);
+
+    const insertQuery = queries.find((q) => q.text.includes("INSERT INTO cron_entries"));
+    expect(insertQuery).toBeDefined();
+    expect(insertQuery?.values[0]).toBe("0 3 * * *");
+    expect(insertQuery?.values[1]).toBe("[nightly-review] do the nightly review");
+  });
+
+  it("updates an existing entry when the note has changed", async () => {
+    readFileSyncMock.mockReturnValue("updated prompt text");
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const pool = makeMockPool((text, values) => {
+      queries.push({ text, values: values ?? [] });
+      if (text.includes("SELECT")) {
+        return Promise.resolve({
+          rows: [{ id: 99, note: "[nightly-review] old prompt text" }],
+          rowCount: 1,
+        } as unknown as QueryResult);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 } as unknown as QueryResult);
+    });
+
+    await seedCronEntries(pool);
+
+    const updateQuery = queries.find((q) => q.text.includes("UPDATE cron_entries"));
+    expect(updateQuery).toBeDefined();
+    expect(updateQuery?.values[0]).toBe("[nightly-review] updated prompt text");
+    expect(updateQuery?.values[1]).toBe(99);
+  });
+
+  it("does not update when the note is already up to date", async () => {
+    readFileSyncMock.mockReturnValue("same prompt");
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const pool = makeMockPool((text, values) => {
+      queries.push({ text, values: values ?? [] });
+      if (text.includes("SELECT")) {
+        // Return a matching up-to-date row for whichever marker is being queried.
+        const likeParam = (values ?? [])[0] as string;
+        const marker = likeParam.replace(/%$/, "");
+        return Promise.resolve({
+          rows: [{ id: 5, note: `${marker} same prompt` }],
+          rowCount: 1,
+        } as unknown as QueryResult);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 } as unknown as QueryResult);
+    });
+
+    await seedCronEntries(pool);
+
+    const updateQuery = queries.find((q) => q.text.includes("UPDATE cron_entries"));
+    expect(updateQuery).toBeUndefined();
+    const insertQuery = queries.find((q) => q.text.includes("INSERT INTO cron_entries"));
+    expect(insertQuery).toBeUndefined();
+  });
+
+  it("skips update when the existing note starts with the manual freeze prefix", async () => {
+    readFileSyncMock.mockReturnValue("new prompt text");
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const pool = makeMockPool((text, values) => {
+      queries.push({ text, values: values ?? [] });
+      if (text.includes("SELECT")) {
+        // Return a manually-frozen row for whichever marker is being queried.
+        const likeParam = (values ?? [])[0] as string;
+        const marker = likeParam.replace(/%$/, "");
+        return Promise.resolve({
+          rows: [{ id: 7, note: `${marker}[manual] custom frozen note` }],
+          rowCount: 1,
+        } as unknown as QueryResult);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 } as unknown as QueryResult);
+    });
+
+    await seedCronEntries(pool);
+
+    const updateQuery = queries.find((q) => q.text.includes("UPDATE cron_entries"));
+    expect(updateQuery).toBeUndefined();
+  });
+
+  it("does not skip when [manual] appears in the note body but not as the freeze prefix", async () => {
+    readFileSyncMock.mockReturnValue("new prompt text");
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const pool = makeMockPool((text, values) => {
+      queries.push({ text, values: values ?? [] });
+      if (text.includes("SELECT")) {
+        return Promise.resolve({
+          rows: [{ id: 8, note: "[nightly-review] some [manual] note body" }],
+          rowCount: 1,
+        } as unknown as QueryResult);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 } as unknown as QueryResult);
+    });
+
+    await seedCronEntries(pool);
+
+    // The note differs from the built note, so an update should be issued.
+    const updateQuery = queries.find((q) => q.text.includes("UPDATE cron_entries"));
+    expect(updateQuery).toBeDefined();
+  });
+
+  it("logs a warning and skips when the prompt file is missing", async () => {
+    const enoentError = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    readFileSyncMock.mockImplementation(() => { throw enoentError; });
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const pool = makeMockPool((text, values) => {
+      queries.push({ text, values: values ?? [] });
+      return Promise.resolve({ rows: [], rowCount: 0 } as unknown as QueryResult);
+    });
+
+    await seedCronEntries(pool);
+
+    // No DB writes should have occurred.
+    const writeQuery = queries.find((q) => q.text.includes("INSERT") || q.text.includes("UPDATE"));
+    expect(writeQuery).toBeUndefined();
+  });
+
+  it("re-throws non-ENOENT errors from readFileSync", async () => {
+    const permissionError = Object.assign(new Error("EACCES"), { code: "EACCES" });
+    readFileSyncMock.mockImplementation(() => { throw permissionError; });
+    const pool = makeMockPool(() => Promise.resolve({ rows: [], rowCount: 0 } as unknown as QueryResult));
+
+    await expect(seedCronEntries(pool)).rejects.toThrow("EACCES");
   });
 });
