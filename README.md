@@ -8,6 +8,7 @@ A personal AI assistant with persistent memory, sandboxed code execution, and Si
 
 - **Secure.** Everything runs in a container, your host OS is completely invisible to the AI. The AI doesn't see any secrets unless you want it to.
 - **Light.** Doesn't run one container per component. Plugins all run in a single container, separated by Unix permissions.
+- **Use any model you want.** Local, OpenRouter, Anthropic/OpenAI. Whatever [Pi](https://pi.dev) supports, the bot can use.
 - **Signal/Telegram/WhatsApp/Email integration.** Two-way messaging, with formatting, attachments, etc.
 - **Three-tier knowledge.** Remembers everything without blowing out its context.  Intelligently and transparently retrieves data from its memory.
 - **Low token usage.** Various optimizations have been made to be light on token usage. It even uses [TOON](https://github.com/toon-format/toon) internally.

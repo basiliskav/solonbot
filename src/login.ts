@@ -7,9 +7,11 @@ import { getBaseStyles } from "./theme.js";
 
 const CLIENT_ID = atob("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl");
 const AUTHORIZATION_URL = "https://claude.ai/oauth/authorize";
-const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
-const SCOPES = "org:create_api_key user:profile user:inference";
+// Must stay in sync with the SCOPES constant in the Pi library's anthropic.ts, since it
+// is not exported and cannot be imported directly.
+const SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 const LOGIN_PAGE_HTML = `<!DOCTYPE html>
 <html lang="en">
