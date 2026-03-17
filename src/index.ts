@@ -103,7 +103,7 @@ export async function handleChatRequest(
   response: http.ServerResponse
 ): Promise<void> {
   try {
-    const body = await readRequestBody(request);
+    const body = await readRequestBody(request, 25 * 1024 * 1024);
     let parsedBody: unknown;
     
     try {

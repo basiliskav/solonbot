@@ -228,8 +228,8 @@ describe("readRequestBody size limit", () => {
 });
 
 describe("handleChatRequest body size limit", () => {
-  it("returns 413 when the request body exceeds 1 MB", async () => {
-    const oversized = Buffer.alloc(1 * 1024 * 1024 + 1, "x");
+  it("returns 413 when the request body exceeds 25 MB", async () => {
+    const oversized = Buffer.alloc(25 * 1024 * 1024 + 1, "x");
     const request = makeBodyRequest(oversized);
     const response = makeMockResponse();
 
@@ -262,10 +262,10 @@ describe("handleChatRequest base64 file handling", () => {
     expect(saveMock).toHaveBeenCalledOnce();
   });
 
-  it("returns 413 when a base64 file payload exceeds the 1 MB body limit", async () => {
-    // A base64 payload for a 10 MB+ file is ~14 MB, which exceeds the 1 MB body
+  it("returns 413 when a base64 file payload exceeds the 25 MB body limit", async () => {
+    // A base64 payload for a 20 MB+ file is ~27 MB, which exceeds the 25 MB body
     // limit. The body limit fires before the per-file 10 MB check is reached.
-    const oversizedBase64 = Buffer.alloc(10 * 1024 * 1024 + 1, "a").toString("base64");
+    const oversizedBase64 = Buffer.alloc(20 * 1024 * 1024 + 1, "a").toString("base64");
     const payload = JSON.stringify({
       message: "hello",
       files: [{ data: oversizedBase64, filename: "big.bin", mimeType: "application/octet-stream" }],
