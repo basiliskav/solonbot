@@ -2,7 +2,7 @@ import { describe, it, expect, vi, type MockedFunction, beforeEach } from "vites
 import type { Agent, AgentMessage, AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { complete } from "@mariozechner/pi-ai";
 import type { Pool } from "pg";
-import { serializeMessagesForSummary, filterToolsForSubagent, formatPluginListSection, truncateContext, createManageKnowledgeTool, injectAutoSearchBlock, pendingAutoSearchBlocks, handlePrompt, createAgent, escalatingSummarize } from "./agent.js";
+import { serializeMessagesForSummary, filterToolsForSubagent, formatPluginListSection, truncateContext, createManageKnowledgeTool, injectAutoSearchBlock, pendingAutoSearchBlocks, handlePrompt, createAgent, escalatingSummarize, selectCompactionCutIndex } from "./agent.js";
 import { getApiKey } from "./auth.js";
 import { loadMessages, loadAllMemories, loadAllScratchpadTitles, getMainAgentId } from "./database.js";
 import { runSearch } from "./search.js";
@@ -1188,5 +1188,106 @@ describe("escalatingSummarize", () => {
     const level2Prompt = mockComplete.mock.calls[1][1].systemPrompt as string;
     // 300 chars / 3 / 2 = 50 tokens target.
     expect(level2Prompt).toContain("50");
+  });
+});
+
+// Build a user message with a string content of the given character length.
+// Each character is 1/3 token (CHARS_PER_TOKEN = 3), so charCount / 3 = tokens.
+function userMsg(charCount: number): AgentMessage {
+  return { role: "user", content: "u".repeat(charCount), timestamp: 0 };
+}
+
+function assistantMsg(charCount: number): AgentMessage {
+  return assistantMessage([{ type: "text", text: "a".repeat(charCount) }]);
+}
+
+describe("selectCompactionCutIndex", () => {
+  // threshold = 300 tokens → keepBudget = 150 tokens = 450 chars
+
+  it("returns the index of the first user message after the token-based cut (forward path)", () => {
+    // Build a history where the last few messages fit within the keep budget and
+    // the cut lands exactly on a user message, so the forward scan succeeds immediately.
+    // threshold = 300 tokens, keepBudget = 150 tokens = 450 chars.
+    // Messages (each 100 chars = ~33 tokens):
+    //   [0] user 100 chars
+    //   [1] assistant 100 chars
+    //   [2] user 100 chars   ← cut lands here (accumulated = 33+33 = 66 < 150, then adding [0] would exceed)
+    //   [3] assistant 100 chars
+    //   [4] user 100 chars   ← keep budget: 33+33+33 = 99 < 150, adding [1] would be 132 < 150, adding [0] = 165 > 150 → cutIndex = 1
+    // Actually let's use larger messages to make the arithmetic clear.
+    // 5 messages of 150 chars each = 50 tokens each. keepBudget = 150 tokens.
+    // Walk backward: i=4 acc=50, i=3 acc=100, i=2 acc=150 (exactly at budget, not exceeded), i=1: 150+50=200 > 150 → cutIndex = 2.
+    // messages[2].role = "user" → forward scan stops immediately → returns 2.
+    const messages: AgentMessage[] = [
+      userMsg(150),       // [0]
+      assistantMsg(150),  // [1]
+      userMsg(150),       // [2] ← expected cut point
+      assistantMsg(150),  // [3]
+      userMsg(150),       // [4]
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBe(2);
+  });
+
+  it("falls back to backward scan when no user message exists after the cut (backward path)", () => {
+    // threshold = 300 tokens, keepBudget = 150 tokens = 450 chars.
+    // Messages:
+    //   [0] user 150 chars (50 tokens)
+    //   [1] assistant 150 chars (50 tokens)
+    //   [2] user 150 chars (50 tokens)
+    //   [3] assistant 450 chars (150 tokens) ← huge response
+    //   [4] assistant 150 chars (50 tokens)
+    // Walk backward: i=4 acc=50, i=3: 50+150=200 > 150 → cutIndex = 4.
+    // Forward scan from 4: messages[4].role = "assistant" → advance to 5 → out of bounds.
+    // Backward scan from 4: messages[4]="assistant", messages[3]="assistant", messages[2]="user" → backwardIndex = 2.
+    const messages: AgentMessage[] = [
+      userMsg(150),       // [0]
+      assistantMsg(150),  // [1]
+      userMsg(150),       // [2] ← expected backward fallback cut point
+      assistantMsg(450),  // [3] huge response
+      assistantMsg(150),  // [4]
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBe(2);
+  });
+
+  it("returns null when there are no user messages at all", () => {
+    // All assistant messages — no safe cut point exists.
+    const messages: AgentMessage[] = [
+      assistantMsg(150),
+      assistantMsg(150),
+      assistantMsg(150),
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when the only user message is at index 0 (backward scan would return 0)", () => {
+    // threshold = 300 tokens, keepBudget = 150 tokens = 450 chars.
+    // Messages:
+    //   [0] user 30 chars (10 tokens)
+    //   [1] assistant 1500 chars (500 tokens) ← huge, exceeds keep budget
+    // Walk backward: i=1: 0+500 > 150 → cutIndex = 2.
+    // Forward scan from 2: out of bounds.
+    // Backward scan from 2: messages[1]="assistant", messages[0]="user" → backwardIndex = 0.
+    // backwardIndex <= 0 → return null (compacting zero messages is pointless).
+    const messages: AgentMessage[] = [
+      userMsg(30),          // [0] only user message
+      assistantMsg(1500),   // [1] huge response
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when all messages fit within the keep budget", () => {
+    // threshold = 300 tokens, keepBudget = 150 tokens.
+    // 2 messages of 30 chars each = 10 tokens each = 20 tokens total < 150.
+    // The backward loop never sets cutIndex away from 0 → returns null.
+    const messages: AgentMessage[] = [
+      userMsg(30),
+      assistantMsg(30),
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBeNull();
   });
 });

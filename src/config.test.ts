@@ -115,3 +115,29 @@ telegram = "987654321"
     expect(config.baseAgentPrompt).toBe("You are Stavrobot.");
   });
 });
+
+describe("loadConfig compactionTokenThreshold", () => {
+  it("defaults to 80000 when the key is omitted from the TOML", async () => {
+    setupMocks(BASE_TOML);
+    const { loadConfig } = await import("./config.js");
+    const config = loadConfig();
+    expect(config.compactionTokenThreshold).toBe(80000);
+  });
+
+  it("uses the value from TOML when the key is present", async () => {
+    const tomlWithThreshold = `
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+apiKey = "test-key"
+publicHostname = "https://example.com"
+compactionTokenThreshold = 50000
+
+[owner]
+name = "Stavros"
+`;
+    setupMocks(tomlWithThreshold);
+    const { loadConfig } = await import("./config.js");
+    const config = loadConfig();
+    expect(config.compactionTokenThreshold).toBe(50000);
+  });
+});

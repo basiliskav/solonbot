@@ -1224,6 +1224,55 @@ export function estimateTokens(messages: AgentMessage[]): number {
   return total;
 }
 
+// Selects the index of the first message to keep after compaction, or null if
+// no safe cut point exists. The cut always lands on a user message so the
+// compacted slice never ends mid-tool-use/tool-result pair.
+//
+// The algorithm walks backward from the end of messages accumulating tokens
+// until the keep budget (50% of threshold) is exceeded, then advances forward
+// to the next user message. If no user message exists forward of the cut, it
+// falls back to scanning backward for the nearest earlier user message. If
+// there are no user messages at all, null is returned and compaction is skipped.
+export function selectCompactionCutIndex(messages: AgentMessage[], compactionTokenThreshold: number): number | null {
+  const keepTokenBudget = compactionTokenThreshold * 0.5;
+  let accumulatedTokens = 0;
+  let cutIndex = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const messageTokens = estimateTokens([messages[i]]);
+    if (accumulatedTokens + messageTokens > keepTokenBudget) {
+      cutIndex = i + 1;
+      break;
+    }
+    accumulatedTokens += messageTokens;
+    cutIndex = i;
+  }
+
+  if (cutIndex === 0) {
+    return null;
+  }
+
+  // Advance forward to the next user message.
+  while (cutIndex < messages.length && messages[cutIndex].role !== "user") {
+    cutIndex++;
+  }
+
+  if (cutIndex < messages.length) {
+    return cutIndex;
+  }
+
+  // No user message found forward — scan backward to find the nearest safe boundary.
+  // This compacts less of the history (keeps more) but still makes progress.
+  let backwardIndex = cutIndex - 1;
+  while (backwardIndex >= 0 && messages[backwardIndex].role !== "user") {
+    backwardIndex--;
+  }
+  if (backwardIndex <= 0) {
+    return null;
+  }
+  log.info(`[stavrobot] Forward scan found no user message, fell back to backward scan (cutIndex=${backwardIndex}).`);
+  return backwardIndex;
+}
+
 // Messages and blocks are copied only when modified to avoid mutating the
 // caller's data.
 export function truncateContext(messages: AgentMessage[], tokenBudget: number): AgentMessage[] {
@@ -2196,44 +2245,12 @@ export async function handlePrompt(
 
     void (async () => {
       try {
-        // Walk backward from the end of currentMessages, accumulating estimated tokens,
-        // until we exceed 50% of the compaction threshold. This keeps roughly half the
-        // threshold worth of recent messages, so the post-compaction context is well
-        // below the trigger and won't immediately re-trigger compaction.
-        const keepTokenBudget = config.compactionTokenThreshold * 0.5;
-        let accumulatedTokens = 0;
-        let cutIndex = currentMessages.length;
-        for (let i = currentMessages.length - 1; i >= 0; i--) {
-          const messageTokens = estimateTokens([currentMessages[i]]);
-          if (accumulatedTokens + messageTokens > keepTokenBudget) {
-            cutIndex = i + 1;
-            break;
-          }
-          accumulatedTokens += messageTokens;
-          cutIndex = i;
-        }
-
-        // If the total estimated tokens of all messages are below the keep budget,
-        // there is nothing worth compacting.
-        if (cutIndex === 0) {
-          log.warn("[stavrobot] Compaction skipped: all messages fit within the keep budget, nothing to compact.");
+        const cutIndexOrNull = selectCompactionCutIndex(currentMessages, config.compactionTokenThreshold);
+        if (cutIndexOrNull === null) {
+          log.warn("[stavrobot] Compaction skipped: no safe cut point found (no user messages or all messages fit within the keep budget).");
           return;
         }
-
-        // Advance the cut point to the next user message. A user message is always a
-        // safe compaction boundary: it is never part of a tool-use/tool-result pair and
-        // is never stripped by the library's transformMessages. Landing on an assistant
-        // message risks orphaning a toolResult that follows it, which the Anthropic API
-        // rejects with a 400 error.
-        while (cutIndex < currentMessages.length && currentMessages[cutIndex].role !== "user") {
-          cutIndex++;
-        }
-
-        // If no user message was found after the token-based cut point, skip compaction for this turn.
-        if (cutIndex >= currentMessages.length) {
-          log.warn("[stavrobot] Compaction skipped: no user message found after token-based cut point, no safe cut point found.");
-          return;
-        }
+        const cutIndex = cutIndexOrNull;
 
         const messagesToCompact = currentMessages.slice(0, cutIndex);
         const messagesToKeep = currentMessages.slice(cutIndex);
