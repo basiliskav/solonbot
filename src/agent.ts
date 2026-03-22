@@ -1224,15 +1224,45 @@ export function estimateTokens(messages: AgentMessage[]): number {
   return total;
 }
 
+// Returns true if messages[index] is a user message at a turn boundary — i.e.,
+// a safe place to cut the conversation history. A user message is a turn
+// boundary when:
+//   - It is the first message (index 0), OR
+//   - The previous message is also a user message (consecutive user messages), OR
+//   - The previous message is an assistant message with no toolCall blocks.
+//
+// Steering injects user messages mid-turn (between an assistant toolCall and its
+// toolResult). Cutting there would orphan the toolResult and cause a 400 from the
+// Anthropic API. Those injected messages are NOT turn boundaries.
+export function isTurnBoundary(messages: AgentMessage[], index: number): boolean {
+  if (messages[index].role !== "user") {
+    return false;
+  }
+  if (index === 0) {
+    return true;
+  }
+  const previous = messages[index - 1];
+  if (previous.role === "user") {
+    return true;
+  }
+  if (previous.role === "assistant") {
+    const hasToolCall = (previous.content as Array<{ type: string }>).some((block) => block.type === "toolCall");
+    return !hasToolCall;
+  }
+  // Previous message is a toolResult — we are mid-turn.
+  return false;
+}
+
 // Selects the index of the first message to keep after compaction, or null if
-// no safe cut point exists. The cut always lands on a user message so the
-// compacted slice never ends mid-tool-use/tool-result pair.
+// no safe cut point exists. The cut always lands on a turn-boundary user message
+// so the compacted slice never ends mid-tool-use/tool-result pair.
 //
 // The algorithm walks backward from the end of messages accumulating tokens
 // until the keep budget (50% of threshold) is exceeded, then advances forward
-// to the next user message. If no user message exists forward of the cut, it
-// falls back to scanning backward for the nearest earlier user message. If
-// there are no user messages at all, null is returned and compaction is skipped.
+// to the next turn-boundary user message. If no such message exists forward of
+// the cut, it falls back to scanning backward for the nearest earlier one. If
+// there are no turn-boundary user messages at all, null is returned and
+// compaction is skipped.
 export function selectCompactionCutIndex(messages: AgentMessage[], compactionTokenThreshold: number): number | null {
   const keepTokenBudget = compactionTokenThreshold * 0.5;
   let accumulatedTokens = 0;
@@ -1251,8 +1281,8 @@ export function selectCompactionCutIndex(messages: AgentMessage[], compactionTok
     return null;
   }
 
-  // Advance forward to the next user message.
-  while (cutIndex < messages.length && messages[cutIndex].role !== "user") {
+  // Advance forward to the next turn-boundary user message.
+  while (cutIndex < messages.length && !isTurnBoundary(messages, cutIndex)) {
     cutIndex++;
   }
 
@@ -1260,10 +1290,11 @@ export function selectCompactionCutIndex(messages: AgentMessage[], compactionTok
     return cutIndex;
   }
 
-  // No user message found forward — scan backward to find the nearest safe boundary.
-  // This compacts less of the history (keeps more) but still makes progress.
+  // No turn-boundary user message found forward — scan backward to find the
+  // nearest earlier one. This compacts less of the history (keeps more) but
+  // still makes progress.
   let backwardIndex = cutIndex - 1;
-  while (backwardIndex >= 0 && messages[backwardIndex].role !== "user") {
+  while (backwardIndex >= 0 && !isTurnBoundary(messages, backwardIndex)) {
     backwardIndex--;
   }
   if (backwardIndex <= 0) {

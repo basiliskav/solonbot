@@ -2,7 +2,7 @@ import { describe, it, expect, vi, type MockedFunction, beforeEach } from "vites
 import type { Agent, AgentMessage, AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { complete } from "@mariozechner/pi-ai";
 import type { Pool } from "pg";
-import { serializeMessagesForSummary, filterToolsForSubagent, formatPluginListSection, truncateContext, createManageKnowledgeTool, injectAutoSearchBlock, pendingAutoSearchBlocks, handlePrompt, createAgent, escalatingSummarize, selectCompactionCutIndex } from "./agent.js";
+import { serializeMessagesForSummary, filterToolsForSubagent, formatPluginListSection, truncateContext, createManageKnowledgeTool, injectAutoSearchBlock, pendingAutoSearchBlocks, handlePrompt, createAgent, escalatingSummarize, selectCompactionCutIndex, isTurnBoundary } from "./agent.js";
 import { getApiKey } from "./auth.js";
 import { loadMessages, loadAllMemories, loadAllScratchpadTitles, getMainAgentId } from "./database.js";
 import { runSearch } from "./search.js";
@@ -1289,5 +1289,118 @@ describe("selectCompactionCutIndex", () => {
     ];
     const result = selectCompactionCutIndex(messages, 300);
     expect(result).toBeNull();
+  });
+
+  it("forward scan skips a steered user message and finds a valid turn boundary further ahead", () => {
+    // The backward walk lands on a steered user message (injected mid-turn between
+    // a toolCall and its toolResult). The forward scan must skip it and advance to
+    // the real turn boundary at [5].
+    // threshold=200, keepBudget=100. The toolCall at [1] is ~50 tokens so the
+    // backward walk sets cutIndex=2 (the steered user message).
+    const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: { query: "x".repeat(140) } }]);
+    const messages: AgentMessage[] = [
+      userMsg(60),              // [0] real turn boundary
+      assistantWithToolCall,    // [1] has toolCall (~50 tokens)
+      userMsg(60),              // [2] steered mid-turn (NOT a boundary)
+      toolResultMessage("execute_sql", "a".repeat(60)),  // [3]
+      assistantMsg(60),         // [4] text-only
+      userMsg(60),              // [5] real turn boundary ← expected cut point
+    ];
+    const result = selectCompactionCutIndex(messages, 200);
+    expect(result).toBe(5);
+  });
+
+  it("backward scan fallback skips steered user messages when forward scan finds no boundary", () => {
+    // The forward scan exhausts the message list without finding a turn-boundary
+    // user message. The backward scan must also skip steered (mid-turn) user
+    // messages and land on the nearest earlier real turn boundary at [2].
+    // threshold=300, keepBudget=150. The tail of the history (messages [4]–[7])
+    // contains only non-boundary user messages, so both scans must skip them.
+    const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: {} }]);
+    const messages: AgentMessage[] = [
+      userMsg(150),             // [0] real turn boundary
+      assistantMsg(150),        // [1] text-only
+      userMsg(150),             // [2] real turn boundary ← expected cut point
+      assistantWithToolCall,    // [3] has toolCall
+      userMsg(150),             // [4] steered mid-turn (NOT a boundary)
+      toolResultMessage("execute_sql", "a".repeat(150)),  // [5]
+      userMsg(150),             // [6] user after toolResult (NOT a boundary)
+      assistantMsg(150),        // [7]
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBe(2);
+  });
+
+  it("skips a steered user message in the backward scan fallback", () => {
+    // When the forward scan finds no turn-boundary user message, the backward scan
+    // must also skip steered (mid-turn) user messages and land on [2].
+    // threshold=300, keepBudget=150. The large toolResult at [5] forces the
+    // backward walk to set cutIndex=6, and neither scan finds a boundary after it.
+    const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: {} }]);
+    const messages: AgentMessage[] = [
+      userMsg(150),             // [0] real turn boundary
+      assistantMsg(150),        // [1] text-only
+      userMsg(150),             // [2] real turn boundary ← expected cut point
+      assistantWithToolCall,    // [3] has toolCall
+      userMsg(150),             // [4] steered mid-turn (NOT a boundary)
+      toolResultMessage("execute_sql", "a".repeat(450)),  // [5] large
+      assistantMsg(150),        // [6]
+    ];
+    const result = selectCompactionCutIndex(messages, 300);
+    expect(result).toBe(2);
+  });
+});
+
+describe("isTurnBoundary", () => {
+  it("returns true for the first message when it is a user message", () => {
+    const messages: AgentMessage[] = [
+      userMsg(10),
+      assistantMsg(10),
+    ];
+    expect(isTurnBoundary(messages, 0)).toBe(true);
+  });
+
+  it("returns false for a non-user message", () => {
+    const messages: AgentMessage[] = [
+      userMsg(10),
+      assistantMsg(10),
+    ];
+    expect(isTurnBoundary(messages, 1)).toBe(false);
+  });
+
+  it("returns true for a user message after a text-only assistant message", () => {
+    const messages: AgentMessage[] = [
+      userMsg(10),
+      assistantMsg(10),
+      userMsg(10),
+    ];
+    expect(isTurnBoundary(messages, 2)).toBe(true);
+  });
+
+  it("returns false for a user message after an assistant message with a toolCall block", () => {
+    const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: {} }]);
+    const messages: AgentMessage[] = [
+      userMsg(10),
+      assistantWithToolCall,
+      userMsg(10),
+    ];
+    expect(isTurnBoundary(messages, 2)).toBe(false);
+  });
+
+  it("returns false for a user message after a toolResult message", () => {
+    const messages: AgentMessage[] = [
+      userMsg(10),
+      toolResultMessage("execute_sql", "result"),
+      userMsg(10),
+    ];
+    expect(isTurnBoundary(messages, 2)).toBe(false);
+  });
+
+  it("returns true for consecutive user messages", () => {
+    const messages: AgentMessage[] = [
+      userMsg(10),
+      userMsg(10),
+    ];
+    expect(isTurnBoundary(messages, 1)).toBe(true);
   });
 });
