@@ -198,10 +198,19 @@ function removeIfSymlink(filePath: string): void {
   }
 }
 
-async function readRequestBody(request: http.IncomingMessage): Promise<string> {
+async function readRequestBody(
+  request: http.IncomingMessage,
+  maxBytes: number = 50 * 1024 * 1024,
+): Promise<string> {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of request) {
-    chunks.push(chunk);
+    totalBytes += (chunk as Buffer).length;
+    if (totalBytes > maxBytes) {
+      request.destroy();
+      throw new Error("Request body too large");
+    }
+    chunks.push(chunk as Buffer);
   }
   return Buffer.concat(chunks).toString("utf-8");
 }
