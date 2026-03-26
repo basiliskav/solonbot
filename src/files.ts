@@ -11,14 +11,14 @@ const FILES_DIR = path.join(TEMP_ATTACHMENTS_DIR, "files");
 const HELP_TEXT = `manage_files: manage files in a temporary directory (${FILES_DIR}).
 
 Actions:
-- write: write content to a file. Parameters: filename (required), content (required), encoding ("utf-8" default or "base64").
+- write: write content to a file. Parameters: filename (required), content (required), encoding ("utf-8" default or "base64"). Also accepts an absolute path under ${TEMP_ATTACHMENTS_DIR} (e.g. a plugin output file path).
 - read: read a file's content as utf-8 text. Parameters: filename (required). Also accepts an absolute path under ${TEMP_ATTACHMENTS_DIR} (e.g. a plugin output file path).
 - list: list all files in the directory. Returns absolute paths, one per line.
-- delete: delete a file. Parameters: filename (required).
+- delete: delete a file. Parameters: filename (required). Also accepts an absolute path under ${TEMP_ATTACHMENTS_DIR} (e.g. a plugin output file path).
 - help: show this help text.
 
 Constraints:
-- Flat namespace only. Filenames must not contain "/" or "\\" (no subdirectories).
+- Flat filenames must not contain "/" or "\\" (no subdirectories). Absolute paths must be under ${TEMP_ATTACHMENTS_DIR}.
 - Files are ephemeral. They live in ${FILES_DIR} and may be deleted automatically when passed as attachmentPath to send_signal_message or send_telegram_message.
 - To send a file as an attachment, pass its absolute path (returned by write or list) as the attachmentPath parameter to send_signal_message or send_telegram_message.
 - No size limits are enforced.`;
@@ -28,6 +28,23 @@ function validateFilename(filename: string): string | null {
     return "Error: filename must not contain path separators ('/' or '\\\\').";
   }
   return null;
+}
+
+// Returns the resolved absolute path, or an error string if the input is invalid.
+// Flat filenames resolve to FILES_DIR; absolute paths must be under TEMP_ATTACHMENTS_DIR.
+function resolvePath(filename: string): { filePath: string } | { error: string } {
+  if (path.isAbsolute(filename)) {
+    const resolved = path.resolve(filename);
+    if (!resolved.startsWith(TEMP_ATTACHMENTS_DIR + path.sep) && resolved !== TEMP_ATTACHMENTS_DIR) {
+      return { error: `Error: path must be under ${TEMP_ATTACHMENTS_DIR}.` };
+    }
+    return { filePath: resolved };
+  }
+  const filenameError = validateFilename(filename);
+  if (filenameError !== null) {
+    return { error: filenameError };
+  }
+  return { filePath: path.join(FILES_DIR, filename) };
 }
 
 export function createManageFilesTool(): AgentTool {
@@ -43,7 +60,7 @@ export function createManageFilesTool(): AgentTool {
         Type.Literal("delete"),
         Type.Literal("help"),
       ], { description: "Action to perform: write, read, list, delete, or help." }),
-      filename: Type.Optional(Type.String({ description: "Filename (no path separators) for write/delete, or a filename or absolute path for read. Required for write, read, and delete." })),
+      filename: Type.Optional(Type.String({ description: "Flat filename (no path separators) resolved to the files directory, or an absolute path under TEMP_ATTACHMENTS_DIR. Required for write, read, and delete." })),
       content: Type.Optional(Type.String({ description: "File content. Required for write." })),
       encoding: Type.Optional(Type.String({ description: "Encoding for write: 'utf-8' (default) or 'base64'." })),
     }),
@@ -85,16 +102,16 @@ export function createManageFilesTool(): AgentTool {
         if (raw.filename === undefined || raw.filename.trim() === "") {
           return toolError("Error: filename is required for write.");
         }
-        const filenameError = validateFilename(raw.filename);
-        if (filenameError !== null) {
-          return toolError(filenameError);
-        }
         if (raw.content === undefined) {
           return toolError("Error: content is required for write.");
         }
 
-        await fs.mkdir(FILES_DIR, { recursive: true });
-        const filePath = path.join(FILES_DIR, raw.filename);
+        const resolved = resolvePath(raw.filename);
+        if ("error" in resolved) {
+          return toolError(resolved.error);
+        }
+        const filePath = resolved.filePath;
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
 
         const encoding = raw.encoding ?? "utf-8";
         if (encoding === "base64") {
@@ -113,21 +130,11 @@ export function createManageFilesTool(): AgentTool {
           return toolError("Error: filename is required for read.");
         }
 
-        let filePath: string;
-        if (path.isAbsolute(raw.filename)) {
-          // Absolute path: allow reading any file under the temp attachments root
-          // (e.g. plugin output files at /tmp/stavrobot-temp/web-get/foo.txt).
-          filePath = path.resolve(raw.filename);
-          if (!filePath.startsWith(TEMP_ATTACHMENTS_DIR + path.sep) && filePath !== TEMP_ATTACHMENTS_DIR) {
-            return toolError(`Error: path must be under ${TEMP_ATTACHMENTS_DIR}.`);
-          }
-        } else {
-          const filenameError = validateFilename(raw.filename);
-          if (filenameError !== null) {
-            return toolError(filenameError);
-          }
-          filePath = path.join(FILES_DIR, raw.filename);
+        const resolved = resolvePath(raw.filename);
+        if ("error" in resolved) {
+          return toolError(resolved.error);
         }
+        const filePath = resolved.filePath;
 
         const fileContent = await fs.readFile(filePath, "utf-8");
         log.debug(`[stavrobot] manage_files read: ${filePath} (${fileContent.length} chars)`);
@@ -138,12 +145,12 @@ export function createManageFilesTool(): AgentTool {
         if (raw.filename === undefined || raw.filename.trim() === "") {
           return toolError("Error: filename is required for delete.");
         }
-        const filenameError = validateFilename(raw.filename);
-        if (filenameError !== null) {
-          return toolError(filenameError);
-        }
 
-        const filePath = path.join(FILES_DIR, raw.filename);
+        const resolved = resolvePath(raw.filename);
+        if ("error" in resolved) {
+          return toolError(resolved.error);
+        }
+        const filePath = resolved.filePath;
         await fs.unlink(filePath);
         const successMessage = `File deleted: ${filePath}`;
         log.debug(`[stavrobot] manage_files delete: ${filePath}`);
