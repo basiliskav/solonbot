@@ -30,16 +30,29 @@ interface MessageStats {
   signal: string;
   telegram: string;
   whatsapp: string;
+  email: string;
   web: string;
   agent: string;
 }
 
 function buildHtml(config: Config, uptime: string, stats: MessageStats): string {
+  const emailStatus = (() => {
+    if (config.email === undefined) return "Disabled";
+    const hasInbound = config.email.webhookSecret !== undefined;
+    const hasOutbound = config.email.smtpHost !== undefined;
+    if (hasInbound && hasOutbound) return "Enabled";
+    if (hasInbound) return "Inbound only";
+    if (hasOutbound) return "Outbound only";
+    return "Disabled";
+  })();
+
   const services = [
-    { name: "Signal", enabled: config.signal !== undefined },
-    { name: "Telegram", enabled: config.telegram !== undefined },
-    { name: "WhatsApp", enabled: config.whatsapp !== undefined },
-    { name: "Coder", enabled: config.coder !== undefined },
+    { name: "Signal", status: config.signal !== undefined ? "Enabled" : "Disabled" },
+    { name: "Telegram", status: config.telegram !== undefined ? "Enabled" : "Disabled" },
+    { name: "WhatsApp", status: config.whatsapp !== undefined ? "Enabled" : "Disabled" },
+    { name: "Email", status: emailStatus },
+    { name: "Coder", status: config.coder !== undefined ? "Enabled" : "Disabled" },
+    { name: "Embeddings", status: config.embeddings !== undefined ? "Enabled" : "Disabled" },
   ];
 
   const serviceRows = services
@@ -47,7 +60,7 @@ function buildHtml(config: Config, uptime: string, stats: MessageStats): string 
       (service) =>
         `<div class="stat-row">
       <span class="stat-label">${service.name}</span>
-      <span class="stat-value ${service.enabled ? "enabled" : "disabled"}">${service.enabled ? "Enabled" : "Disabled"}</span>
+      <span class="stat-value ${service.status === "Disabled" ? "disabled" : "enabled"}">${service.status}</span>
     </div>`,
     )
     .join("\n    ");
@@ -394,6 +407,10 @@ function buildHtml(config: Config, uptime: string, stats: MessageStats): string 
           <span class="stat-value">${stats.whatsapp}</span>
         </div>
         <div class="stat-row">
+          <span class="stat-label">Email</span>
+          <span class="stat-value">${stats.email}</span>
+        </div>
+        <div class="stat-row">
           <span class="stat-label">Web API</span>
           <span class="stat-value">${stats.web}</span>
         </div>
@@ -557,6 +574,7 @@ export async function serveHomePage(
         COUNT(*) FILTER (WHERE ii.service = 'signal') AS signal,
         COUNT(*) FILTER (WHERE ii.service = 'telegram') AS telegram,
         COUNT(*) FILTER (WHERE ii.service = 'whatsapp') AS whatsapp,
+        COUNT(*) FILTER (WHERE ii.service = 'email') AS email,
         COUNT(*) FILTER (WHERE m.sender_identity_id IS NULL AND m.sender_agent_id IS NULL) AS web,
         COUNT(*) FILTER (WHERE m.sender_agent_id IS NOT NULL) AS agent
       FROM messages m
