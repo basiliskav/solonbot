@@ -23,8 +23,8 @@ CODER_CREDENTIALS_PATH = "/home/coder/.claude/.credentials.json"
 PLUGIN_NAME_RE = re.compile(r"^[a-z0-9-]+$")
 
 
-def load_config() -> tuple[str, str]:
-    """Read config.toml and return (password, model).
+def load_config() -> tuple[str, str, str | None, str | None]:
+    """Read config.toml and return (password, model, api_key, coder_base_url).
 
     Raises SystemExit if the password is missing, since the server must not
     start without authentication configured.
@@ -40,10 +40,15 @@ def load_config() -> tuple[str, str]:
     coder_section = config.get("coder", {})
     model = coder_section["model"]
 
-    return password, model
+    api_key: str | None = config.get("apiKey") or None
+    base_url: str | None = config.get("baseUrl") or None
+    if base_url is not None and base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+
+    return password, model, api_key, base_url
 
 
-PASSWORD, MODEL = load_config()
+PASSWORD, MODEL, API_KEY, BASE_URL = load_config()
 
 
 def ensure_plugin_user(plugin_name: str, uid: int, gid: int) -> None:
@@ -162,6 +167,7 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
 
     cwd = os.path.join(PLUGINS_DIR, plugin)
 
+    use_api_key_auth = API_KEY is not None and BASE_URL is not None
     credentials_set_up = False
     result_text = ""
 
@@ -175,11 +181,14 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
         # has a valid passwd entry.
         ensure_plugin_user(plugin, uid, gid)
 
-        # Copy credentials into the plugin directory so claude can authenticate when
-        # running as the plugin user. HOME is set to the plugin directory so claude
-        # finds .claude/.credentials there.
-        setup_plugin_credentials(cwd, uid, gid)
-        credentials_set_up = True
+        if use_api_key_auth:
+            print(f"[stavrobot-coder] Using API key auth for task {task_id}")
+        else:
+            # Copy credentials into the plugin directory so claude can authenticate when
+            # running as the plugin user. HOME is set to the plugin directory so claude
+            # finds .claude/.credentials there.
+            setup_plugin_credentials(cwd, uid, gid)
+            credentials_set_up = True
 
         # Ensure the per-plugin cache directory exists and is owned by the plugin user.
         cache_dir = f"/cache/{plugin}/uv"
@@ -201,6 +210,11 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
             "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
             "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
         }
+
+        if use_api_key_auth:
+            assert API_KEY is not None and BASE_URL is not None
+            subprocess_env["ANTHROPIC_API_KEY"] = API_KEY
+            subprocess_env["ANTHROPIC_BASE_URL"] = BASE_URL
 
         print(f"[stavrobot-coder] Running as uid={uid} gid={gid} in {cwd}")
 
