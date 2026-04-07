@@ -11,6 +11,16 @@ import { getBaseStyles } from "./theme.js";
 // single-user bot — only one login flow runs at a time.
 let pendingPromptResolver: ((value: string) => void) | null = null;
 
+// Module-level state for the active login flow. Used to cancel an in-progress
+// flow when a new SSE connection arrives, so the library's callback server on
+// port 53692 is closed before the new flow tries to bind the same port.
+let loginAbortReject: ((error: Error) => void) | null = null;
+let activeLoginPromise: Promise<void> | null = null;
+let loginCancelled = false;
+// Monotonically increasing counter so stale disconnect handlers from an old
+// flow cannot accidentally clear state that belongs to a newer flow.
+let loginFlowCounter = 0;
+
 function buildLoginPageHtml(providerName: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -178,6 +188,30 @@ export async function handleLoginEvents(
     return;
   }
 
+  // If a login flow is already running, cancel it and wait for it to finish so
+  // the library's callback server on port 53692 is closed before we try to bind
+  // the same port again. The cancellation works by rejecting the onManualCodeInput
+  // Promise, which causes the library's catch handler to call server.cancelWait(),
+  // which unblocks server.waitForCode(), which then throws and reaches the
+  // finally { server.server.close() } block.
+  if (activeLoginPromise !== null) {
+    log.debug("[stavrobot] handleLoginEvents: cancelling previous login flow");
+    if (loginAbortReject !== null) {
+      loginAbortReject(new Error("Login cancelled: new login flow started"));
+    } else {
+      // onManualCodeInput has not been called yet; set the flag so it rejects
+      // immediately when it is called.
+      loginCancelled = true;
+    }
+    try {
+      await activeLoginPromise;
+    } catch {
+      // Expected: the previous flow was cancelled.
+    }
+    // Give the OS a moment to release the port before the new flow binds it.
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+
   response.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -185,13 +219,36 @@ export async function handleLoginEvents(
   });
 
   let isConnected = true;
+  loginFlowCounter += 1;
+  const flowId = loginFlowCounter;
+
   request.on("close", () => {
-    log.debug("[stavrobot] handleLoginEvents: client disconnected");
+    log.debug(`[stavrobot] handleLoginEvents: client disconnected (flow ${flowId})`);
     isConnected = false;
     pendingPromptResolver = null;
+    // Only cancel the active flow if this disconnect belongs to the current flow.
+    // A stale handler from an old flow must not clear state for a newer flow.
+    if (flowId === loginFlowCounter && loginAbortReject !== null) {
+      log.debug(`[stavrobot] handleLoginEvents: aborting login flow ${flowId} on disconnect`);
+      loginAbortReject(new Error("Login cancelled: client disconnected"));
+    }
   });
 
-  log.debug(`[stavrobot] handleLoginEvents: starting login flow for provider "${config.provider}"`);
+  log.debug(`[stavrobot] handleLoginEvents: starting login flow ${flowId} for provider "${config.provider}"`);
+
+  // Reset cancellation state for this new flow.
+  loginCancelled = false;
+  loginAbortReject = null;
+
+  // These are assigned synchronously inside the Promise constructor, so they
+  // are always non-null by the time the try block runs. TypeScript cannot infer
+  // this, so we use non-null assertions at the call sites.
+  let resolveActiveLogin!: () => void;
+  let rejectActiveLogin!: (error: unknown) => void;
+  activeLoginPromise = new Promise<void>((resolve, reject) => {
+    resolveActiveLogin = resolve;
+    rejectActiveLogin = reject;
+  });
 
   try {
     const credentials = await provider.login({
@@ -222,7 +279,14 @@ export async function handleLoginEvents(
       // the user paste the redirect URL or code manually, whichever arrives first wins.
       onManualCodeInput: () => {
         log.debug("[stavrobot] handleLoginEvents: onManualCodeInput called, sending prompt event");
-        return new Promise<string>((resolve) => {
+        return new Promise<string>((resolve, reject) => {
+          // If the flow was already cancelled before onManualCodeInput was called,
+          // reject immediately so the library closes its callback server.
+          if (loginCancelled) {
+            reject(new Error("Login cancelled: new login flow started"));
+            return;
+          }
+          loginAbortReject = reject;
           pendingPromptResolver = resolve;
           if (isConnected) {
             sendSseEvent(response, "prompt", { message: "Paste the authorization code or full redirect URL from your browser:" });
@@ -257,6 +321,8 @@ export async function handleLoginEvents(
       sendSseEvent(response, "success", {});
       response.end();
     }
+
+    resolveActiveLogin();
   } catch (error) {
     pendingPromptResolver = null;
     const message = error instanceof Error ? error.message : String(error);
@@ -264,6 +330,14 @@ export async function handleLoginEvents(
     if (isConnected) {
       sendSseEvent(response, "error_event", { message });
       response.end();
+    }
+    rejectActiveLogin(error);
+  } finally {
+    // Clean up module-level state so a future flow starts fresh.
+    if (flowId === loginFlowCounter) {
+      loginAbortReject = null;
+      activeLoginPromise = null;
+      loginCancelled = false;
     }
   }
 }

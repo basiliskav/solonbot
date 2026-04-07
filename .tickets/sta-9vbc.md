@@ -1,7 +1,7 @@
 ---
 id: sta-9vbc
 status: open
-deps: []
+deps: [sta-xgaw]
 links: []
 created: 2026-03-29T23:24:32Z
 type: epic
