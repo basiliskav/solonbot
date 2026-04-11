@@ -1,4 +1,5 @@
 import http from "http";
+import path from "path";
 import { fileURLToPath } from "url";
 import type { Pool } from "pg";
 import { loadConfig } from "./config.js";
@@ -22,6 +23,7 @@ import {
 } from "./explorer.js";
 import { handleUploadRequest, saveAttachment } from "./uploads.js";
 import type { FileAttachment } from "./uploads.js";
+import { TEMP_ATTACHMENTS_DIR } from "./temp-dir.js";
 import {
   servePluginsPage,
   handlePluginsListRequest,
@@ -65,16 +67,6 @@ function isPublicRoute(method: string, pathname: string): boolean {
   }
   // Page queries have per-page auth: the handler checks is_public and enforces auth itself.
   if (method === "GET" && pathname.startsWith("/api/pages/") && pathname.includes("/queries/")) {
-    return true;
-  }
-  // The login flow must be accessible without auth — its whole purpose is to obtain credentials.
-  if (method === "GET" && pathname === "/login") {
-    return true;
-  }
-  if (method === "GET" && pathname === "/login/events") {
-    return true;
-  }
-  if (method === "POST" && pathname === "/login/respond") {
     return true;
   }
   return false;
@@ -136,15 +128,25 @@ export async function handleChatRequest(
 
     let attachments: FileAttachment[] | undefined;
     if ("attachments" in parsedBody && Array.isArray(parsedBody.attachments)) {
+      const uploadsPrefix = TEMP_ATTACHMENTS_DIR.endsWith("/") ? TEMP_ATTACHMENTS_DIR : `${TEMP_ATTACHMENTS_DIR}/`;
       attachments = (parsedBody.attachments as unknown[]).filter((item): item is FileAttachment => {
-        return (
-          typeof item === "object" &&
-          item !== null &&
-          typeof (item as Record<string, unknown>).storedPath === "string" &&
-          typeof (item as Record<string, unknown>).originalFilename === "string" &&
-          typeof (item as Record<string, unknown>).mimeType === "string" &&
-          typeof (item as Record<string, unknown>).size === "number"
-        );
+        if (
+          typeof item !== "object" ||
+          item === null ||
+          typeof (item as Record<string, unknown>).storedPath !== "string" ||
+          typeof (item as Record<string, unknown>).originalFilename !== "string" ||
+          typeof (item as Record<string, unknown>).mimeType !== "string" ||
+          typeof (item as Record<string, unknown>).size !== "number"
+        ) {
+          return false;
+        }
+        // Reject paths outside the uploads directory to prevent arbitrary file reads.
+        const normalized = path.normalize((item as Record<string, unknown>).storedPath as string);
+        if (!normalized.startsWith(uploadsPrefix)) {
+          log.warn("[stavrobot] Rejecting attachment with path outside uploads directory:", normalized);
+          return false;
+        }
+        return true;
       });
       if (attachments.length === 0) {
         attachments = undefined;

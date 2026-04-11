@@ -7,6 +7,7 @@ import os
 import pwd
 import shutil
 import signal
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -112,23 +113,36 @@ def collect_output_files() -> tuple[list[dict[str, str]], str]:
     except OSError:
         return [], ""
 
-    file_paths = [
-        os.path.join(output_dir, name)
-        for name in entries
-        if os.path.isfile(os.path.join(output_dir, name))
-    ]
+    # Open with O_NOFOLLOW so the kernel refuses to follow symlinks atomically.
+    # This prevents a TOCTOU race where a background process left behind by the
+    # script could swap a regular file for a symlink between a check and the open.
+    # Without this, the root process would follow the symlink and read arbitrary files.
+    safe_files: list[tuple[str, int]] = []
+    for name in entries:
+        file_path = os.path.join(output_dir, name)
+        try:
+            fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        stat = os.fstat(fd)
+        if not stat_module.S_ISREG(stat.st_mode):
+            os.close(fd)
+            continue
+        safe_files.append((file_path, fd))
 
-    total_size = sum(os.path.getsize(path) for path in file_paths)
+    total_size = sum(os.fstat(fd).st_size for _, fd in safe_files)
     if total_size > MAX_FILE_TRANSFER_BYTES:
+        for _, fd in safe_files:
+            os.close(fd)
         warning = f"Output files ({total_size} bytes) exceed the 25 MB limit and were not returned."
         print(f"[python-runner] {warning}", file=sys.stderr)
         return [], warning
 
     result = []
-    for path in file_paths:
-        with open(path, "rb") as file_handle:
+    for file_path, fd in safe_files:
+        with os.fdopen(fd, "rb") as file_handle:
             encoded = base64.b64encode(file_handle.read()).decode()
-        result.append({"filename": os.path.basename(path), "data": encoded})
+        result.append({"filename": os.path.basename(file_path), "data": encoded})
 
     return result, ""
 
