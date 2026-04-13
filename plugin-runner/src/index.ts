@@ -57,7 +57,7 @@ function loadAppPassword(): void {
   }
   appPassword = match[1];
   setAppPassword(appPassword);
-  console.log("[stavrobot-plugin-runner] App password loaded from config.toml");
+  console.log("[solonbot-plugin-runner] App password loaded from config.toml");
 }
 
 // This endpoint returns config values that may contain secrets (API keys, tokens).
@@ -78,7 +78,7 @@ function handleGetBundleConfig(bundleName: string, response: http.ServerResponse
   const rawValues = readJsonFile(configPath);
   const values = typeof rawValues === "object" && rawValues !== null ? rawValues : {};
 
-  console.log(`[stavrobot-plugin-runner] Returning config for bundle "${bundleName}"`);
+  console.log(`[solonbot-plugin-runner] Returning config for bundle "${bundleName}"`);
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify({ schema, values }));
 }
@@ -176,14 +176,14 @@ async function handleRunTool(
       : ["*"];
 
   if (permissions.length === 0) {
-    console.log(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} rejected: plugin is disabled`);
+    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} rejected: plugin is disabled`);
     response.writeHead(403, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: "Plugin is disabled" }));
     return;
   }
 
   if (!permissions.includes("*") && !permissions.includes(toolName)) {
-    console.log(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} rejected: not in permissions list`);
+    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} rejected: not in permissions list`);
     response.writeHead(403, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: "Tool not permitted" }));
     return;
@@ -193,7 +193,7 @@ async function handleRunTool(
   const { toolDir, manifest } = tool;
 
   console.log(
-    `[stavrobot-plugin-runner] Running tool: ${bundleName}/${toolName}, entrypoint: ${manifest.entrypoint}, async: ${manifest.async === true}`
+    `[solonbot-plugin-runner] Running tool: ${bundleName}/${toolName}, entrypoint: ${manifest.entrypoint}, async: ${manifest.async === true}`
   );
 
   const entrypoint = path.join(toolDir, manifest.entrypoint);
@@ -248,7 +248,7 @@ async function handleRunTool(
         fs.writeFileSync(filePath, fileData);
         fs.chownSync(filePath, uid, gid);
         params[paramName] = filePath;
-        console.log(`[stavrobot-plugin-runner] Materialized input file for param "${paramName}": ${filePath} (${fileData.length} bytes)`);
+        console.log(`[solonbot-plugin-runner] Materialized input file for param "${paramName}": ${filePath} (${fileData.length} bytes)`);
       }
 
       stdinBody = JSON.stringify(params);
@@ -320,7 +320,7 @@ async function handleRunTool(
         result = await runScript(entrypoint, toolDir, uid, gid, stdinBody, ASYNC_TIMEOUT_MS);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        console.error(`[stavrobot-plugin-runner] Async tool ${bundleName}/${toolName} threw unexpectedly: ${errorMessage}`);
+        console.error(`[solonbot-plugin-runner] Async tool ${bundleName}/${toolName} threw unexpectedly: ${errorMessage}`);
         fs.rmSync(pluginTempDir, { recursive: true, force: true });
         await postCallback(
           source,
@@ -332,7 +332,7 @@ async function handleRunTool(
       if (result.success) {
         const files = scanPluginTempDir(pluginTempDir, bundleName);
         fs.rmSync(pluginTempDir, { recursive: true, force: true });
-        console.log(`[stavrobot-plugin-runner] Async tool ${bundleName}/${toolName} completed successfully`);
+        console.log(`[solonbot-plugin-runner] Async tool ${bundleName}/${toolName} completed successfully`);
         await postCallback(
           source,
           `The run of tool "${toolName}" (plugin "${bundleName}") returned:\n\`\`\`\n${result.output}\n\`\`\``,
@@ -343,7 +343,7 @@ async function handleRunTool(
         const errorText = result.timedOut === true
           ? `Tool "${toolName}" (plugin "${bundleName}") exceeded the timeout of ${ASYNC_TIMEOUT_MS / 1000} seconds`
           : (result.error ?? result.output);
-        console.error(`[stavrobot-plugin-runner] Async tool ${bundleName}/${toolName} failed: ${errorText}`);
+        console.error(`[solonbot-plugin-runner] Async tool ${bundleName}/${toolName} failed: ${errorText}`);
         fs.rmSync(pluginTempDir, { recursive: true, force: true });
         await postCallback(
           source,
@@ -361,14 +361,14 @@ async function handleRunTool(
     fs.rmSync(pluginTempDir, { recursive: true, force: true });
 
     if (result.spawnFailed === true) {
-      console.error(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} failed to spawn: ${result.error}`);
+      console.error(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} failed to spawn: ${result.error}`);
       response.writeHead(500, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ success: false, error: result.error }));
       return;
     }
 
     if (result.timedOut === true) {
-      console.error(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} timed out after ${TOOL_TIMEOUT_MS}ms`);
+      console.error(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} timed out after ${TOOL_TIMEOUT_MS}ms`);
       response.writeHead(500, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ success: false, error: "Tool execution timed out" }));
       return;
@@ -376,7 +376,7 @@ async function handleRunTool(
 
     // Include both streams: the script may write error details to stdout
     // (e.g., JSON error objects) while uv or other tooling writes to stderr.
-    console.error(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} failed: ${result.error}`);
+    console.error(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} failed: ${result.error}`);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ success: false, error: result.error }));
     return;
@@ -392,12 +392,12 @@ async function handleRunTool(
     output = result.output;
   }
 
-  console.log(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} completed successfully`);
+  console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} completed successfully`);
   response.writeHead(200, { "Content-Type": "application/json" });
 
   const responseBody: Record<string, unknown> = { success: true, output };
   if (files.length > 0) {
-    console.log(`[stavrobot-plugin-runner] Tool ${bundleName}/${toolName} produced ${files.length} file(s) for transport`);
+    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} produced ${files.length} file(s) for transport`);
     responseBody["files"] = files;
   }
 
@@ -411,7 +411,7 @@ async function handleRequest(
   const url = request.url ?? "/";
   const method = request.method ?? "GET";
 
-  console.log(`[stavrobot-plugin-runner] ${method} ${url}`);
+  console.log(`[solonbot-plugin-runner] ${method} ${url}`);
 
   if (appPassword === undefined) {
     response.writeHead(500, { "Content-Type": "application/json" });
@@ -483,7 +483,7 @@ async function handleRequest(
     response.writeHead(404, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: "Not found" }));
   } catch (error) {
-    console.error("[stavrobot-plugin-runner] Error handling request:", error);
+    console.error("[solonbot-plugin-runner] Error handling request:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));
@@ -501,7 +501,7 @@ async function main(): Promise<void> {
 
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3003;
   server.listen(port, () => {
-    console.log(`[stavrobot-plugin-runner] Server listening on port ${port}`);
+    console.log(`[solonbot-plugin-runner] Server listening on port ${port}`);
   });
 }
 

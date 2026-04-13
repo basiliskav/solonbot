@@ -23,7 +23,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     publicHostname: "https://example.com",
     baseSystemPrompt: "You are a bot.",
     compactionPrompt: "Compact.",
-    baseAgentPrompt: "You are Stavrobot.",
+    baseAgentPrompt: "You are Solonbot.",
     owner: { name: "Owner" },
     ...overrides,
   } as Config;

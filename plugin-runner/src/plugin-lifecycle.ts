@@ -82,7 +82,7 @@ export function migrateExistingPlugins(): void {
     // conforming name.
     if (!/^[a-z0-9-]+$/.test(pluginName)) {
       console.warn(
-        `[stavrobot-plugin-runner] Skipping migration for plugin "${pluginName}": name does not match [a-z0-9-]+`
+        `[solonbot-plugin-runner] Skipping migration for plugin "${pluginName}": name does not match [a-z0-9-]+`
       );
       continue;
     }
@@ -95,10 +95,10 @@ export function migrateExistingPlugins(): void {
       if (fs.existsSync(cacheDir)) {
         execFileSync("chown", ["-R", "-h", `${uid}:${gid}`, cacheDir], { stdio: "pipe" });
       }
-      console.log(`[stavrobot-plugin-runner] Migrated plugin "${pluginName}" to user "${derivePluginUsername(pluginName)}"`);
+      console.log(`[solonbot-plugin-runner] Migrated plugin "${pluginName}" to user "${derivePluginUsername(pluginName)}"`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[stavrobot-plugin-runner] Failed to migrate plugin "${pluginName}": ${message}`);
+      console.error(`[solonbot-plugin-runner] Failed to migrate plugin "${pluginName}": ${message}`);
     }
   }
 }
@@ -131,7 +131,7 @@ async function runInitScript(
     throw new Error(`Init script declared in manifest not found or not executable: ${scriptPath}`);
   }
 
-  console.log(`[stavrobot-plugin-runner] Running init script: ${scriptPath}`);
+  console.log(`[solonbot-plugin-runner] Running init script: ${scriptPath}`);
 
   const result = await runScript(scriptPath, bundleDir, uid, gid, "", TOOL_TIMEOUT_MS);
 
@@ -139,7 +139,7 @@ async function runInitScript(
     throw new Error(result.error ?? result.output);
   }
 
-  console.log(`[stavrobot-plugin-runner] Init script completed successfully: ${scriptPath}`);
+  console.log(`[solonbot-plugin-runner] Init script completed successfully: ${scriptPath}`);
   return result.output;
 }
 
@@ -190,7 +190,7 @@ function applyConfigDefaults(
   fs.chownSync(configPath, uid, gid);
 
   console.log(
-    `[stavrobot-plugin-runner] Applied default config keys for plugin in ${bundleDir}: ${[...appliedKeys].join(", ")}`
+    `[solonbot-plugin-runner] Applied default config keys for plugin in ${bundleDir}: ${[...appliedKeys].join(", ")}`
   );
 
   return appliedKeys;
@@ -210,13 +210,13 @@ function runAsyncInit(
 ): void {
   const source = `plugin:${pluginName}/init`;
   void (async (): Promise<void> => {
-    console.log(`[stavrobot-plugin-runner] Running async init script for "${pluginName}": ${entrypoint}`);
+    console.log(`[solonbot-plugin-runner] Running async init script for "${pluginName}": ${entrypoint}`);
     let result: ScriptResult;
     try {
       result = await runScript(entrypoint, pluginDir, uid, gid, "", ASYNC_TIMEOUT_MS);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`[stavrobot-plugin-runner] Async init for "${pluginName}" threw unexpectedly: ${errorMessage}`);
+      console.error(`[solonbot-plugin-runner] Async init for "${pluginName}" threw unexpectedly: ${errorMessage}`);
       await postCallback(
         source,
         `Init script for plugin "${pluginName}" failed:\n\`\`\`\n${errorMessage}\n\`\`\``
@@ -225,7 +225,7 @@ function runAsyncInit(
     }
 
     if (result.success) {
-      console.log(`[stavrobot-plugin-runner] Async init for "${pluginName}" completed successfully`);
+      console.log(`[solonbot-plugin-runner] Async init for "${pluginName}" completed successfully`);
       await postCallback(
         source,
         `Init script for plugin "${pluginName}" completed.\n${messageParts.join(" ")}\n\nInit output:\n\`\`\`\n${result.output}\n\`\`\``
@@ -234,7 +234,7 @@ function runAsyncInit(
       const errorText = result.timedOut === true
         ? `Init script for plugin "${pluginName}" exceeded the timeout of ${ASYNC_TIMEOUT_MS / 1000} seconds`
         : (result.error ?? result.output);
-      console.error(`[stavrobot-plugin-runner] Async init for "${pluginName}" failed: ${errorText}`);
+      console.error(`[solonbot-plugin-runner] Async init for "${pluginName}" failed: ${errorText}`);
       await postCallback(
         source,
         `Init script for plugin "${pluginName}" failed:\n\`\`\`\n${errorText}\n\`\`\``
@@ -299,7 +299,7 @@ export async function handleCreate(
   execFileSync("chown", ["-R", `${uid}:${gid}`, destDir], { stdio: "pipe" });
   fs.chmodSync(destDir, 0o700);
 
-  console.log(`[stavrobot-plugin-runner] Created local plugin "${pluginName}"`);
+  console.log(`[solonbot-plugin-runner] Created local plugin "${pluginName}"`);
   response.writeHead(201, { "Content-Type": "application/json" });
   response.end(JSON.stringify({ message: `Plugin '${pluginName}' created successfully.` }));
 }
@@ -343,11 +343,11 @@ export async function handleInstall(
   const tempDir = path.join(PLUGINS_DIR, `.tmp-install-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
   try {
-    console.log(`[stavrobot-plugin-runner] Cloning ${url} to ${tempDir}`);
+    console.log(`[solonbot-plugin-runner] Cloning ${url} to ${tempDir}`);
     execFileSync("git", ["clone", "--", url, tempDir]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[stavrobot-plugin-runner] Clone failed: ${message}`);
+    console.error(`[solonbot-plugin-runner] Clone failed: ${message}`);
     fs.rmSync(tempDir, { recursive: true, force: true });
     response.writeHead(400, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: `Failed to clone repository: ${message}` }));
@@ -414,7 +414,7 @@ export async function handleInstall(
       initOutput = await runInitScript(destDir, rawManifest, uid, gid);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[stavrobot-plugin-runner] Init script failed for "${pluginName}": ${message}`);
+      console.error(`[solonbot-plugin-runner] Init script failed for "${pluginName}": ${message}`);
       fs.rmSync(destDir, { recursive: true, force: true });
       removePluginUser(pluginName);
       response.writeHead(500, { "Content-Type": "application/json" });
@@ -485,7 +485,7 @@ export async function handleInstall(
 
   responseBody["message"] = messageParts.join(" ");
 
-  console.log(`[stavrobot-plugin-runner] Installed plugin "${pluginName}"`);
+  console.log(`[solonbot-plugin-runner] Installed plugin "${pluginName}"`);
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify(responseBody));
 
@@ -537,7 +537,7 @@ export async function handleUpdate(
 
   const pluginDir = bundle.bundleDir;
 
-  console.log(`[stavrobot-plugin-runner] Updating plugin "${pluginName}" in ${pluginDir}`);
+  console.log(`[solonbot-plugin-runner] Updating plugin "${pluginName}" in ${pluginDir}`);
   execFileSync("git", ["-C", pluginDir, "fetch", "--all"]);
   execFileSync("git", ["-C", pluginDir, "reset", "--hard", "origin/HEAD"]);
 
@@ -553,13 +553,13 @@ export async function handleUpdate(
 
   let initOutput: string | null = null;
   if (!isBundleManifest(updatedRawManifest)) {
-    console.warn(`[stavrobot-plugin-runner] Manifest invalid after update for "${pluginName}"; skipping init`);
+    console.warn(`[solonbot-plugin-runner] Manifest invalid after update for "${pluginName}"; skipping init`);
   } else if (!isAsyncInit) {
     try {
       initOutput = await runInitScript(pluginDir, updatedRawManifest, uid, gid);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[stavrobot-plugin-runner] Init script failed for "${pluginName}" during update: ${message}`);
+      console.error(`[solonbot-plugin-runner] Init script failed for "${pluginName}" during update: ${message}`);
       response.writeHead(500, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: `Init script failed: ${message}` }));
       return;
@@ -620,7 +620,7 @@ export async function handleUpdate(
 
   responseBody["message"] = messageParts.join(" ");
 
-  console.log(`[stavrobot-plugin-runner] Updated plugin "${pluginName}"`);
+  console.log(`[solonbot-plugin-runner] Updated plugin "${pluginName}"`);
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify(responseBody));
 
@@ -666,14 +666,14 @@ export async function handleRemove(
 
   const pluginDir = bundle.bundleDir;
 
-  console.log(`[stavrobot-plugin-runner] Removing plugin "${pluginName}" from ${pluginDir}`);
+  console.log(`[solonbot-plugin-runner] Removing plugin "${pluginName}" from ${pluginDir}`);
   fs.rmSync(pluginDir, { recursive: true, force: true });
   fs.rmSync(`/cache/${pluginName}`, { recursive: true, force: true });
   removePluginUser(pluginName);
 
   loadBundles();
 
-  console.log(`[stavrobot-plugin-runner] Removed plugin "${pluginName}"`);
+  console.log(`[solonbot-plugin-runner] Removed plugin "${pluginName}"`);
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify({ message: `Plugin '${pluginName}' removed successfully.` }));
 }
@@ -782,7 +782,7 @@ export async function handleConfigure(
   const { uid, gid } = getPluginUserIds(pluginName);
   fs.chownSync(configPath, uid, gid);
 
-  console.log(`[stavrobot-plugin-runner] Configured plugin "${pluginName}"`);
+  console.log(`[solonbot-plugin-runner] Configured plugin "${pluginName}"`);
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify({
     message: `Plugin '${pluginName}' configured successfully. Use show_plugin(name) to see available tools, then run_plugin_tool(plugin, tool, parameters) to run them.`,

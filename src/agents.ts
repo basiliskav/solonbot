@@ -145,7 +145,7 @@ export function createManageAgentsTool(pool: pg.Pool): AgentTool {
 
         const newId = await createAgentInDb(pool, raw.name.trim(), raw.system_prompt, allowedTools, allowedPlugins);
         const message = `Agent ${newId} created.`;
-        log.info(`[stavrobot] ${message}`);
+        log.info(`[solonbot] ${message}`);
         return toolSuccess(message);
       }
 
@@ -191,7 +191,7 @@ export function createManageAgentsTool(pool: pg.Pool): AgentTool {
 
         await updateAgent(pool, raw.id, fields);
         const message = `Agent ${raw.id} updated.`;
-        log.info(`[stavrobot] ${message}`);
+        log.info(`[solonbot] ${message}`);
         return toolSuccess(message);
       }
 

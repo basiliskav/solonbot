@@ -167,7 +167,7 @@ export async function fetchPluginList(): Promise<PluginEntry[] | undefined> {
   try {
     const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
     if (!response.ok) {
-      log.warn(`[stavrobot] fetchPluginList: plugin runner returned ${response.status}`);
+      log.warn(`[solonbot] fetchPluginList: plugin runner returned ${response.status}`);
       return undefined;
     }
     const data = await response.json() as { plugins: PluginSummary[] };
@@ -176,7 +176,7 @@ export async function fetchPluginList(): Promise<PluginEntry[] | undefined> {
     const visiblePlugins = data.plugins.filter((plugin) => !Array.isArray(plugin.permissions) || plugin.permissions.length > 0);
     return visiblePlugins.map((plugin) => ({ name: plugin.name, description: plugin.description }));
   } catch (error) {
-    log.warn("[stavrobot] fetchPluginList: failed to fetch plugin list:", error instanceof Error ? error.message : String(error));
+    log.warn("[solonbot] fetchPluginList: failed to fetch plugin list:", error instanceof Error ? error.message : String(error));
     return undefined;
   }
 }
@@ -197,7 +197,7 @@ export async function fetchPluginDetails(
       try {
         const response = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${name}`);
         if (!response.ok) {
-          log.warn(`[stavrobot] fetchPluginDetails: plugin runner returned ${response.status} for plugin "${name}"`);
+          log.warn(`[solonbot] fetchPluginDetails: plugin runner returned ${response.status} for plugin "${name}"`);
           return null;
         }
         const manifest = await response.json() as PluginManifest;
@@ -214,7 +214,7 @@ export async function fetchPluginDetails(
         }
         return [name, visibleTools];
       } catch (error) {
-        log.warn(`[stavrobot] fetchPluginDetails: failed to fetch manifest for plugin "${name}":`, error instanceof Error ? error.message : String(error));
+        log.warn(`[solonbot] fetchPluginDetails: failed to fetch manifest for plugin "${name}":`, error instanceof Error ? error.message : String(error));
         return null;
       }
     }),

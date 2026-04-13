@@ -108,7 +108,7 @@ async function tick(pool: pg.Pool, apiKey: string, mainAgentId: number, onSucces
   }
 
   if (zeroVectorCount > 0) {
-    log.info(`[stavrobot] Embeddings worker: zero-vectored ${zeroVectorCount} message(s) with no text content`);
+    log.info(`[solonbot] Embeddings worker: zero-vectored ${zeroVectorCount} message(s) with no text content`);
   }
 
   // Main batch: fetch up to BATCH_SIZE messages that now have text (empties
@@ -130,7 +130,7 @@ async function tick(pool: pg.Pool, apiKey: string, mainAgentId: number, onSucces
     return;
   }
 
-  log.info(`[stavrobot] Embeddings worker: processing ${result.rows.length} message(s)`);
+  log.info(`[solonbot] Embeddings worker: processing ${result.rows.length} message(s)`);
 
   const withText: Array<{ messageId: number; text: string }> = [];
   for (const row of result.rows) {
@@ -157,14 +157,14 @@ async function tick(pool: pg.Pool, apiKey: string, mainAgentId: number, onSucces
       // A 400 from the batch call means at least one input is poisonous. Fall
       // back to one-by-one so we can isolate and quarantine the bad message(s)
       // with a zero vector rather than blocking forever.
-      log.warn("[stavrobot] Embeddings worker: batch 400 error, falling back to one-by-one:", error.message);
+      log.warn("[solonbot] Embeddings worker: batch 400 error, falling back to one-by-one:", error.message);
       for (const entry of withText) {
         let singleEmbeddings: number[][];
         try {
           singleEmbeddings = await fetchEmbeddings([entry.text], apiKey);
         } catch (singleError) {
           if (singleError instanceof EmbeddingApiError && singleError.status === 400) {
-            log.warn(`[stavrobot] Embeddings worker: message ${entry.messageId} rejected by API (400), inserting zero vector`);
+            log.warn(`[solonbot] Embeddings worker: message ${entry.messageId} rejected by API (400), inserting zero vector`);
             await pool.query(
               "INSERT INTO message_embeddings (message_id, embedding) VALUES ($1, $2) ON CONFLICT DO NOTHING",
               [entry.messageId, ZERO_VECTOR],
@@ -172,7 +172,7 @@ async function tick(pool: pg.Pool, apiKey: string, mainAgentId: number, onSucces
           } else {
             // Non-400 error (401, 403, 429, 5xx, network). Stop the loop and back off;
             // remaining messages will be retried on the next tick.
-            log.error("[stavrobot] Embeddings worker: transient error during one-by-one fallback:", singleError);
+            log.error("[solonbot] Embeddings worker: transient error during one-by-one fallback:", singleError);
             onError();
             return;
           }
@@ -185,7 +185,7 @@ async function tick(pool: pg.Pool, apiKey: string, mainAgentId: number, onSucces
         );
       }
     } else {
-      log.error("[stavrobot] Embeddings worker: OpenAI API error:", error);
+      log.error("[solonbot] Embeddings worker: OpenAI API error:", error);
       onError();
       return;
     }
@@ -204,7 +204,7 @@ async function tick(pool: pg.Pool, apiKey: string, mainAgentId: number, onSucces
     }
   }
 
-  log.info(`[stavrobot] Embeddings worker: embedded ${withText.length} message(s) via OpenAI`);
+  log.info(`[solonbot] Embeddings worker: embedded ${withText.length} message(s) via OpenAI`);
   onSuccess();
 }
 
@@ -237,7 +237,7 @@ export function initializeEmbeddingsWorker(pool: pg.Pool, config: Config): void 
           const next = Math.min(currentIntervalMs * 2, MAX_BACKOFF_MS);
           if (next !== currentIntervalMs) {
             currentIntervalMs = next;
-            log.info(`[stavrobot] Embeddings worker: backing off to ${currentIntervalMs / 1000}s`);
+            log.info(`[solonbot] Embeddings worker: backing off to ${currentIntervalMs / 1000}s`);
             scheduleNext(currentIntervalMs);
           }
         },
@@ -246,5 +246,5 @@ export function initializeEmbeddingsWorker(pool: pg.Pool, config: Config): void 
   }
 
   scheduleNext(currentIntervalMs);
-  log.info("[stavrobot] Embeddings worker initialized.");
+  log.info("[solonbot] Embeddings worker initialized.");
 }

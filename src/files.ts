@@ -118,7 +118,7 @@ export function createManageFilesTool(): AgentTool {
         }
         const absolutePaths = filenames.map((name) => path.join(FILES_DIR, name));
         const result = absolutePaths.join("\n");
-        log.debug(`[stavrobot] manage_files list: ${filenames.length} file(s)`);
+        log.debug(`[solonbot] manage_files list: ${filenames.length} file(s)`);
         return toolSuccess(result);
       }
 
@@ -145,7 +145,7 @@ export function createManageFilesTool(): AgentTool {
           await fs.writeFile(filePath, raw.content, "utf-8");
         }
 
-        log.debug(`[stavrobot] manage_files write: ${filePath}`);
+        log.debug(`[solonbot] manage_files write: ${filePath}`);
         return toolSuccess(filePath);
       }
 
@@ -161,7 +161,7 @@ export function createManageFilesTool(): AgentTool {
         const filePath = resolved.filePath;
 
         const fileContent = await fs.readFile(filePath, "utf-8");
-        log.debug(`[stavrobot] manage_files read: ${filePath} (${fileContent.length} chars)`);
+        log.debug(`[solonbot] manage_files read: ${filePath} (${fileContent.length} chars)`);
         return toolSuccess(fileContent);
       }
 
@@ -216,7 +216,7 @@ export function createManageFilesTool(): AgentTool {
           result += `\n... (showing ${MAX_SEARCH_RESULTS} of ${totalMatches} matches)`;
         }
 
-        log.debug(`[stavrobot] manage_files search: ${filePath} pattern="${raw.pattern}" matches=${totalMatches}`);
+        log.debug(`[solonbot] manage_files search: ${filePath} pattern="${raw.pattern}" matches=${totalMatches}`);
         return toolSuccess(result);
       }
 
@@ -254,7 +254,7 @@ export function createManageFilesTool(): AgentTool {
         const toClamped = Math.min(totalLines, raw.to);
 
         if (fromClamped > totalLines) {
-          log.debug(`[stavrobot] manage_files read_lines: ${filePath} from=${raw.from} beyond EOF (${totalLines} lines)`);
+          log.debug(`[solonbot] manage_files read_lines: ${filePath} from=${raw.from} beyond EOF (${totalLines} lines)`);
           return toolSuccess(`(lines ${raw.from}-${raw.to} of ${totalLines} total)`);
         }
 
@@ -262,7 +262,7 @@ export function createManageFilesTool(): AgentTool {
         const numbered = selectedLines.map((line, index) => `${fromClamped + index}: ${line}`);
         const result = numbered.join("\n") + `\n(lines ${fromClamped}-${toClamped} of ${totalLines} total)`;
 
-        log.debug(`[stavrobot] manage_files read_lines: ${filePath} lines ${fromClamped}-${toClamped} of ${totalLines}`);
+        log.debug(`[solonbot] manage_files read_lines: ${filePath} lines ${fromClamped}-${toClamped} of ${totalLines}`);
         return toolSuccess(result);
       }
 
@@ -309,7 +309,7 @@ export function createManageFilesTool(): AgentTool {
         const output = hadTrailingNewline ? lines.join("\n") + "\n" : lines.join("\n");
         await fs.writeFile(filePath, output, "utf-8");
 
-        log.debug(`[stavrobot] manage_files write_lines: ${filePath} replaced lines ${raw.from}-${raw.to}, new total=${lines.length}`);
+        log.debug(`[solonbot] manage_files write_lines: ${filePath} replaced lines ${raw.from}-${raw.to}, new total=${lines.length}`);
         return toolSuccess(`Done. New total line count: ${lines.length}.`);
       }
 
@@ -325,7 +325,7 @@ export function createManageFilesTool(): AgentTool {
         const filePath = resolved.filePath;
         await fs.unlink(filePath);
         const successMessage = `File deleted: ${filePath}`;
-        log.debug(`[stavrobot] manage_files delete: ${filePath}`);
+        log.debug(`[solonbot] manage_files delete: ${filePath}`);
         return toolSuccess(successMessage);
       }
 
@@ -349,7 +349,7 @@ export function createManageFilesTool(): AgentTool {
         await fs.mkdir(path.dirname(resolvedDestination.filePath), { recursive: true });
         await fs.copyFile(resolvedSource.filePath, resolvedDestination.filePath);
 
-        log.debug(`[stavrobot] manage_files copy: ${resolvedSource.filePath} -> ${resolvedDestination.filePath}`);
+        log.debug(`[solonbot] manage_files copy: ${resolvedSource.filePath} -> ${resolvedDestination.filePath}`);
         return toolSuccess(resolvedDestination.filePath);
       }
 
@@ -373,7 +373,7 @@ export function createManageFilesTool(): AgentTool {
         await fs.mkdir(path.dirname(resolvedDestination.filePath), { recursive: true });
         await fs.rename(resolvedSource.filePath, resolvedDestination.filePath);
 
-        log.debug(`[stavrobot] manage_files move: ${resolvedSource.filePath} -> ${resolvedDestination.filePath}`);
+        log.debug(`[solonbot] manage_files move: ${resolvedSource.filePath} -> ${resolvedDestination.filePath}`);
         return toolSuccess(resolvedDestination.filePath);
       }
 

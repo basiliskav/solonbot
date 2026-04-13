@@ -49,7 +49,7 @@ async function resolveOutboundRecipient(
   }
   if (resolved !== null && "disabled" in resolved) {
     const errorMessage = `Error: Interlocutor "${resolved.displayName}" is disabled.`;
-    log.warn(`[stavrobot] ${toolName} rejected:`, errorMessage);
+    log.warn(`[solonbot] ${toolName} rejected:`, errorMessage);
     return toolError(errorMessage);
   }
 
@@ -58,7 +58,7 @@ async function resolveOutboundRecipient(
   const interlocutor = await resolveInterlocutorByName(pool, recipientInput);
   if (interlocutor !== null) {
     const errorMessage = `Error: interlocutor '${recipientInput}' has no ${serviceLabel} identity. Use manage_interlocutors to add one.`;
-    log.warn(`[stavrobot] ${toolName} rejected:`, errorMessage);
+    log.warn(`[solonbot] ${toolName} rejected:`, errorMessage);
     return toolError(errorMessage);
   }
 
@@ -70,7 +70,7 @@ async function resolveOutboundRecipient(
   );
   if (identityCheck.rows.length === 0) {
     const errorMessage = `Error: unknown recipient '${recipientInput}'. No interlocutor found with that display name or ${rawIdLabel}.`;
-    log.warn(`[stavrobot] ${toolName} rejected:`, errorMessage);
+    log.warn(`[solonbot] ${toolName} rejected:`, errorMessage);
     return toolError(errorMessage);
   }
 
@@ -102,7 +102,7 @@ async function checkSubagentRecipientScope(
   const assignedIdentifiers = result.rows.map((row) => normalize(row.identifier));
   if (!assignedIdentifiers.includes(normalize(recipient))) {
     const errorMessage = `You can only message your assigned interlocutor. If you need to message someone else, ask the main agent (agent ${getMainAgentId()}) via send_agent_message.`;
-    log.warn(`[stavrobot] ${toolName} rejected: subagent ${currentAgentId} attempted to message '${recipient}' on ${serviceKey}, not in assigned identifiers`);
+    log.warn(`[solonbot] ${toolName} rejected: subagent ${currentAgentId} attempted to message '${recipient}' on ${serviceKey}, not in assigned identifiers`);
     return toolError(errorMessage);
   }
 
@@ -178,12 +178,12 @@ export function createSendSignalMessageTool(pool: pg.Pool, config: Config): Agen
       // Hard gate: recipient must be in the allowlist.
       if (!isInAllowlist("signal", recipient)) {
         const errorMessage = `Error: recipient '${recipient}' is not in the Signal allowlist.`;
-        log.warn("[stavrobot] send_signal_message rejected:", errorMessage);
+        log.warn("[solonbot] send_signal_message rejected:", errorMessage);
         return toolError(errorMessage);
       }
 
       const signalPreview = (message ?? "").slice(0, 200);
-      log.info(`[stavrobot] message out: signal - ${recipient} - ${signalPreview}`);
+      log.info(`[solonbot] message out: signal - ${recipient} - ${signalPreview}`);
 
       if (attachmentPath !== undefined) {
         const attachment = await readAndConsumeAttachment(attachmentPath);
@@ -212,7 +212,7 @@ export function createSendSignalMessageTool(pool: pg.Pool, config: Config): Agen
         const responseText = await response.text();
 
         if (response.status === 429) {
-          log.warn("[stavrobot] send_signal_message rate limited by bridge (attachment path)");
+          log.warn("[solonbot] send_signal_message rate limited by bridge (attachment path)");
           return toolError(signalRateLimitMessage(config.publicHostname));
         }
 
@@ -241,14 +241,14 @@ export function createSendSignalMessageTool(pool: pg.Pool, config: Config): Agen
           throw parseError;
         }
 
-        log.debug("[stavrobot] send_signal_message bridge response status:", response.status);
+        log.debug("[solonbot] send_signal_message bridge response status:", response.status);
 
         return toolSuccess("Message sent successfully.");
       }
 
       const sendResult = await sendSignalMessage(recipient, message as string);
       if (sendResult === "rate_limited") {
-        log.warn("[stavrobot] send_signal_message rate limited by bridge (text-only path)");
+        log.warn("[solonbot] send_signal_message rate limited by bridge (text-only path)");
         return toolError(signalRateLimitMessage(config.publicHostname));
       }
 
@@ -303,14 +303,14 @@ export function createSendTelegramMessageTool(pool: pg.Pool, config: Config): Ag
       // Hard gate: recipient must be in the allowlist.
       if (!isInAllowlist("telegram", recipient)) {
         const errorMessage = `Error: recipient '${recipient}' is not in the Telegram allowlist.`;
-        log.warn("[stavrobot] send_telegram_message rejected:", errorMessage);
+        log.warn("[solonbot] send_telegram_message rejected:", errorMessage);
         return toolError(errorMessage);
       }
 
       const baseUrl = `https://api.telegram.org/bot${config.telegram.botToken}`;
 
       const telegramPreview = (message ?? "").slice(0, 200);
-      log.info(`[stavrobot] message out: telegram - ${recipient} - ${telegramPreview}`);
+      log.info(`[solonbot] message out: telegram - ${recipient} - ${telegramPreview}`);
 
       if (attachmentPath !== undefined) {
         const attachment = await readAndConsumeAttachment(attachmentPath);
@@ -335,7 +335,7 @@ export function createSendTelegramMessageTool(pool: pg.Pool, config: Config): Ag
           formFieldName = "document";
         }
 
-        log.debug("[stavrobot] send_telegram_message attachment type detected:", { extension, apiMethod });
+        log.debug("[solonbot] send_telegram_message attachment type detected:", { extension, apiMethod });
 
         const formData = new FormData();
         formData.append("chat_id", recipient);
@@ -356,11 +356,11 @@ export function createSendTelegramMessageTool(pool: pg.Pool, config: Config): Ag
           const errorBody = await response.json() as { description?: string };
           const description = errorBody.description ?? "unknown error";
           const errorMessage = `Error: Telegram API error ${response.status}: ${description}`;
-          log.error(`[stavrobot] send_telegram_message ${apiMethod} error:`, errorMessage);
+          log.error(`[solonbot] send_telegram_message ${apiMethod} error:`, errorMessage);
           return toolError(errorMessage);
         }
 
-        log.debug(`[stavrobot] send_telegram_message ${apiMethod} response status:`, response.status);
+        log.debug(`[solonbot] send_telegram_message ${apiMethod} response status:`, response.status);
         return toolSuccess("Message sent successfully.");
       }
 
@@ -370,7 +370,7 @@ export function createSendTelegramMessageTool(pool: pg.Pool, config: Config): Ag
         await sendTelegramMessage(config.telegram.botToken, recipient, htmlText);
       } catch (error) {
         const errorMessage = `Error: ${error instanceof Error ? error.message : String(error)}`;
-        log.error("[stavrobot] send_telegram_message sendMessage error:", errorMessage);
+        log.error("[solonbot] send_telegram_message sendMessage error:", errorMessage);
         return toolError(errorMessage);
       }
 
@@ -421,12 +421,12 @@ export function createSendWhatsappMessageTool(pool: pg.Pool, config: Config): Ag
       // Hard gate: recipient must be in the allowlist.
       if (!isInAllowlist("whatsapp", recipient)) {
         const errorMessage = `Error: recipient '${recipient}' is not in the WhatsApp allowlist.`;
-        log.warn("[stavrobot] send_whatsapp_message rejected:", errorMessage);
+        log.warn("[solonbot] send_whatsapp_message rejected:", errorMessage);
         return toolError(errorMessage);
       }
 
       const whatsappPreview = (message ?? "").slice(0, 200);
-      log.info(`[stavrobot] message out: whatsapp - ${recipient} - ${whatsappPreview}`);
+      log.info(`[solonbot] message out: whatsapp - ${recipient} - ${whatsappPreview}`);
 
       if (attachmentPath !== undefined) {
         const validated = validateAttachmentPath(attachmentPath);
@@ -444,7 +444,7 @@ export function createSendWhatsappMessageTool(pool: pg.Pool, config: Config): Ag
         const audioExtensions = new Set([".mp3", ".ogg", ".oga", ".wav", ".m4a"]);
         const videoExtensions = new Set([".mp4", ".mov", ".avi", ".mkv"]);
 
-        log.debug("[stavrobot] send_whatsapp_message attachment type detected:", { extension });
+        log.debug("[solonbot] send_whatsapp_message attachment type detected:", { extension });
 
         const fileBuffer = await fs.readFile(validated.resolvedPath);
         const fileName = path.basename(validated.resolvedPath);
@@ -475,7 +475,7 @@ export function createSendWhatsappMessageTool(pool: pg.Pool, config: Config): Ag
           await socket.sendMessage(jid, { document: fileBuffer, fileName, mimetype });
         }
 
-        log.debug("[stavrobot] send_whatsapp_message attachment sent successfully.");
+        log.debug("[solonbot] send_whatsapp_message attachment sent successfully.");
         return toolSuccess("Message sent successfully.");
       }
 
@@ -530,12 +530,12 @@ export function createSendEmailTool(pool: pg.Pool, config: Config): AgentTool {
       // Hard gate: recipient must be in the allowlist.
       if (!isInAllowlist("email", recipient)) {
         const errorMessage = `Error: recipient '${recipient}' is not in the email allowlist.`;
-        log.warn("[stavrobot] send_email rejected:", errorMessage);
+        log.warn("[solonbot] send_email rejected:", errorMessage);
         return toolError(errorMessage);
       }
 
       const emailPreview = message.slice(0, 200);
-      log.info(`[stavrobot] message out: email - ${recipient} - ${emailPreview}`);
+      log.info(`[solonbot] message out: email - ${recipient} - ${emailPreview}`);
 
       if (attachmentPath !== undefined) {
         const validated = validateAttachmentPath(attachmentPath);

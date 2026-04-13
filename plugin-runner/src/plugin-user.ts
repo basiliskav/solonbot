@@ -19,7 +19,7 @@ export function ensurePluginUser(pluginName: string): { uid: number; gid: number
   const username = derivePluginUsername(pluginName);
   try {
     execFileSync("useradd", ["--system", "--no-create-home", username], { stdio: "pipe" });
-    console.log(`[stavrobot-plugin-runner] Created system user "${username}" for plugin "${pluginName}"`);
+    console.log(`[solonbot-plugin-runner] Created system user "${username}" for plugin "${pluginName}"`);
   } catch (error) {
     // useradd exits with code 9 when the user already exists; treat that as success.
     const exitCode = (error as NodeJS.ErrnoException & { status?: number }).status;
@@ -35,7 +35,7 @@ export function removePluginUser(pluginName: string): void {
   const username = derivePluginUsername(pluginName);
   try {
     execFileSync("userdel", [username], { stdio: "pipe" });
-    console.log(`[stavrobot-plugin-runner] Removed system user "${username}" for plugin "${pluginName}"`);
+    console.log(`[solonbot-plugin-runner] Removed system user "${username}" for plugin "${pluginName}"`);
   } catch (error) {
     // userdel exits with code 6 when the user doesn't exist; treat that as success.
     const exitCode = (error as NodeJS.ErrnoException & { status?: number }).status;

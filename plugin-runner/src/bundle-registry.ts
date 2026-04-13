@@ -146,12 +146,12 @@ export function migratePermissions(bundleDir: string, pluginName: string): strin
     // The plugin user may not exist yet during early startup; log and continue.
     const message = error instanceof Error ? error.message : String(error);
     console.warn(
-      `[stavrobot-plugin-runner] Could not chown config.json for "${pluginName}" during permissions migration: ${message}`
+      `[solonbot-plugin-runner] Could not chown config.json for "${pluginName}" during permissions migration: ${message}`
     );
   }
 
   console.log(
-    `[stavrobot-plugin-runner] Wrote default permissions ["*"] to config.json for plugin "${pluginName}"`
+    `[solonbot-plugin-runner] Wrote default permissions ["*"] to config.json for plugin "${pluginName}"`
   );
   return ["*"];
 }
@@ -161,7 +161,7 @@ export function loadBundles(): void {
   try {
     topLevelEntries = fs.readdirSync(PLUGINS_DIR);
   } catch {
-    console.warn("[stavrobot-plugin-runner] Plugins directory not found; no bundles loaded");
+    console.warn("[solonbot-plugin-runner] Plugins directory not found; no bundles loaded");
     bundles = [];
     return;
   }
@@ -179,7 +179,7 @@ export function loadBundles(): void {
     const rawBundleManifest = readJsonFile(bundleManifestPath);
 
     if (!isBundleManifest(rawBundleManifest)) {
-      console.warn(`[stavrobot-plugin-runner] Skipping ${bundleDirName}: missing or invalid bundle manifest.json`);
+      console.warn(`[solonbot-plugin-runner] Skipping ${bundleDirName}: missing or invalid bundle manifest.json`);
       continue;
     }
 
@@ -187,7 +187,7 @@ export function loadBundles(): void {
 
     if (bundleName !== bundleDirName) {
       console.warn(
-        `[stavrobot-plugin-runner] Skipping "${bundleDirName}": manifest name "${bundleName}" does not match directory name`
+        `[solonbot-plugin-runner] Skipping "${bundleDirName}": manifest name "${bundleName}" does not match directory name`
       );
       continue;
     }
@@ -197,7 +197,7 @@ export function loadBundles(): void {
     try {
       toolDirEntries = fs.readdirSync(bundleDir);
     } catch {
-      console.warn(`[stavrobot-plugin-runner] Cannot read bundle directory ${bundleDirName}`);
+      console.warn(`[solonbot-plugin-runner] Cannot read bundle directory ${bundleDirName}`);
       continue;
     }
 
@@ -222,7 +222,7 @@ export function loadBundles(): void {
           typeof (rawToolManifest as Record<string, unknown>)["entrypoint"] === "string"
         ) {
           console.warn(
-            `[stavrobot-plugin-runner] Skipping tool "${(rawToolManifest as Record<string, unknown>)["name"] as string}" in bundle "${bundleName}": manifest.json failed validation (missing or invalid "parameters")`
+            `[solonbot-plugin-runner] Skipping tool "${(rawToolManifest as Record<string, unknown>)["name"] as string}" in bundle "${bundleName}": manifest.json failed validation (missing or invalid "parameters")`
           );
         }
         continue;
@@ -243,7 +243,7 @@ export function loadBundles(): void {
 
     loadedBundles.push({ bundleDir, manifest: rawBundleManifest, tools, permissions });
     console.log(
-      `[stavrobot-plugin-runner] Loaded bundle "${bundleName}" with ${tools.length} tool(s)`
+      `[solonbot-plugin-runner] Loaded bundle "${bundleName}" with ${tools.length} tool(s)`
     );
   }
 

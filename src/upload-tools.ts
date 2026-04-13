@@ -87,14 +87,14 @@ export function createManageUploadsTool(): AgentTool {
 
         const validationError = validatePath(filePath);
         if (validationError !== null) {
-          log.warn("[stavrobot] manage_uploads read validation failed:", validationError);
+          log.warn("[solonbot] manage_uploads read validation failed:", validationError);
           return toolError(validationError);
         }
 
         const extension = path.extname(filePath).toLowerCase();
 
         if (IMAGE_EXTENSIONS.has(extension)) {
-          log.debug("[stavrobot] manage_uploads read: classified as image:", extension);
+          log.debug("[solonbot] manage_uploads read: classified as image:", extension);
           let buffer: Buffer;
           try {
             buffer = await fs.readFile(filePath);
@@ -104,7 +104,7 @@ export function createManageUploadsTool(): AgentTool {
               throw error;
             }
             const message = `File not found: ${filePath}`;
-            log.warn("[stavrobot] manage_uploads read error:", message);
+            log.warn("[solonbot] manage_uploads read error:", message);
             return toolError(message);
           }
           const base64Data = buffer.toString("base64");
@@ -117,7 +117,7 @@ export function createManageUploadsTool(): AgentTool {
         }
 
         if (TEXT_EXTENSIONS.has(extension) || extension === "") {
-          log.debug("[stavrobot] manage_uploads read: classified as text:", extension || "(no extension)");
+          log.debug("[solonbot] manage_uploads read: classified as text:", extension || "(no extension)");
           let contents: string;
           try {
             contents = await fs.readFile(filePath, "utf-8");
@@ -127,14 +127,14 @@ export function createManageUploadsTool(): AgentTool {
               throw error;
             }
             const message = `File not found: ${filePath}`;
-            log.warn("[stavrobot] manage_uploads read error:", message);
+            log.warn("[solonbot] manage_uploads read error:", message);
             return toolError(message);
           }
           return toolSuccess(contents);
         }
 
         const message = `Cannot read binary file directly. The file is stored at ${filePath} with type ${extension}.`;
-        log.debug("[stavrobot] manage_uploads read: classified as unsupported binary:", extension);
+        log.debug("[solonbot] manage_uploads read: classified as unsupported binary:", extension);
         return toolSuccess(message);
       }
 
@@ -147,7 +147,7 @@ export function createManageUploadsTool(): AgentTool {
 
         const validationError = validatePath(filePath);
         if (validationError !== null) {
-          log.warn("[stavrobot] manage_uploads delete validation failed:", validationError);
+          log.warn("[solonbot] manage_uploads delete validation failed:", validationError);
           return toolError(validationError);
         }
 
@@ -159,7 +159,7 @@ export function createManageUploadsTool(): AgentTool {
             throw error;
           }
           const message = `File not found: ${filePath}`;
-          log.warn("[stavrobot] manage_uploads delete error:", message);
+          log.warn("[solonbot] manage_uploads delete error:", message);
           return toolError(message);
         }
 

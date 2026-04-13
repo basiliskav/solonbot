@@ -43,7 +43,7 @@ export async function handleEmailWebhook(payload: EmailWebhookPayload): Promise<
   const from = payload.from.toLowerCase();
   const raw = payload.raw;
 
-  log.info("[stavrobot] Email webhook received from:", from);
+  log.info("[solonbot] Email webhook received from:", from);
 
   const parsed = await simpleParser(raw);
 
@@ -56,7 +56,7 @@ export async function handleEmailWebhook(payload: EmailWebhookPayload): Promise<
     const mimeType = attachment.contentType;
     const content = attachment.content;
 
-    log.info("[stavrobot] Saving email attachment:", filename, "mimeType:", mimeType);
+    log.info("[solonbot] Saving email attachment:", filename, "mimeType:", mimeType);
     const { storedPath } = await saveAttachment(content, filename, mimeType);
     attachments.push({
       storedPath,
@@ -72,11 +72,11 @@ export async function handleEmailWebhook(payload: EmailWebhookPayload): Promise<
       : bodyText;
 
   if (!isInAllowlist("email", from)) {
-    log.info("[stavrobot] Email from disallowed address:", from);
+    log.info("[solonbot] Email from disallowed address:", from);
     return;
   }
 
-  log.info("[stavrobot] Enqueueing email message from:", from);
+  log.info("[solonbot] Enqueueing email message from:", from);
   void enqueueMessage(
     formattedMessage,
     "email",
@@ -92,7 +92,7 @@ export function handleEmailWebhookRequest(
 ): void {
   const authHeader = request.headers["authorization"];
   if (authHeader === undefined || authHeader !== `Bearer ${config.webhookSecret}`) {
-    log.info("[stavrobot] Email webhook rejected: invalid or missing Authorization header");
+    log.info("[solonbot] Email webhook rejected: invalid or missing Authorization header");
     response.writeHead(401, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: "Unauthorized" }));
     return;
@@ -122,7 +122,7 @@ export function handleEmailWebhookRequest(
       response.end(JSON.stringify({ ok: true }));
 
       void handleEmailWebhook(parsedBody).catch((error: unknown) => {
-        log.error("[stavrobot] Error processing email webhook:", error);
+        log.error("[solonbot] Error processing email webhook:", error);
       });
     } catch (error) {
       if (error instanceof Error && error.message === "Request body too large") {
@@ -132,7 +132,7 @@ export function handleEmailWebhookRequest(
         }
         return;
       }
-      log.error("[stavrobot] Error handling email webhook request:", error);
+      log.error("[solonbot] Error handling email webhook request:", error);
       if (!response.headersSent) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         response.writeHead(500, { "Content-Type": "application/json" });

@@ -85,16 +85,16 @@ export function loadConfig(): Config {
   const configContent = fs.readFileSync(configPath, "utf-8");
   const config = TOML.parse(configContent) as unknown as Config;
 
-  log.info(`[stavrobot] Loading base system prompt from ${SYSTEM_PROMPT_PATH}`);
+  log.info(`[solonbot] Loading base system prompt from ${SYSTEM_PROMPT_PATH}`);
   config.baseSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_PATH, "utf-8").trimEnd();
 
-  log.info(`[stavrobot] Loading compaction prompt from ${COMPACTION_PROMPT_PATH}`);
+  log.info(`[solonbot] Loading compaction prompt from ${COMPACTION_PROMPT_PATH}`);
   config.compactionPrompt = fs.readFileSync(COMPACTION_PROMPT_PATH, "utf-8").trimEnd();
 
-  log.info(`[stavrobot] Loading compaction bullet prompt from ${COMPACTION_BULLET_PROMPT_PATH}`);
+  log.info(`[solonbot] Loading compaction bullet prompt from ${COMPACTION_BULLET_PROMPT_PATH}`);
   config.compactionBulletPrompt = fs.readFileSync(COMPACTION_BULLET_PROMPT_PATH, "utf-8").trimEnd();
 
-  log.info(`[stavrobot] Loading agent prompt from ${AGENT_PROMPT_PATH}`);
+  log.info(`[solonbot] Loading agent prompt from ${AGENT_PROMPT_PATH}`);
   config.baseAgentPrompt = fs.readFileSync(AGENT_PROMPT_PATH, "utf-8").trimEnd();
 
   if (config.compactionTokenThreshold === undefined) {
@@ -156,8 +156,8 @@ export function loadPostgresConfig(): PostgresConfig {
   return {
     host: process.env.PGHOST ?? "postgres",
     port: process.env.PGPORT !== undefined ? parseInt(process.env.PGPORT, 10) : 5432,
-    user: process.env.PGUSER ?? "stavrobot",
-    password: process.env.PGPASSWORD ?? "stavrobot",
-    database: process.env.PGDATABASE ?? "stavrobot",
+    user: process.env.PGUSER ?? "solonbot",
+    password: process.env.PGPASSWORD ?? "solonbot",
+    database: process.env.PGDATABASE ?? "solonbot",
   };
 }

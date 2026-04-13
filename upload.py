@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI script to upload a file to the stavrobot /api/upload endpoint."""
+"""CLI script to upload a file to the solonbot /api/upload endpoint."""
 import argparse
 import base64
 import mimetypes
@@ -112,7 +112,7 @@ def upload_file(
 def parse_args() -> argparse.Namespace:
     """Parse and return command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Upload a file to the stavrobot /api/upload endpoint."
+        description="Upload a file to the solonbot /api/upload endpoint."
     )
     parser.add_argument("url", help="Full URL of the upload endpoint.")
     parser.add_argument(

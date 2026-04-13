@@ -57,17 +57,17 @@ export async function getApiKey(config: Config): Promise<string> {
         throw new AuthError(`No OAuth credentials found for provider "${config.provider}". Visit /login to authenticate.`);
       }
 
-      log.debug(`[stavrobot] OAuth token state: refresh=...${providerCredentials.refresh.slice(-8)}, access=...${providerCredentials.access.slice(-8)}, expires=${providerCredentials.expires}`);
+      log.debug(`[solonbot] OAuth token state: refresh=...${providerCredentials.refresh.slice(-8)}, access=...${providerCredentials.access.slice(-8)}, expires=${providerCredentials.expires}`);
 
       if (Date.now() >= providerCredentials.expires) {
         providerCredentials = await provider.refreshToken(providerCredentials);
         credentials[config.provider] = providerCredentials;
         fs.writeFileSync(authFile, JSON.stringify(credentials, null, 2));
-        log.debug(`[stavrobot] OAuth token refreshed: refresh=...${providerCredentials.refresh.slice(-8)}, access=...${providerCredentials.access.slice(-8)}, expires=${providerCredentials.expires}`);
+        log.debug(`[solonbot] OAuth token refreshed: refresh=...${providerCredentials.refresh.slice(-8)}, access=...${providerCredentials.access.slice(-8)}, expires=${providerCredentials.expires}`);
       }
 
       if (attempt > 0) {
-        log.info(`[stavrobot] OAuth token resolved after ${attempt + 1} attempts.`);
+        log.info(`[solonbot] OAuth token resolved after ${attempt + 1} attempts.`);
       }
 
       return provider.getApiKey(providerCredentials);
@@ -81,7 +81,7 @@ export async function getApiKey(config: Config): Promise<string> {
       }
 
       const delayMilliseconds = BASE_DELAY_MILLISECONDS * Math.pow(2, attempt);
-      log.error(`[stavrobot] OAuth token refresh failed (attempt ${attempt + 1}/${MAX_RETRIES}): ${errorMessage}. Retrying in ${delayMilliseconds}ms...`);
+      log.error(`[solonbot] OAuth token refresh failed (attempt ${attempt + 1}/${MAX_RETRIES}): ${errorMessage}. Retrying in ${delayMilliseconds}ms...`);
       await sleep(delayMilliseconds);
     }
   }
@@ -113,7 +113,7 @@ export function invalidateCredentials(config: Config): void {
 
   delete credentials[config.provider];
   fs.writeFileSync(authFile, JSON.stringify(credentials, null, 2));
-  log.info(`[stavrobot] Invalidated credentials for provider "${config.provider}".`);
+  log.info(`[solonbot] Invalidated credentials for provider "${config.provider}".`);
 }
 
 export function startBackgroundTokenRefresh(config: Config): void {
@@ -125,9 +125,9 @@ export function startBackgroundTokenRefresh(config: Config): void {
     void (async () => {
       try {
         await getApiKey(config);
-        log.debug("[stavrobot] Background token refresh succeeded.");
+        log.debug("[solonbot] Background token refresh succeeded.");
       } catch (error) {
-        log.error("[stavrobot] Background token refresh failed:", error instanceof Error ? error.message : String(error));
+        log.error("[solonbot] Background token refresh failed:", error instanceof Error ? error.message : String(error));
       }
     })();
   }, BACKGROUND_REFRESH_INTERVAL_MILLISECONDS);

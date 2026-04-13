@@ -17,7 +17,7 @@ prune_backups() {
 	# Collect all backup files sorted by name (oldest first, since filenames are
 	# ISO timestamps).
 	local -a files
-	mapfile -t files < <(find /backups -maxdepth 1 -name "stavrobot-*.sql.gz" | sort)
+	mapfile -t files < <(find /backups -maxdepth 1 -name "solonbot-*.sql.gz" | sort)
 
 	local total="${#files[@]}"
 	if [[ "${total}" -eq 0 ]]; then
@@ -44,8 +44,8 @@ prune_backups() {
 		local file="${files[$i]}"
 		local basename
 		basename=$(basename "${file}")
-		# Extract the YYYY-MM-DD portion from stavrobot-YYYY-MM-DDTHH-MM-SS.sql.gz.
-		local date_part="${basename#stavrobot-}"
+		# Extract the YYYY-MM-DD portion from solonbot-YYYY-MM-DDTHH-MM-SS.sql.gz.
+		local date_part="${basename#solonbot-}"
 		date_part="${date_part:0:10}"
 		local year="${date_part:0:4}"
 		local year_month="${date_part:0:7}"
@@ -108,7 +108,7 @@ prune_backups() {
 attempt_backup() {
 	local timestamp
 	timestamp=$(date -u +"%Y-%m-%dT%H-%M-%S")
-	local filename="/backups/stavrobot-${timestamp}.sql.gz"
+	local filename="/backups/solonbot-${timestamp}.sql.gz"
 
 	if ! run_backup "${filename}"; then
 		echo "[pg-backup] ERROR: Backup failed; removing partial file if present"

@@ -25,7 +25,7 @@ export async function saveAttachment(
   const storedFilename = `upload-${crypto.randomUUID()}${extension}`;
   const storedPath = path.join(TEMP_ATTACHMENTS_DIR, storedFilename);
 
-  log.debug("[stavrobot] Saving attachment to:", storedPath, "mimeType:", mimeType);
+  log.debug("[solonbot] Saving attachment to:", storedPath, "mimeType:", mimeType);
 
   await fs.promises.writeFile(storedPath, data);
 
@@ -80,7 +80,7 @@ export async function handleUploadRequest(
 
         fileStream.on("limit", () => {
           fileTruncated = true;
-          log.warn("[stavrobot] Upload rejected: file exceeds 10 MB limit");
+          log.warn("[solonbot] Upload rejected: file exceeds 10 MB limit");
         });
 
         fileStream.on("end", () => {
@@ -154,7 +154,7 @@ export async function handleUploadRequest(
       size: fileSize,
     };
 
-    log.debug("[stavrobot] File uploaded:", storedFilename, "size:", fileSize, "bytes");
+    log.debug("[solonbot] File uploaded:", storedFilename, "size:", fileSize, "bytes");
 
     // Fire-and-forget: return the HTTP response immediately without waiting for the agent.
     void enqueueMessage(undefined, "upload", undefined, [attachment]);
@@ -162,7 +162,7 @@ export async function handleUploadRequest(
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ message: "File uploaded successfully", filename: storedFilename }));
   } catch (error) {
-    log.error("[stavrobot] Error handling upload request:", error);
+    log.error("[solonbot] Error handling upload request:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));

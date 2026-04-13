@@ -81,7 +81,7 @@ function mimeTypeFromFilename(filename: string): string {
 }
 
 export async function postCallback(source: string, message: string, files?: TransportedFile[]): Promise<void> {
-  console.log(`[stavrobot-plugin-runner] Posting callback from "${source}" to ${APP_INTERNAL_URL}`);
+  console.log(`[solonbot-plugin-runner] Posting callback from "${source}" to ${APP_INTERNAL_URL}`);
   try {
     const body: Record<string, unknown> = { source, message };
     if (files !== undefined && files.length > 0) {
@@ -100,10 +100,10 @@ export async function postCallback(source: string, message: string, files?: Tran
       },
       body: JSON.stringify(body),
     });
-    console.log(`[stavrobot-plugin-runner] Callback posted, status: ${response.status}`);
+    console.log(`[solonbot-plugin-runner] Callback posted, status: ${response.status}`);
   } catch (error) {
     const message_ = error instanceof Error ? error.message : String(error);
-    console.error(`[stavrobot-plugin-runner] Failed to post callback from "${source}": ${message_}`);
+    console.error(`[solonbot-plugin-runner] Failed to post callback from "${source}": ${message_}`);
   }
 }
 
@@ -161,7 +161,7 @@ export async function runScript(
       // EPIPE means the child exited before reading stdin. This is not fatal
       // since the child's exit handler will report the actual error.
       if ((error as NodeJS.ErrnoException).code !== "EPIPE") {
-        console.error(`[stavrobot-plugin-runner] Stdin error for ${entrypoint}: ${error.message}`);
+        console.error(`[solonbot-plugin-runner] Stdin error for ${entrypoint}: ${error.message}`);
       }
     });
 
@@ -223,7 +223,7 @@ export function scanPluginTempDir(pluginTempDir: string, bundleName: string): Tr
 
   if (totalBytes > MAX_FILE_TRANSPORT_BYTES) {
     console.warn(
-      `[stavrobot-plugin-runner] Plugin "${bundleName}" produced ${totalBytes} bytes of files, exceeding the ${MAX_FILE_TRANSPORT_BYTES}-byte limit; skipping file transport`
+      `[solonbot-plugin-runner] Plugin "${bundleName}" produced ${totalBytes} bytes of files, exceeding the ${MAX_FILE_TRANSPORT_BYTES}-byte limit; skipping file transport`
     );
     return [];
   }

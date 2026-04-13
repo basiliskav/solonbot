@@ -180,7 +180,7 @@ async function resolveTargetAgent(
   // Hard gate: sender must be in the allowlist. Owner messages bypass this
   // check above, and internal sources are handled earlier in this function.
   if (!isInAllowlist(source, sender)) {
-    log.info(`[stavrobot] Dropping message from sender not in allowlist: source=${source}, sender=${sender}`);
+    log.info(`[solonbot] Dropping message from sender not in allowlist: source=${source}, sender=${sender}`);
     return null;
   }
 
@@ -234,19 +234,19 @@ async function sendErrorToSource(
     try {
       await sendSignalMessage(sender, message);
     } catch (sendError) {
-      log.error(`[stavrobot] Failed to send Signal error notification: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
+      log.error(`[solonbot] Failed to send Signal error notification: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
     }
   } else if (source === "telegram" && sender !== undefined) {
     try {
       await sendTelegramMessage(config.telegram!.botToken, sender, message);
     } catch (sendError) {
-      log.error(`[stavrobot] Failed to send Telegram error notification: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
+      log.error(`[solonbot] Failed to send Telegram error notification: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
     }
   } else if (source === "whatsapp" && sender !== undefined) {
     try {
       await sendWhatsappTextMessage(sender, message);
     } catch (sendError) {
-      log.error(`[stavrobot] Failed to send WhatsApp error notification: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
+      log.error(`[solonbot] Failed to send WhatsApp error notification: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
     }
   }
 }
@@ -256,12 +256,12 @@ async function processQueue(): Promise<void> {
   while (queue.length > 0) {
     const entry = queue.shift()!;
     const preview = (entry.message ?? "").slice(0, 200);
-    log.info(`[stavrobot] message in: ${entry.source} - ${entry.sender} - ${preview}`);
+    log.info(`[solonbot] message in: ${entry.source} - ${entry.sender} - ${preview}`);
     currentEntry = entry;
     try {
       const routing = await resolveTargetAgent(queuePool!, entry.source, entry.sender, entry.targetAgentId);
       if (routing === null) {
-        log.warn(`[stavrobot] Dropping message: could not resolve target agent. source=${entry.source}, sender=${entry.sender}`);
+        log.warn(`[solonbot] Dropping message: could not resolve target agent. source=${entry.source}, sender=${entry.sender}`);
         entry.resolve("");
         continue;
       }
@@ -270,31 +270,31 @@ async function processQueue(): Promise<void> {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (error instanceof AbortError) {
-        log.info("[stavrobot] Agent was aborted, resolving cleanly.");
+        log.info("[solonbot] Agent was aborted, resolving cleanly.");
         entry.resolve("Aborted.");
       } else if (error instanceof AuthError) {
-        log.error(`[stavrobot] Auth failure, not retrying: ${errorMessage}`);
+        log.error(`[solonbot] Auth failure, not retrying: ${errorMessage}`);
         const loginMessage = `Authentication required. Visit ${queueConfig!.publicHostname}/login to log in.`;
         await sendErrorToSource(entry.source, entry.sender, queueConfig!, loginMessage);
         entry.resolve(loginMessage);
       } else if (errorMessage.includes("401 ")) {
-        log.error(`[stavrobot] Auth failure (401), not retrying: ${errorMessage}`);
+        log.error(`[solonbot] Auth failure (401), not retrying: ${errorMessage}`);
         invalidateCredentials(queueConfig!);
         const loginMessage = `Authentication required. Visit ${queueConfig!.publicHostname}/login to log in.`;
         await sendErrorToSource(entry.source, entry.sender, queueConfig!, loginMessage);
         entry.resolve(loginMessage);
       } else if (errorMessage.includes("400 {")) {
-        log.error(`[stavrobot] Non-retryable API error (400 client error), not retrying: ${errorMessage}`);
+        log.error(`[solonbot] Non-retryable API error (400 client error), not retrying: ${errorMessage}`);
         const userMessage = `Something went wrong: ${parseProviderErrorMessage(errorMessage)}`;
         await sendErrorToSource(entry.source, entry.sender, queueConfig!, userMessage);
         entry.resolve(userMessage);
       } else if (entry.retries < MAX_RETRIES) {
         const attempt = entry.retries + 1;
-        log.info(`[stavrobot] Message failed (attempt ${attempt}/${MAX_RETRIES + 1}), retrying in ${RETRY_DELAY_MS / 1000}s: ${errorMessage}`);
+        log.info(`[solonbot] Message failed (attempt ${attempt}/${MAX_RETRIES + 1}), retrying in ${RETRY_DELAY_MS / 1000}s: ${errorMessage}`);
         await sleep(RETRY_DELAY_MS);
         queue.push({ ...entry, retries: attempt });
       } else {
-        log.error(`[stavrobot] Message failed after ${MAX_RETRIES + 1} attempts, giving up: ${errorMessage}`);
+        log.error(`[solonbot] Message failed after ${MAX_RETRIES + 1} attempts, giving up: ${errorMessage}`);
         const userMessage = `Something went wrong: ${parseProviderErrorMessage(errorMessage)}`;
         await sendErrorToSource(entry.source, entry.sender, queueConfig!, userMessage);
         entry.resolve(userMessage);
@@ -315,10 +315,10 @@ export function enqueueMessage(
 ): Promise<string> {
   if (message !== undefined && message.trim().toLowerCase() === "/stop") {
     if (processing) {
-      log.info("[stavrobot] /stop received, aborting running agent.");
+      log.info("[solonbot] /stop received, aborting running agent.");
       queueAgent!.abort();
     } else {
-      log.info("[stavrobot] /stop received but agent is idle, no-op.");
+      log.info("[solonbot] /stop received but agent is idle, no-op.");
     }
     return Promise.resolve("Aborted.");
   }
@@ -331,7 +331,7 @@ export function enqueueMessage(
       timestamp: Date.now(),
     };
     queueAgent!.steer(agentMessage);
-    log.info(`[stavrobot] Steering agent with message from ${source ?? "cli"}.`);
+    log.info(`[solonbot] Steering agent with message from ${source ?? "cli"}.`);
     return Promise.resolve("Message received, steering the current request.");
   }
 

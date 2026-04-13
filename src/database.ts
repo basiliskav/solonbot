@@ -61,7 +61,7 @@ export async function seedOwner(pool: pg.Pool, ownerConfig: OwnerConfig): Promis
      RETURNING id`,
   );
   const seededMainAgentId = agentResult.rows[0].id;
-  log.info(`[stavrobot] Main agent seeded: id=${seededMainAgentId}`);
+  log.info(`[solonbot] Main agent seeded: id=${seededMainAgentId}`);
 
   // Backfill existing messages and compactions that predate the agents system.
   const messagesResult = await pool.query(
@@ -72,7 +72,7 @@ export async function seedOwner(pool: pg.Pool, ownerConfig: OwnerConfig): Promis
     "UPDATE compactions SET agent_id = $1 WHERE agent_id IS NULL",
     [seededMainAgentId],
   );
-  log.info(`[stavrobot] Backfilled ${messagesResult.rowCount ?? 0} message(s) and ${compactionsResult.rowCount ?? 0} compaction(s) to main agent`);
+  log.info(`[solonbot] Backfilled ${messagesResult.rowCount ?? 0} message(s) and ${compactionsResult.rowCount ?? 0} compaction(s) to main agent`);
 
   // Use a select-then-insert/update pattern because the partial unique index on
   // owner=true cannot be used as an ON CONFLICT target in standard SQL.
@@ -87,14 +87,14 @@ export async function seedOwner(pool: pg.Pool, ownerConfig: OwnerConfig): Promis
       "UPDATE interlocutors SET display_name = $1, agent_id = $2 WHERE id = $3",
       [ownerConfig.name, seededMainAgentId, ownerId],
     );
-    log.info(`[stavrobot] Owner interlocutor updated: id=${ownerId}, name=${ownerConfig.name}`);
+    log.info(`[solonbot] Owner interlocutor updated: id=${ownerId}, name=${ownerConfig.name}`);
   } else {
     const result = await pool.query<{ id: number }>(
       "INSERT INTO interlocutors (display_name, owner, agent_id) VALUES ($1, true, $2) RETURNING id",
       [ownerConfig.name, seededMainAgentId],
     );
     ownerId = result.rows[0].id;
-    log.info(`[stavrobot] Owner interlocutor created: id=${ownerId}, name=${ownerConfig.name}`);
+    log.info(`[solonbot] Owner interlocutor created: id=${ownerId}, name=${ownerConfig.name}`);
   }
 
   // Upsert each configured identity for the owner.
@@ -117,7 +117,7 @@ export async function seedOwner(pool: pg.Pool, ownerConfig: OwnerConfig): Promis
        DO UPDATE SET interlocutor_id = $1`,
       [ownerId, identity.service, identity.identifier],
     );
-    log.info(`[stavrobot] Owner identity upserted: service=${identity.service}, identifier=${identity.identifier}`);
+    log.info(`[solonbot] Owner identity upserted: service=${identity.service}, identifier=${identity.identifier}`);
   }
 
   ownerInterlocutorId = ownerId;
@@ -177,7 +177,7 @@ export async function createAgent(
     [name, systemPrompt, allowedTools, allowedPlugins],
   );
   const newId = result.rows[0].id;
-  log.info(`[stavrobot] Agent created: id=${newId}, name=${name}`);
+  log.info(`[solonbot] Agent created: id=${newId}, name=${name}`);
   return newId;
 }
 
@@ -216,7 +216,7 @@ export async function updateAgent(
     `UPDATE agents SET ${setClauses.join(", ")} WHERE id = $${paramIndex}`,
     values,
   );
-  log.info(`[stavrobot] Agent updated: id=${agentId}`);
+  log.info(`[solonbot] Agent updated: id=${agentId}`);
 }
 
 export async function listAgents(pool: pg.Pool): Promise<Agent[]> {
@@ -507,7 +507,7 @@ export async function seedCronEntries(pool: pg.Pool): Promise<void> {
       promptText = fs.readFileSync(entry.promptFile, "utf-8").trimEnd();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        log.warn(`[stavrobot] ${entry.promptFile} not found, skipping cron seed for ${entry.marker}.`);
+        log.warn(`[solonbot] ${entry.promptFile} not found, skipping cron seed for ${entry.marker}.`);
         continue;
       }
       throw error;
@@ -526,19 +526,19 @@ export async function seedCronEntries(pool: pg.Pool): Promise<void> {
         "INSERT INTO cron_entries (cron_expression, note) VALUES ($1, $2)",
         [entry.cronExpression, note],
       );
-      log.info(`[stavrobot] Cron entry created for ${entry.marker}.`);
+      log.info(`[solonbot] Cron entry created for ${entry.marker}.`);
     } else {
       const row = existing.rows[0];
       if (row.note.startsWith(manualFreezePrefix)) {
-        log.info(`[stavrobot] Cron entry for ${entry.marker} is manually frozen, skipping update.`);
+        log.info(`[solonbot] Cron entry for ${entry.marker} is manually frozen, skipping update.`);
       } else if (row.note !== note) {
         await pool.query(
           "UPDATE cron_entries SET note = $1 WHERE id = $2",
           [note, row.id],
         );
-        log.info(`[stavrobot] Cron entry updated for ${entry.marker}.`);
+        log.info(`[solonbot] Cron entry updated for ${entry.marker}.`);
       } else {
-        log.info(`[stavrobot] Cron entry for ${entry.marker} is up to date.`);
+        log.info(`[solonbot] Cron entry for ${entry.marker} is up to date.`);
       }
     }
   }

@@ -2,7 +2,7 @@ import { log } from "./log.js";
 import { internalFetch } from "./internal-fetch.js";
 
 export async function sendSignalMessage(recipient: string, message: string): Promise<"ok" | "rate_limited"> {
-  log.debug("[stavrobot] sendSignalMessage called:", { recipient, messageLength: message.length });
+  log.debug("[solonbot] sendSignalMessage called:", { recipient, messageLength: message.length });
 
   const response = await internalFetch("http://signal-bridge:8081/send", {
     method: "POST",
@@ -13,7 +13,7 @@ export async function sendSignalMessage(recipient: string, message: string): Pro
   const responseText = await response.text();
 
   if (response.status === 429) {
-    log.warn("[stavrobot] sendSignalMessage rate limited by bridge");
+    log.warn("[solonbot] sendSignalMessage rate limited by bridge");
     return "rate_limited";
   }
 
@@ -42,6 +42,6 @@ export async function sendSignalMessage(recipient: string, message: string): Pro
     throw parseError;
   }
 
-  log.debug("[stavrobot] sendSignalMessage bridge response status:", response.status);
+  log.debug("[solonbot] sendSignalMessage bridge response status:", response.status);
   return "ok";
 }

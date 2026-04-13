@@ -393,7 +393,7 @@ async function resolveFileParameters(
       data: data.toString("base64"),
     };
     resolved[key] = transportedFile;
-    log.debug(`[stavrobot] run_plugin_tool: resolved file parameter '${key}' for plugin '${plugin}', tool '${tool}'`);
+    log.debug(`[solonbot] run_plugin_tool: resolved file parameter '${key}' for plugin '${plugin}', tool '${tool}'`);
   }
 
   return resolved;
@@ -430,7 +430,7 @@ export function createRunPluginToolTool(): AgentTool {
       if (isBundleManifest(manifest) && Array.isArray(manifest.permissions)) {
         const permissions = manifest.permissions as string[];
         if (permissions.length === 0) {
-          log.debug(`[stavrobot] run_plugin_tool: rejected '${plugin}/${tool}' — plugin is disabled`);
+          log.debug(`[solonbot] run_plugin_tool: rejected '${plugin}/${tool}' — plugin is disabled`);
           return toolSuccess(`Plugin '${plugin}' not found.`);
         }
         if (!permissions.includes("*") && !permissions.includes(tool)) {
@@ -444,7 +444,7 @@ export function createRunPluginToolTool(): AgentTool {
               ? ` Available tools: ${formatAvailableTools(availableTools)}`
               : "";
           const result = `Tool '${tool}' not found on plugin '${plugin}'.${availablePart}`;
-          log.debug(`[stavrobot] run_plugin_tool: rejected '${plugin}/${tool}' — tool not in permissions list`);
+          log.debug(`[solonbot] run_plugin_tool: rejected '${plugin}/${tool}' — tool not in permissions list`);
           return toolSuccess(result);
         }
       }
@@ -487,7 +487,7 @@ export function createRunPluginToolTool(): AgentTool {
               await fs.writeFile(filePath, Buffer.from(file.data, "base64"));
             }
             filesDir = pluginFilesDir;
-            log.debug(`[stavrobot] run_plugin_tool: saved ${validFiles.length} file(s) to ${pluginFilesDir}`);
+            log.debug(`[solonbot] run_plugin_tool: saved ${validFiles.length} file(s) to ${pluginFilesDir}`);
           }
         }
       } catch {
@@ -561,7 +561,7 @@ export function createRequestCodingTaskTool(): AgentTool {
       }
 
       const taskId = crypto.randomUUID();
-      log.debug("[stavrobot] request_coding_task submitting: taskId", taskId, "plugin:", plugin, "message:", message);
+      log.debug("[solonbot] request_coding_task submitting: taskId", taskId, "plugin:", plugin, "message:", message);
       try {
         await internalFetch(`${CLAUDE_CODE_BASE_URL}/code`, {
           method: "POST",

@@ -7,7 +7,7 @@ let transporter: Transporter | undefined;
 let configuredFromAddress: string | undefined;
 
 export function initializeEmailTransport(config: EmailConfig): void {
-  log.info("[stavrobot] Initializing email transport:", config.smtpHost, config.smtpPort);
+  log.info("[solonbot] Initializing email transport:", config.smtpHost, config.smtpPort);
   transporter = nodemailer.createTransport({
     host: config.smtpHost,
     port: config.smtpPort,

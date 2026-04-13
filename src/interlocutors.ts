@@ -217,7 +217,7 @@ export function createManageInterlocutorsTool(pool: pg.Pool): AgentTool {
           client.release();
         }
 
-        log.info(`[stavrobot] Interlocutor ${newId} created.`);
+        log.info(`[solonbot] Interlocutor ${newId} created.`);
         const record = await fetchInterlocutorById(pool, newId);
         if (record === undefined) {
           return toolError(`Error: interlocutor ${newId} not found.`);
@@ -288,7 +288,7 @@ export function createManageInterlocutorsTool(pool: pg.Pool): AgentTool {
           values,
         );
 
-        log.info(`[stavrobot] Interlocutor ${raw.id} updated.`);
+        log.info(`[solonbot] Interlocutor ${raw.id} updated.`);
         const record = await fetchInterlocutorById(pool, raw.id);
         if (record === undefined) {
           return toolError(`Error: interlocutor ${raw.id} not found.`);
@@ -313,7 +313,7 @@ export function createManageInterlocutorsTool(pool: pg.Pool): AgentTool {
           [raw.id],
         );
 
-        log.info(`[stavrobot] Identities removed from interlocutor ${raw.id}.`);
+        log.info(`[solonbot] Identities removed from interlocutor ${raw.id}.`);
         const record = await fetchInterlocutorById(pool, raw.id);
         if (record === undefined) {
           return toolError(`Error: interlocutor ${raw.id} not found.`);
@@ -348,7 +348,7 @@ export function createManageInterlocutorsTool(pool: pg.Pool): AgentTool {
           return toolError(`Error: identity (${raw.service.trim()}, ${raw.identifier.trim()}) is already assigned to another interlocutor.`);
         }
 
-        log.info(`[stavrobot] Identity added to interlocutor ${raw.id}.`);
+        log.info(`[solonbot] Identity added to interlocutor ${raw.id}.`);
         const record = await fetchInterlocutorById(pool, raw.id);
         if (record === undefined) {
           return toolError(`Error: interlocutor ${raw.id} not found.`);
@@ -379,7 +379,7 @@ export function createManageInterlocutorsTool(pool: pg.Pool): AgentTool {
           [raw.id, raw.service.trim(), raw.identifier.trim()],
         );
 
-        log.info(`[stavrobot] Identity removed from interlocutor ${raw.id}.`);
+        log.info(`[solonbot] Identity removed from interlocutor ${raw.id}.`);
         const record = await fetchInterlocutorById(pool, raw.id);
         if (record === undefined) {
           return toolError(`Error: interlocutor ${raw.id} not found.`);

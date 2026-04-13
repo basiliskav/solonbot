@@ -131,7 +131,7 @@ export async function runSearch(
         matchCount: searchResult.rows.length,
         rows: searchResult.rows as Record<string, unknown>[],
       });
-      log.debug(`[stavrobot] search: table "${tableName}" returned ${searchResult.rows.length} match(es)`);
+      log.debug(`[solonbot] search: table "${tableName}" returned ${searchResult.rows.length} match(es)`);
     }
   }
 
@@ -149,9 +149,9 @@ export async function runSearch(
   const compactionParam = compaction !== null ? compaction.upToMessageId : null;
 
   if (compaction !== null) {
-    log.debug(`[stavrobot] search: excluding messages with id > ${compaction.upToMessageId} (still in active context)`);
+    log.debug(`[solonbot] search: excluding messages with id > ${compaction.upToMessageId} (still in active context)`);
   } else {
-    log.debug("[stavrobot] search: no compaction found, searching all messages");
+    log.debug("[solonbot] search: no compaction found, searching all messages");
   }
 
   // Full-text search on messages. We extract only the text parts from the
@@ -183,7 +183,7 @@ export async function runSearch(
      LIMIT $2`,
     fullTextParams,
   );
-  log.debug(`[stavrobot] search: messages full-text returned ${fullTextResult.rows.length} match(es)`);
+  log.debug(`[solonbot] search: messages full-text returned ${fullTextResult.rows.length} match(es)`);
 
   // Assign RRF ranks to full-text results (1-indexed).
   const fullTextRanks = new Map<number, number>();
@@ -217,7 +217,7 @@ export async function runSearch(
          LIMIT $2`,
         semanticParams,
       );
-      log.debug(`[stavrobot] search: messages semantic returned ${semanticResult.rows.length} match(es)`);
+      log.debug(`[solonbot] search: messages semantic returned ${semanticResult.rows.length} match(es)`);
 
       for (let i = 0; i < semanticResult.rows.length; i++) {
         const row = semanticResult.rows[i];
@@ -225,7 +225,7 @@ export async function runSearch(
         semanticRows.set(row.id, row);
       }
     } catch (error) {
-      log.error("[stavrobot] search: embedding call failed, falling back to full-text only:", error instanceof Error ? error.message : String(error));
+      log.error("[solonbot] search: embedding call failed, falling back to full-text only:", error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -308,7 +308,7 @@ export function createSearchTool(pool: pg.Pool, embeddingsConfig?: EmbeddingsCon
       }
 
       if (parts.length === 0) {
-        log.debug("[stavrobot] search: no results found");
+        log.debug("[solonbot] search: no results found");
         return toolSuccess(`No results found for "${query}".`);
       }
 

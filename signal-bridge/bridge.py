@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Signal bridge script that connects signal-cli to the stavrobot agent API.
+Signal bridge script that connects signal-cli to the solonbot agent API.
 
 Starts signal-cli as a subprocess, listens for incoming Signal messages via SSE,
 forwards them to the agent API, and sends replies back via Signal.

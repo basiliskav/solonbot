@@ -178,7 +178,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
             return toolError(`Error: memory ${raw.id} not found.`);
           }
           const message = raw.id === undefined ? `Memory ${memoryResult.id} created.` : `Memory ${memoryResult.id} updated.`;
-          log.info(`[stavrobot] ${message}`);
+          log.info(`[solonbot] ${message}`);
           return toolSuccess(message);
         }
 
@@ -194,7 +194,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
             return toolError(`Error: scratchpad entry ${raw.id} not found.`);
           }
           const message = raw.id === undefined ? `Scratchpad entry ${scratchpadResult.id} created.` : `Scratchpad entry ${scratchpadResult.id} updated.`;
-          log.info(`[stavrobot] ${message}`);
+          log.info(`[solonbot] ${message}`);
           return toolSuccess(message);
         }
 
@@ -216,7 +216,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
             return toolError(`Error: memory ${raw.id} not found.`);
           }
           const message = `Memory ${raw.id} deleted.`;
-          log.info(`[stavrobot] ${message}`);
+          log.info(`[solonbot] ${message}`);
           return toolSuccess(message);
         }
 
@@ -226,7 +226,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
             return toolError(`Error: scratchpad entry ${raw.id} not found.`);
           }
           const message = `Scratchpad entry ${raw.id} deleted.`;
-          log.info(`[stavrobot] ${message}`);
+          log.info(`[solonbot] ${message}`);
           return toolSuccess(message);
         }
 
@@ -247,7 +247,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
           return toolError(`Error: scratchpad entry ${raw.id} not found.`);
         }
 
-        log.info(`[stavrobot] Scratchpad entry ${entry.id} read.`);
+        log.info(`[solonbot] Scratchpad entry ${entry.id} read.`);
         const message = `Title: ${entry.title}\n\n${entry.body}`;
         return toolSuccess(message);
       }
@@ -323,7 +323,7 @@ export function createManageCronTool(pool: pg.Pool): AgentTool {
         const entry = await createCronEntry(pool, cronExpression, fireAt, raw.note.trim());
         await reloadScheduler(pool);
         const message = `Cron entry ${entry.id} created.`;
-        log.info(`[stavrobot] ${message}`);
+        log.info(`[solonbot] ${message}`);
         return toolSuccess(message);
       }
 
@@ -349,7 +349,7 @@ export function createManageCronTool(pool: pg.Pool): AgentTool {
         await updateCronEntry(pool, raw.id, fields);
         await reloadScheduler(pool);
         const message = `Cron entry ${raw.id} updated.`;
-        log.info(`[stavrobot] ${message}`);
+        log.info(`[solonbot] ${message}`);
         return toolSuccess(message);
       }
 
@@ -360,7 +360,7 @@ export function createManageCronTool(pool: pg.Pool): AgentTool {
         await deleteCronEntry(pool, raw.id);
         await reloadScheduler(pool);
         const message = `Cron entry ${raw.id} deleted.`;
-        log.info(`[stavrobot] ${message}`);
+        log.info(`[solonbot] ${message}`);
         return toolSuccess(message);
       }
 
@@ -384,11 +384,11 @@ function wrapToolWithLogging(tool: AgentTool): AgentTool {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate) => {
       const compactParams = truncate(JSON.stringify(params), 200);
-      log.info(`[stavrobot] tool: ${tool.name}(${compactParams})`);
+      log.info(`[solonbot] tool: ${tool.name}(${compactParams})`);
       const result = await originalExecute(toolCallId, params, signal, onUpdate);
       const textBlock = result.content.find((block): block is { type: "text"; text: string } => block.type === "text");
       const compactResult = truncate(textBlock !== undefined ? textBlock.text : "(no text content)", 200);
-      log.info(`[stavrobot] tool: ${tool.name} -> ${compactResult}`);
+      log.info(`[solonbot] tool: ${tool.name} -> ${compactResult}`);
       return result;
     },
   };
@@ -491,7 +491,7 @@ function buildMainAgentSystemPrompt(config: Config, allPlugins: PluginEntry[] | 
 
   const visiblePlugins = allPlugins !== undefined && allPlugins.length > 0 ? allPlugins : undefined;
   const pluginListSection = visiblePlugins !== undefined ? formatPluginListSection(visiblePlugins) : undefined;
-  log.debug(`[stavrobot] fetchPluginList: injecting ${visiblePlugins?.length ?? 0} plugin(s) into system prompt`);
+  log.debug(`[solonbot] fetchPluginList: injecting ${visiblePlugins?.length ?? 0} plugin(s) into system prompt`);
 
   const promptWithPlugins = pluginListSection !== undefined
     ? `${effectiveBasePrompt}\n\n${pluginListSection}`
@@ -526,7 +526,7 @@ function buildMainAgentSystemPrompt(config: Config, allPlugins: PluginEntry[] | 
     for (const entry of scratchpadTitles) {
       scratchpadLines.push(`[Scratchpad ${entry.id}] ${entry.title}`);
     }
-    log.debug(`[stavrobot] Injecting ${scratchpadTitles.length} scratchpad title(s) into system prompt`);
+    log.debug(`[solonbot] Injecting ${scratchpadTitles.length} scratchpad title(s) into system prompt`);
     systemPrompt = `${systemPrompt}\n\n${scratchpadLines.join("\n")}`;
   }
 
@@ -561,7 +561,7 @@ async function buildSubagentSystemPrompt(config: Config, subagentRow: AgentRow |
       const pluginNames = pluginsToShow.map((plugin) => plugin.name);
       const toolDetails = await fetchPluginDetails(pluginNames, accessMap);
       pluginListSection = formatPluginListSection(pluginsToShow, toolDetails);
-      log.debug(`[stavrobot] fetchPluginList: injecting ${pluginsToShow.length} plugin(s) into subagent system prompt`);
+      log.debug(`[solonbot] fetchPluginList: injecting ${pluginsToShow.length} plugin(s) into subagent system prompt`);
     }
   }
 
@@ -610,13 +610,13 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
   // and never touches agent.state.messages directly.
   const currentMessages = agent.state.messages.slice();
 
-  log.debug(`[stavrobot] [debug] Compaction triggered: ${currentMessages.length} messages, ~${Math.round(estimateTokens(currentMessages))} estimated tokens`);
+  log.debug(`[solonbot] [debug] Compaction triggered: ${currentMessages.length} messages, ~${Math.round(estimateTokens(currentMessages))} estimated tokens`);
 
   void (async () => {
     try {
       const cutIndexOrNull = selectCompactionCutIndex(currentMessages, config.compactionTokenThreshold);
       if (cutIndexOrNull === null) {
-        log.warn("[stavrobot] Compaction skipped: no safe cut point found (no user messages or all messages fit within the keep budget).");
+        log.warn("[solonbot] Compaction skipped: no safe cut point found (no user messages or all messages fit within the keep budget).");
         return;
       }
       const cutIndex = cutIndexOrNull;
@@ -624,13 +624,13 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
       const messagesToCompact = currentMessages.slice(0, cutIndex);
       const messagesToKeep = currentMessages.slice(cutIndex);
 
-      log.debug(`[stavrobot] [debug] Cut point: index=${cutIndex}, compacting=${messagesToCompact.length}, keeping=${messagesToKeep.length}`);
-      log.debug(`[stavrobot] [debug] Last compacted message: role=${messagesToCompact[messagesToCompact.length - 1].role}`);
-      log.debug(`[stavrobot] [debug] First kept message: role=${messagesToKeep[0].role}`);
+      log.debug(`[solonbot] [debug] Cut point: index=${cutIndex}, compacting=${messagesToCompact.length}, keeping=${messagesToKeep.length}`);
+      log.debug(`[solonbot] [debug] Last compacted message: role=${messagesToCompact[messagesToCompact.length - 1].role}`);
+      log.debug(`[solonbot] [debug] First kept message: role=${messagesToKeep[0].role}`);
 
       const serializedMessages = serializeMessagesForSummary(messagesToCompact);
 
-      log.debug(`[stavrobot] [debug] Serialized input for summarizer (${serializedMessages.length} chars): ${serializedMessages.split("\n")[0]}`);
+      log.debug(`[solonbot] [debug] Serialized input for summarizer (${serializedMessages.length} chars): ${serializedMessages.split("\n")[0]}`);
 
       // Capture the maximum message id in the DB before summarization starts.
       // Summarization can take several seconds, during which new messages may
@@ -660,18 +660,18 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
         [agentId, previousBoundary, snapshotMaxId],
       );
       if (cutoffResult.rows.length === 0) {
-        log.warn("[stavrobot] Compaction skipped: no cutoff message found for computed boundary.");
+        log.warn("[solonbot] Compaction skipped: no cutoff message found for computed boundary.");
         return;
       }
       const upToMessageId = cutoffResult.rows[0].id as number;
 
-      log.debug(`[stavrobot] [debug] Boundary: previousBoundary=${previousBoundary}, keepCount=${keepCount}, upToMessageId=${upToMessageId}`);
+      log.debug(`[solonbot] [debug] Boundary: previousBoundary=${previousBoundary}, keepCount=${keepCount}, upToMessageId=${upToMessageId}`);
 
       await saveCompaction(pool, summaryText, upToMessageId, agentId);
-      log.info(`[stavrobot] Background compaction complete: compacted ${messagesToCompact.length} messages, kept ${messagesToKeep.length}.`);
+      log.info(`[solonbot] Background compaction complete: compacted ${messagesToCompact.length} messages, kept ${messagesToKeep.length}.`);
       compactionCompletedForAgent = agentId;
     } catch (error) {
-      log.error("[stavrobot] Background compaction failed:", error instanceof Error ? error.message : String(error));
+      log.error("[solonbot] Background compaction failed:", error instanceof Error ? error.message : String(error));
     } finally {
       compactionInProgress = false;
     }
@@ -707,12 +707,12 @@ export async function handlePrompt(
   // conversation.
   if (compactionCompletedForAgent === agentId) {
     compactionCompletedForAgent = null;
-    log.debug(`[stavrobot] Cleared compaction-completed flag for agent ${agentId}.`);
-    log.debug(`[stavrobot] [debug] Reloaded ${conversationMessages.length} messages`);
+    log.debug(`[solonbot] Cleared compaction-completed flag for agent ${agentId}.`);
+    log.debug(`[solonbot] [debug] Reloaded ${conversationMessages.length} messages`);
   }
 
   agent.replaceMessages(conversationMessages);
-  log.debug(`[stavrobot] Loaded ${conversationMessages.length} messages for agent ${agentId}.`);
+  log.debug(`[solonbot] Loaded ${conversationMessages.length} messages for agent ${agentId}.`);
 
   const allPlugins = await fetchPluginList();
 
@@ -759,7 +759,7 @@ export async function handlePrompt(
     try {
       const searchResults = await runSearch(pool, resolvedMessage, AUTO_SEARCH_LIMIT, getMainAgentId(), config.embeddings);
       const searchDuration = Date.now() - searchStart;
-      log.debug(`[stavrobot] auto-search completed in ${searchDuration}ms (${searchResults.tableResults.length} table results, ${searchResults.messages.length} messages)`);
+      log.debug(`[solonbot] auto-search completed in ${searchDuration}ms (${searchResults.tableResults.length} table results, ${searchResults.messages.length} messages)`);
 
       autoSearchEmbedding = searchResults.queryEmbedding;
 
@@ -768,7 +768,7 @@ export async function handlePrompt(
         pendingAutoSearchBlocks.set(agent, buildAutoSearchBlock(searchResults, resolvedMessage));
       }
     } catch (error) {
-      log.warn("[stavrobot] auto-search failed, continuing without results:", error instanceof Error ? error.message : String(error));
+      log.warn("[solonbot] auto-search failed, continuing without results:", error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -826,7 +826,7 @@ export async function handlePrompt(
           "INSERT INTO message_embeddings (message_id, embedding) VALUES ($1, $2) ON CONFLICT DO NOTHING",
           [savedUserMessageId, vectorLiteral],
         );
-        log.debug(`[stavrobot] auto-search embedding stored for message ${savedUserMessageId}`);
+        log.debug(`[solonbot] auto-search embedding stored for message ${savedUserMessageId}`);
       }
     }
 
@@ -907,7 +907,7 @@ export async function handlePrompt(
     agent.replaceMessages(cleanedMessages);
     agent.state.error = undefined;
     if (wasAborted) {
-      log.info("[stavrobot] Agent aborted.");
+      log.info("[solonbot] Agent aborted.");
       const cancellationMessage = {
         role: "user" as const,
         content: [{ type: "text" as const, text: "[The user cancelled the previous request with /stop.]" }],
@@ -917,7 +917,7 @@ export async function handlePrompt(
       await saveMessage(pool, cancellationMessage, agentId);
       throw new AbortError();
     }
-    log.error("[stavrobot] Agent error:", errorJson);
+    log.error("[solonbot] Agent error:", errorJson);
     throw new Error(`Agent error: ${errorJson}`);
   }
 

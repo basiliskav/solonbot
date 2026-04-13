@@ -194,7 +194,7 @@ export function selectCompactionCutIndex(messages: AgentMessage[], compactionTok
   if (backwardIndex <= 0) {
     return null;
   }
-  log.info(`[stavrobot] Forward scan found no user message, fell back to backward scan (cutIndex=${backwardIndex}).`);
+  log.info(`[solonbot] Forward scan found no user message, fell back to backward scan (cutIndex=${backwardIndex}).`);
   return backwardIndex;
 }
 
@@ -309,7 +309,7 @@ export function truncateContext(messages: AgentMessage[], tokenBudget: number): 
     }
   }
 
-  log.info(`[stavrobot] truncateContext: reduced estimated tokens from ${Math.round(estimateTokens(messages))} to ${Math.round(estimateTokens(result))} (budget: ${tokenBudget})`);
+  log.info(`[solonbot] truncateContext: reduced estimated tokens from ${Math.round(estimateTokens(messages))} to ${Math.round(estimateTokens(result))} (budget: ${tokenBudget})`);
 
   return result;
 }
@@ -461,7 +461,7 @@ export async function escalatingSummarize(
 
   // Level 2: bullet-point prompt targeting half the input's estimated token count.
   const targetTokens = Math.round(inputLength / 3 / 2);
-  log.info(`[stavrobot] Compaction level 1 failed (summary ${level1Text.length} chars >= input ${inputLength} chars), attempting level 2 bullet-point summary (target: ${targetTokens} tokens).`);
+  log.info(`[solonbot] Compaction level 1 failed (summary ${level1Text.length} chars >= input ${inputLength} chars), attempting level 2 bullet-point summary (target: ${targetTokens} tokens).`);
 
   const bulletPrompt = config.compactionBulletPrompt.replace("{target}", String(targetTokens));
 
@@ -496,7 +496,7 @@ export async function escalatingSummarize(
   }
 
   // Level 3: deterministic truncation — no LLM call.
-  log.info(`[stavrobot] Compaction level 2 failed (summary ${level2Text.length} chars >= input ${inputLength} chars), falling back to level 3 truncation.`);
+  log.info(`[solonbot] Compaction level 2 failed (summary ${level2Text.length} chars >= input ${inputLength} chars), falling back to level 3 truncation.`);
 
   const suffix = "\n[truncated due to compaction failure]";
   // Guarantee the result is strictly shorter than the input. If the input is

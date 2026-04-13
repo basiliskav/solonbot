@@ -247,14 +247,14 @@ export async function handleLoginEvents(
   // reconnects automatically, and we replay the stored state so the user sees
   // the same auth URL and prompt they saw before the reload.
   if (activeLoginPromise !== null) {
-    log.debug("[stavrobot] handleLoginEvents: attaching new SSE connection to existing flow");
+    log.debug("[solonbot] handleLoginEvents: attaching new SSE connection to existing flow");
 
     activeResponse = response;
     activeIsConnected = true;
     const thisResponse = response;
 
     request.on("close", () => {
-      log.debug("[stavrobot] handleLoginEvents: reconnected client disconnected");
+      log.debug("[solonbot] handleLoginEvents: reconnected client disconnected");
       if (thisResponse === activeResponse) {
         activeIsConnected = false;
       }
@@ -284,13 +284,13 @@ export async function handleLoginEvents(
   activeIsConnected = true;
 
   request.on("close", () => {
-    log.debug(`[stavrobot] handleLoginEvents: client disconnected (flow ${flowId})`);
+    log.debug(`[solonbot] handleLoginEvents: client disconnected (flow ${flowId})`);
     if (flowId === loginFlowCounter) {
       activeIsConnected = false;
     }
   });
 
-  log.debug(`[stavrobot] handleLoginEvents: starting login flow ${flowId} for provider "${config.provider}"`);
+  log.debug(`[solonbot] handleLoginEvents: starting login flow ${flowId} for provider "${config.provider}"`);
 
   // These are assigned synchronously inside the Promise constructor, so they
   // are always non-null by the time the try block runs. TypeScript cannot infer
@@ -307,7 +307,7 @@ export async function handleLoginEvents(
   // the user abandons the login page.
   flowTimeoutHandle = setTimeout(() => {
     if (flowId === loginFlowCounter && activeLoginPromise !== null) {
-      log.warn(`[stavrobot] handleLoginEvents: flow ${flowId} timed out after ${FLOW_TIMEOUT_MS / 1000}s`);
+      log.warn(`[solonbot] handleLoginEvents: flow ${flowId} timed out after ${FLOW_TIMEOUT_MS / 1000}s`);
       if (pendingPromptReject !== null) {
         // The library is currently blocked waiting for user input. Rejecting its
         // promise causes it to call cancelWait() and close the callback server.
@@ -328,12 +328,12 @@ export async function handleLoginEvents(
   try {
     const credentials = await provider.login({
       onAuth: (info) => {
-        log.debug("[stavrobot] handleLoginEvents: onAuth called, sending auth event");
+        log.debug("[solonbot] handleLoginEvents: onAuth called, sending auth event");
         lastAuthEvent = { url: info.url, instructions: info.instructions };
         sendActiveSseEvent("auth", { url: info.url, instructions: info.instructions });
       },
       onPrompt: (prompt) => {
-        log.debug("[stavrobot] handleLoginEvents: onPrompt called, sending prompt event");
+        log.debug("[solonbot] handleLoginEvents: onPrompt called, sending prompt event");
         return new Promise<string>((resolve, reject) => {
           if (loginCancelled) {
             reject(new Error("Login flow timed out"));
@@ -346,7 +346,7 @@ export async function handleLoginEvents(
         });
       },
       onProgress: (message) => {
-        log.debug("[stavrobot] handleLoginEvents: onProgress:", message);
+        log.debug("[solonbot] handleLoginEvents: onProgress:", message);
         sendActiveSseEvent("progress", { message });
       },
       // Races against the provider's local callback server. In a remote deployment
@@ -354,7 +354,7 @@ export async function handleLoginEvents(
       // so the callback server never receives the code. Providing this callback lets
       // the user paste the redirect URL or code manually, whichever arrives first wins.
       onManualCodeInput: () => {
-        log.debug("[stavrobot] handleLoginEvents: onManualCodeInput called, sending prompt event");
+        log.debug("[solonbot] handleLoginEvents: onManualCodeInput called, sending prompt event");
         return new Promise<string>((resolve, reject) => {
           if (loginCancelled) {
             reject(new Error("Login flow timed out"));
@@ -369,7 +369,7 @@ export async function handleLoginEvents(
       },
     });
 
-    log.debug("[stavrobot] handleLoginEvents: login succeeded, saving credentials");
+    log.debug("[solonbot] handleLoginEvents: login succeeded, saving credentials");
 
     const authFile = config.authFile;
     let existingCredentials: Record<string, OAuthCredentials> = {};
@@ -388,7 +388,7 @@ export async function handleLoginEvents(
     fs.mkdirSync(authDir, { recursive: true });
     fs.writeFileSync(authFile, JSON.stringify(existingCredentials, null, 2), "utf-8");
 
-    log.debug("[stavrobot] handleLoginEvents: credentials written to", authFile);
+    log.debug("[solonbot] handleLoginEvents: credentials written to", authFile);
 
     if (activeIsConnected && activeResponse !== null) {
       sendSseEvent(activeResponse, "success", {});
@@ -398,7 +398,7 @@ export async function handleLoginEvents(
     resolveActiveLogin();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    log.error("[stavrobot] handleLoginEvents: login failed:", message);
+    log.error("[solonbot] handleLoginEvents: login failed:", message);
     if (activeIsConnected && activeResponse !== null) {
       sendSseEvent(activeResponse, "error_event", { message });
       activeResponse.end();
@@ -448,7 +448,7 @@ export async function handleLoginRespond(
     return;
   }
 
-  log.debug("[stavrobot] handleLoginRespond: resolving pending prompt");
+  log.debug("[solonbot] handleLoginRespond: resolving pending prompt");
   const resolver = pendingPromptResolver;
   pendingPromptResolver = null;
   pendingPromptReject = null;

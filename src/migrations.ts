@@ -239,7 +239,7 @@ export async function runMigrations(pool: pg.Pool): Promise<void> {
   const bootstrapClient = await pool.connect();
   try {
     await migrations[0](bootstrapClient);
-    log.info("[stavrobot] Migration 0 applied (baseline schema).");
+    log.info("[solonbot] Migration 0 applied (baseline schema).");
   } finally {
     bootstrapClient.release();
   }
@@ -247,7 +247,7 @@ export async function runMigrations(pool: pg.Pool): Promise<void> {
   // Read the current version after migration 0 has ensured the table exists.
   const versionResult = await pool.query<{ version: number }>("SELECT version FROM schema_version WHERE id = 1");
   let currentVersion = versionResult.rows[0].version;
-  log.info(`[stavrobot] Current schema version: ${currentVersion}`);
+  log.info(`[solonbot] Current schema version: ${currentVersion}`);
 
   // Apply any pending migrations in order.
   for (let index = currentVersion + 1; index < migrations.length; index++) {
@@ -258,7 +258,7 @@ export async function runMigrations(pool: pg.Pool): Promise<void> {
       await client.query("UPDATE schema_version SET version = $1 WHERE id = 1", [index]);
       await client.query("COMMIT");
       currentVersion = index;
-      log.info(`[stavrobot] Migration ${index} applied.`);
+      log.info(`[solonbot] Migration ${index} applied.`);
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -268,6 +268,6 @@ export async function runMigrations(pool: pg.Pool): Promise<void> {
   }
 
   if (currentVersion === 0) {
-    log.info("[stavrobot] Schema is up to date.");
+    log.info("[solonbot] Schema is up to date.");
   }
 }

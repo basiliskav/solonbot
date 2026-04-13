@@ -66,10 +66,10 @@ async function cleanupOldUploads(): Promise<void> {
       const stat = await fs.promises.stat(filePath);
       if (now - stat.mtimeMs > THREE_DAYS_MS) {
         await fs.promises.unlink(filePath);
-        log.info("[stavrobot] Deleted old upload:", filePath);
+        log.info("[solonbot] Deleted old upload:", filePath);
       }
     } catch (error) {
-      log.error("[stavrobot] Error processing upload file during cleanup:", filePath, error);
+      log.error("[solonbot] Error processing upload file during cleanup:", filePath, error);
     }
   }
 }
@@ -80,7 +80,7 @@ function tick(): void {
   const toFire = scheduledEntries.filter((entry) => entry.nextFireAt <= now);
 
   if (toFire.length > 0) {
-    log.info(`[stavrobot] Cron tick: firing ${toFire.length} entries (ids: ${toFire.map((e) => e.id).join(", ")})`);
+    log.info(`[solonbot] Cron tick: firing ${toFire.length} entries (ids: ${toFire.map((e) => e.id).join(", ")})`);
   }
 
   // Update in-memory state synchronously before any async work.
@@ -107,10 +107,10 @@ export async function initializeScheduler(pool: pg.Pool): Promise<void> {
   schedulerPool = pool;
   await loadEntries(pool);
   setInterval(tick, 60_000);
-  log.info(`[stavrobot] Scheduler initialized with ${scheduledEntries.length} entries.`);
+  log.info(`[solonbot] Scheduler initialized with ${scheduledEntries.length} entries.`);
 }
 
 export async function reloadScheduler(pool: pg.Pool): Promise<void> {
   await loadEntries(pool);
-  log.info(`[stavrobot] Scheduler reloaded with ${scheduledEntries.length} entries.`);
+  log.info(`[solonbot] Scheduler reloaded with ${scheduledEntries.length} entries.`);
 }

@@ -143,7 +143,7 @@ export async function handleChatRequest(
         // Reject paths outside the uploads directory to prevent arbitrary file reads.
         const normalized = path.normalize((item as Record<string, unknown>).storedPath as string);
         if (!normalized.startsWith(uploadsPrefix)) {
-          log.warn("[stavrobot] Rejecting attachment with path outside uploads directory:", normalized);
+          log.warn("[solonbot] Rejecting attachment with path outside uploads directory:", normalized);
           return false;
         }
         return true;
@@ -174,11 +174,11 @@ export async function handleChatRequest(
           typeof (item as Record<string, unknown>).mimeType === "string"
         );
       });
-      log.debug("[stavrobot] Received", rawFiles.length, "file(s) via 'files' field");
+      log.debug("[solonbot] Received", rawFiles.length, "file(s) via 'files' field");
       for (const rawFile of rawFiles) {
         const buffer = Buffer.from(rawFile.data, "base64");
         if (buffer.length > 10 * 1024 * 1024) {
-          log.warn("[stavrobot] Skipping file", rawFile.filename, "— decoded size", buffer.length, "exceeds 10 MB limit");
+          log.warn("[solonbot] Skipping file", rawFile.filename, "— decoded size", buffer.length, "exceeds 10 MB limit");
           continue;
         }
         const { storedPath } = await saveAttachment(buffer, rawFile.filename, rawFile.mimeType);
@@ -212,7 +212,7 @@ export async function handleChatRequest(
       response.end(JSON.stringify({ error: "Request body too large" }));
       return;
     }
-    log.error("[stavrobot] Error handling request:", error);
+    log.error("[solonbot] Error handling request:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));
@@ -244,10 +244,10 @@ export async function handleTelegramWebhookRequest(
       } else {
         reason = "wrong_secret";
       }
-      log.info(`[stavrobot] Telegram webhook rejected: ${reason}`);
+      log.info(`[solonbot] Telegram webhook rejected: ${reason}`);
       const providedFingerprint = typeof providedSecret === "string" ? providedSecret.slice(0, 8) : String(providedSecret);
-      log.debug(`[stavrobot] [debug] Secret mismatch: reason=${reason}, provided=${providedFingerprint}...`);
-      log.debug(`[stavrobot] [debug] Request metadata: remoteAddress=${request.socket?.remoteAddress}, x-forwarded-for=${request.headers["x-forwarded-for"]}, user-agent=${request.headers["user-agent"]}, content-length=${request.headers["content-length"]}`);
+      log.debug(`[solonbot] [debug] Secret mismatch: reason=${reason}, provided=${providedFingerprint}...`);
+      log.debug(`[solonbot] [debug] Request metadata: remoteAddress=${request.socket?.remoteAddress}, x-forwarded-for=${request.headers["x-forwarded-for"]}, user-agent=${request.headers["user-agent"]}, content-length=${request.headers["content-length"]}`);
       response.writeHead(403, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: "Forbidden" }));
       return;
@@ -279,7 +279,7 @@ export async function handleTelegramWebhookRequest(
       }
       return;
     }
-    log.error("[stavrobot] Error handling Telegram webhook request:", error);
+    log.error("[solonbot] Error handling Telegram webhook request:", error);
     if (!response.headersSent) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       response.writeHead(500, { "Content-Type": "application/json" });
@@ -335,7 +335,7 @@ export async function handlePageQueryRequest(
       if (!checkBasicAuth(request, password)) {
         response.writeHead(401, {
           "Content-Type": "application/json",
-          "WWW-Authenticate": `Basic realm="stavrobot"`,
+          "WWW-Authenticate": `Basic realm="solonbot"`,
         });
         response.end(JSON.stringify({ error: "Unauthorized" }));
         return;
@@ -383,7 +383,7 @@ export async function handlePageQueryRequest(
     }
     const parameterizedSql = sql.replace(/\$param:(\w+)/g, (_full, name: string) => paramMap.get(name) ?? "");
 
-    log.info(`[stavrobot] Page query: ${pagePath}/${queryName}`, parameterizedSql);
+    log.info(`[solonbot] Page query: ${pagePath}/${queryName}`, parameterizedSql);
     const client = await pool.connect();
     let result;
     try {
@@ -400,7 +400,7 @@ export async function handlePageQueryRequest(
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify(result.rows));
   } catch (error) {
-    log.error("[stavrobot] Error handling page query request:", error);
+    log.error("[solonbot] Error handling page query request:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));
@@ -434,18 +434,18 @@ async function handlePageRequest(
       if (!checkBasicAuth(request, password)) {
         response.writeHead(401, {
           "Content-Type": "application/json",
-          "WWW-Authenticate": `Basic realm="stavrobot"`,
+          "WWW-Authenticate": `Basic realm="solonbot"`,
         });
         response.end(JSON.stringify({ error: "Unauthorized" }));
         return;
       }
     }
 
-    log.info(`[stavrobot] Serving page: ${pagePath} (public: ${page.isPublic})`);
+    log.info(`[solonbot] Serving page: ${pagePath} (public: ${page.isPublic})`);
     response.writeHead(200, { "Content-Type": page.mimetype });
     response.end(page.data);
   } catch (error) {
-    log.error("[stavrobot] Error handling page request:", error);
+    log.error("[solonbot] Error handling page request:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));
@@ -474,7 +474,7 @@ async function main(): Promise<void> {
       throw new Error("Config must specify publicHostname when telegram is configured.");
     }
     telegramWebhookSecret = await registerTelegramWebhook(config.telegram, config.publicHostname);
-    log.debug(`[stavrobot] [debug] Telegram webhook secret loaded: fingerprint=${telegramWebhookSecret.slice(0, 8)}..., bootTime=${new Date().toISOString()}`);
+    log.debug(`[solonbot] [debug] Telegram webhook secret loaded: fingerprint=${telegramWebhookSecret.slice(0, 8)}..., bootTime=${new Date().toISOString()}`);
   }
 
   if (config.whatsapp !== undefined) {
@@ -493,10 +493,10 @@ async function main(): Promise<void> {
 
     if (config.password !== undefined && !isPublicRoute(request.method ?? "", pathname)) {
       if (!checkBasicAuth(request, config.password)) {
-        log.info("[stavrobot] Unauthorized request:", request.method, pathname);
+        log.info("[solonbot] Unauthorized request:", request.method, pathname);
         response.writeHead(401, {
           "Content-Type": "application/json",
-          "WWW-Authenticate": `Basic realm="stavrobot"`,
+          "WWW-Authenticate": `Basic realm="solonbot"`,
         });
         response.end(JSON.stringify({ error: "Unauthorized" }));
         return;

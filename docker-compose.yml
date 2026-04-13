@@ -10,12 +10,12 @@ services:
       - "-c"
       - "log_line_prefix=%t [%p]: "
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-stavrobot}
-      POSTGRES_USER: ${POSTGRES_USER:-stavrobot}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stavrobot}
+      POSTGRES_DB: ${POSTGRES_DB:-solonbot}
+      POSTGRES_USER: ${POSTGRES_USER:-solonbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-solonbot}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-stavrobot}", "-d", "${POSTGRES_DB:-stavrobot}"]
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-solonbot}", "-d", "${POSTGRES_DB:-solonbot}"]
       interval: 2s
       timeout: 3s
       retries: 10
@@ -30,9 +30,9 @@ services:
       TZ: ${TZ:-UTC}
       PGHOST: postgres
       PGPORT: 5432
-      PGUSER: ${POSTGRES_USER:-stavrobot}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-stavrobot}
-      PGDATABASE: ${POSTGRES_DB:-stavrobot}
+      PGUSER: ${POSTGRES_USER:-solonbot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-solonbot}
+      PGDATABASE: ${POSTGRES_DB:-solonbot}
       STAVROBOT_LOG_LEVEL: ${STAVROBOT_LOG_LEVEL:-info}
       CONFIG_PATH: /app/config/config.toml
       ALLOWLIST_PATH: /app/data/allowlist.json
@@ -86,9 +86,9 @@ services:
     environment:
       TZ: ${TZ:-UTC}
       PGHOST: postgres
-      PGUSER: ${POSTGRES_USER:-stavrobot}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-stavrobot}
-      PGDATABASE: ${POSTGRES_DB:-stavrobot}
+      PGUSER: ${POSTGRES_USER:-solonbot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-solonbot}
+      PGDATABASE: ${POSTGRES_DB:-solonbot}
       BACKUP_INTERVAL_SECONDS: 3600
     restart: unless-stopped
     volumes:

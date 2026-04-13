@@ -29,7 +29,7 @@ export function e164ToJid(phoneNumber: string): string {
 export async function sendWhatsappTextMessage(recipient: string, text: string): Promise<void> {
   const socket = getWhatsappSocket();
   if (socket === undefined) {
-    log.warn("[stavrobot] sendWhatsappTextMessage: WhatsApp socket not connected, dropping message.");
+    log.warn("[solonbot] sendWhatsappTextMessage: WhatsApp socket not connected, dropping message.");
     return;
   }
   const jid = e164ToJid(recipient);

@@ -17,7 +17,7 @@ export function handleGetAllowlistRequest(
   response: http.ServerResponse,
   config: Config,
 ): void {
-  log.debug("[stavrobot] handleGetAllowlistRequest: returning allowlist and owner identities");
+  log.debug("[solonbot] handleGetAllowlistRequest: returning allowlist and owner identities");
   const allowlist = getAllowlist();
   const ownerIdentities = getOwnerIdentities(config);
   response.writeHead(200, { "Content-Type": "application/json" });
@@ -198,7 +198,7 @@ export async function handlePutAllowlistRequest(
   submitted.notes = prunedNotes;
 
   saveAllowlist(submitted);
-  log.debug("[stavrobot] handlePutAllowlistRequest: allowlist saved", submitted);
+  log.debug("[solonbot] handlePutAllowlistRequest: allowlist saved", submitted);
 
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify({ allowlist: submitted, ownerIdentities }));

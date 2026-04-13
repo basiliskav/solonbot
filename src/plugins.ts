@@ -16,10 +16,10 @@ async function readRequestBody(request: http.IncomingMessage): Promise<string> {
 export async function handlePluginsListRequest(
   response: http.ServerResponse,
 ): Promise<void> {
-  log.debug("[stavrobot] handlePluginsListRequest: proxying GET /bundles");
+  log.debug("[solonbot] handlePluginsListRequest: proxying GET /bundles");
   const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles`);
   const body = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginsListRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginsListRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(body);
 }
@@ -28,10 +28,10 @@ export async function handlePluginDetailRequest(
   response: http.ServerResponse,
   pluginName: string,
 ): Promise<void> {
-  log.debug("[stavrobot] handlePluginDetailRequest: proxying GET /bundles/:name for", pluginName);
+  log.debug("[solonbot] handlePluginDetailRequest: proxying GET /bundles/:name for", pluginName);
   const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/bundles/${encodeURIComponent(pluginName)}`);
   const body = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginDetailRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginDetailRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(body);
 }
@@ -48,12 +48,12 @@ export async function handlePluginConfigRequest(
     response.end(JSON.stringify({ error: "Server password not configured; cannot proxy config request." }));
     return;
   }
-  log.debug("[stavrobot] handlePluginConfigRequest: proxying GET /bundles/:name/config for", pluginName);
+  log.debug("[solonbot] handlePluginConfigRequest: proxying GET /bundles/:name/config for", pluginName);
   const pluginResponse = await internalFetch(
     `${PLUGIN_RUNNER_BASE_URL}/bundles/${encodeURIComponent(pluginName)}/config`,
   );
   const body = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginConfigRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginConfigRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(body);
 }
@@ -63,14 +63,14 @@ export async function handlePluginInstallRequest(
   response: http.ServerResponse,
 ): Promise<void> {
   const body = await readRequestBody(request);
-  log.debug("[stavrobot] handlePluginInstallRequest: proxying POST /install");
+  log.debug("[solonbot] handlePluginInstallRequest: proxying POST /install");
   const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/install`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
   });
   const responseBody = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginInstallRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginInstallRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(responseBody);
 }
@@ -80,14 +80,14 @@ export async function handlePluginUpdateRequest(
   response: http.ServerResponse,
 ): Promise<void> {
   const body = await readRequestBody(request);
-  log.debug("[stavrobot] handlePluginUpdateRequest: proxying POST /update");
+  log.debug("[solonbot] handlePluginUpdateRequest: proxying POST /update");
   const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/update`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
   });
   const responseBody = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginUpdateRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginUpdateRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(responseBody);
 }
@@ -97,14 +97,14 @@ export async function handlePluginRemoveRequest(
   response: http.ServerResponse,
 ): Promise<void> {
   const body = await readRequestBody(request);
-  log.debug("[stavrobot] handlePluginRemoveRequest: proxying POST /remove");
+  log.debug("[solonbot] handlePluginRemoveRequest: proxying POST /remove");
   const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/remove`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
   });
   const responseBody = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginRemoveRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginRemoveRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(responseBody);
 }
@@ -114,14 +114,14 @@ export async function handlePluginConfigureRequest(
   response: http.ServerResponse,
 ): Promise<void> {
   const body = await readRequestBody(request);
-  log.debug("[stavrobot] handlePluginConfigureRequest: proxying POST /configure");
+  log.debug("[solonbot] handlePluginConfigureRequest: proxying POST /configure");
   const pluginResponse = await internalFetch(`${PLUGIN_RUNNER_BASE_URL}/configure`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
   });
   const responseBody = await pluginResponse.text();
-  log.debug("[stavrobot] handlePluginConfigureRequest: response status", pluginResponse.status);
+  log.debug("[solonbot] handlePluginConfigureRequest: response status", pluginResponse.status);
   response.writeHead(pluginResponse.status, { "Content-Type": "application/json" });
   response.end(responseBody);
 }

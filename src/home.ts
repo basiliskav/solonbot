@@ -75,7 +75,7 @@ function buildHtml(config: Config, uptime: string, stats: MessageStats): string 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Stavrobot</title>
+  <title>Solonbot</title>
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js" integrity="sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.3.2/dist/purify.min.js" integrity="sha384-8hAfZQ5Oqos5HLTHfR0sLvvwpcVI4fGhV+0Dj/HCcpkKaacivQs82XHmvLOnAhXn" crossorigin="anonymous"></script>
   <style>
@@ -345,7 +345,7 @@ function buildHtml(config: Config, uptime: string, stats: MessageStats): string 
   </style>
 </head>
 <body>
-  <h1>Stavrobot</h1>
+  <h1>Solonbot</h1>
 
   <div class="page-layout">
     <div class="chat-column">
@@ -448,7 +448,7 @@ function buildHtml(config: Config, uptime: string, stats: MessageStats): string 
 
         const senderEl = document.createElement("div");
         senderEl.className = "chat-message-sender";
-        senderEl.textContent = sender === "user" ? "You" : "Stavrobot";
+        senderEl.textContent = sender === "user" ? "You" : "Solonbot";
 
         const bubble = document.createElement("div");
         bubble.className = "chat-message-bubble";
@@ -566,7 +566,7 @@ export async function serveHomePage(
   pool: pg.Pool,
 ): Promise<void> {
   try {
-    log.debug("[stavrobot] serveHomePage: querying message stats");
+    log.debug("[solonbot] serveHomePage: querying message stats");
 
     const result = await pool.query<MessageStats>(`
       SELECT
@@ -586,11 +586,11 @@ export async function serveHomePage(
     const uptime = formatUptime(Date.now() - startTime);
     const html = buildHtml(config, uptime, stats);
 
-    log.debug("[stavrobot] serveHomePage: serving home page");
+    log.debug("[solonbot] serveHomePage: serving home page");
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     response.end(html);
   } catch (error) {
-    log.error("[stavrobot] Error serving home page:", error);
+    log.error("[solonbot] Error serving home page:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));

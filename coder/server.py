@@ -34,7 +34,7 @@ def load_config() -> tuple[str, str, str | None, str | None]:
 
     password = config.get("password")
     if not password:
-        print("[stavrobot-coder] Fatal: 'password' is missing from config.toml")
+        print("[solonbot-coder] Fatal: 'password' is missing from config.toml")
         raise SystemExit(1)
 
     coder_section = config.get("coder", {})
@@ -66,7 +66,7 @@ def ensure_plugin_user(plugin_name: str, uid: int, gid: int) -> None:
         )
         # Exit code 9 means the group already exists, which is fine.
         if group_result.returncode not in (0, 9):
-            print(f"[stavrobot-coder] Warning: groupadd exited with code {group_result.returncode} for {username}: {group_result.stderr.decode(errors='replace').strip()}")
+            print(f"[solonbot-coder] Warning: groupadd exited with code {group_result.returncode} for {username}: {group_result.stderr.decode(errors='replace').strip()}")
 
         user_result = subprocess.run(
             ["useradd", "--system", "--no-create-home", "--uid", str(uid), "--gid", str(gid), username],
@@ -74,9 +74,9 @@ def ensure_plugin_user(plugin_name: str, uid: int, gid: int) -> None:
         )
         # Exit code 9 means the user already exists, which is fine.
         if user_result.returncode not in (0, 9):
-            print(f"[stavrobot-coder] Warning: useradd exited with code {user_result.returncode} for {username}: {user_result.stderr.decode(errors='replace').strip()}")
+            print(f"[solonbot-coder] Warning: useradd exited with code {user_result.returncode} for {username}: {user_result.stderr.decode(errors='replace').strip()}")
     except FileNotFoundError:
-        print(f"[stavrobot-coder] Warning: useradd/groupadd not available, skipping user creation for {username}")
+        print(f"[solonbot-coder] Warning: useradd/groupadd not available, skipping user creation for {username}")
 
 
 def setup_plugin_credentials(plugin_dir: str, uid: int, gid: int) -> None:
@@ -120,7 +120,7 @@ def teardown_plugin_credentials(plugin_dir: str) -> None:
         # .credentials.json with a symlink. Since this copy runs as root, following a
         # symlink here would allow the plugin to read arbitrary root-owned files.
         if os.path.islink(plugin_credentials):
-            print(f"[stavrobot-coder] Warning: {plugin_credentials} is a symlink; skipping credential copy-back")
+            print(f"[solonbot-coder] Warning: {plugin_credentials} is a symlink; skipping credential copy-back")
         else:
             shutil.copy2(plugin_credentials, CODER_CREDENTIALS_PATH)
     shutil.rmtree(plugin_claude_dir, ignore_errors=True)
@@ -155,7 +155,7 @@ def post_result(message: str) -> None:
         method="POST",
     )
     with urllib.request.urlopen(request) as response:
-        print(f"[stavrobot-coder] Result posted, HTTP {response.status}")
+        print(f"[solonbot-coder] Result posted, HTTP {response.status}")
 
 
 def run_coding_task(task_id: str, message: str, plugin: str) -> None:
@@ -163,7 +163,7 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
     if not PLUGIN_NAME_RE.match(plugin):
         raise ValueError(f"Invalid plugin name: {plugin!r}")
 
-    print(f"[stavrobot-coder] Starting coding task {task_id} for plugin {plugin!r}")
+    print(f"[solonbot-coder] Starting coding task {task_id} for plugin {plugin!r}")
 
     cwd = os.path.join(PLUGINS_DIR, plugin)
 
@@ -182,7 +182,7 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
         ensure_plugin_user(plugin, uid, gid)
 
         if use_api_key_auth:
-            print(f"[stavrobot-coder] Using API key auth for task {task_id}")
+            print(f"[solonbot-coder] Using API key auth for task {task_id}")
         else:
             # Copy credentials into the plugin directory so claude can authenticate when
             # running as the plugin user. HOME is set to the plugin directory so claude
@@ -216,7 +216,7 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
             subprocess_env["ANTHROPIC_API_KEY"] = API_KEY
             subprocess_env["ANTHROPIC_BASE_URL"] = BASE_URL
 
-        print(f"[stavrobot-coder] Running as uid={uid} gid={gid} in {cwd}")
+        print(f"[solonbot-coder] Running as uid={uid} gid={gid} in {cwd}")
 
         result = subprocess.run(
             [
@@ -237,10 +237,10 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
             env=subprocess_env,
         )
 
-        print(f"[stavrobot-coder] Task {task_id} subprocess exited with code {result.returncode}")
-        print(f"[stavrobot-coder] Task {task_id} stdout: {result.stdout}")
+        print(f"[solonbot-coder] Task {task_id} subprocess exited with code {result.returncode}")
+        print(f"[solonbot-coder] Task {task_id} stdout: {result.stdout}")
         if result.stderr:
-            print(f"[stavrobot-coder] Task {task_id} stderr: {result.stderr}")
+            print(f"[solonbot-coder] Task {task_id} stderr: {result.stderr}")
 
         if not result.stdout.strip():
             stderr_snippet = result.stderr.strip()[:500] if result.stderr else "no output"
@@ -266,16 +266,16 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
                 result_text = result_text + usage_footer
 
     except subprocess.TimeoutExpired:
-        print(f"[stavrobot-coder] Task {task_id} timed out after {TASK_TIMEOUT_SECONDS}s")
+        print(f"[solonbot-coder] Task {task_id} timed out after {TASK_TIMEOUT_SECONDS}s")
         result_text = f"Coding task failed: timed out after {TASK_TIMEOUT_SECONDS} seconds."
     except Exception as error:
-        print(f"[stavrobot-coder] Task {task_id} raised an exception: {error}")
+        print(f"[solonbot-coder] Task {task_id} raised an exception: {error}")
         result_text = f"Coding task failed: {error}"
     finally:
         if credentials_set_up:
             teardown_plugin_credentials(cwd)
 
-    print(f"[stavrobot-coder] Posting result for task {task_id}, length: {len(result_text)}")
+    print(f"[solonbot-coder] Posting result for task {task_id}, length: {len(result_text)}")
     post_result(result_text)
 
 
@@ -299,7 +299,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         """Override to use the project log prefix."""
-        print(f"[stavrobot-coder] {format % args}")
+        print(f"[solonbot-coder] {format % args}")
 
     def do_GET(self) -> None:
         """Handle GET requests."""
@@ -323,17 +323,17 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             plugin = payload["plugin"]
 
             if not PLUGIN_NAME_RE.match(plugin):
-                print(f"[stavrobot-coder] Rejecting task {task_id}: invalid plugin name: {plugin!r}")
+                print(f"[solonbot-coder] Rejecting task {task_id}: invalid plugin name: {plugin!r}")
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid plugin name: {plugin!r}"})
                 return
 
             plugin_dir = os.path.join(PLUGINS_DIR, plugin)
             if not os.path.isdir(plugin_dir):
-                print(f"[stavrobot-coder] Rejecting task {task_id}: plugin directory not found: {plugin_dir}")
+                print(f"[solonbot-coder] Rejecting task {task_id}: plugin directory not found: {plugin_dir}")
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Plugin directory not found: {plugin!r}"})
                 return
 
-            print(f"[stavrobot-coder] Received coding task {task_id} for plugin {plugin!r}: {message[:100]}")
+            print(f"[solonbot-coder] Received coding task {task_id} for plugin {plugin!r}: {message[:100]}")
 
             thread = Thread(
                 target=run_coding_task,
@@ -360,7 +360,7 @@ def main() -> None:
     """Start the HTTP server."""
     port = int(os.environ.get("PORT", "3002"))
     server = http.server.ThreadingHTTPServer(("", port), RequestHandler)
-    print(f"[stavrobot-coder] Listening on port {port}")
+    print(f"[solonbot-coder] Listening on port {port}")
     server.serve_forever()
 
 

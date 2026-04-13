@@ -60,7 +60,7 @@ export function createRunPythonTool(): AgentTool {
         const resolvedPath = path.resolve(filePath);
         if (!resolvedPath.startsWith(resolvedTempDir + path.sep) && resolvedPath !== resolvedTempDir) {
           const errorMessage = `Error: file path is outside the allowed directory (${TEMP_ATTACHMENTS_DIR}): ${filePath}`;
-          log.warn(`[stavrobot] run_python path validation failed: ${filePath}`);
+          log.warn(`[solonbot] run_python path validation failed: ${filePath}`);
           return toolError(errorMessage);
         }
         const data = await fs.readFile(resolvedPath);
@@ -83,7 +83,7 @@ export function createRunPythonTool(): AgentTool {
         if (!response.ok) {
           const errorText = await response.text();
           output = `python-runner returned HTTP ${response.status}: ${errorText}`;
-          log.error(`[stavrobot] run_python HTTP error: ${response.status}`);
+          log.error(`[solonbot] run_python HTTP error: ${response.status}`);
         } else {
           const json: unknown = await response.json();
           if (
@@ -114,7 +114,7 @@ export function createRunPythonTool(): AgentTool {
                   const buffer = Buffer.from(data, "base64");
                   await fs.writeFile(outPath, buffer);
                   savedPaths.push(outPath);
-                  log.debug(`[stavrobot] run_python saved output file: ${outPath} (${buffer.length} bytes)`);
+                  log.debug(`[solonbot] run_python saved output file: ${outPath} (${buffer.length} bytes)`);
                 }
               }
               if (savedPaths.length > 0) {
@@ -129,12 +129,12 @@ export function createRunPythonTool(): AgentTool {
             }
           } else {
             output = "python-runner returned unexpected response format";
-            log.error("[stavrobot] run_python unexpected response format:", json);
+            log.error("[solonbot] run_python unexpected response format:", json);
           }
         }
       } catch (error) {
         output = `python-runner request failed: ${error instanceof Error ? error.message : String(error)}`;
-        log.error(`[stavrobot] run_python fetch error: ${output}`);
+        log.error(`[solonbot] run_python fetch error: ${output}`);
       }
 
       return toolSuccess(output);

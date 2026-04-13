@@ -22,7 +22,7 @@ function setupMocks(toml: string): void {
     if (path === "prompts/system-prompt.txt") return "You are a bot.";
     if (path === "prompts/compaction-prompt.txt") return "Compaction prompt.";
     if (path === "prompts/compaction-bullet-prompt.txt") return "Bullet prompt. Target: {target} tokens maximum.";
-    if (path === "prompts/agent-prompt.txt") return "You are Stavrobot.";
+    if (path === "prompts/agent-prompt.txt") return "You are Solonbot.";
     throw new Error(`Unexpected readFileSync call: ${String(path)}`);
   });
 }
@@ -113,7 +113,7 @@ telegram = "987654321"
     setupMocks(BASE_TOML);
     const { loadConfig } = await import("./config.js");
     const config = loadConfig();
-    expect(config.baseAgentPrompt).toBe("You are Stavrobot.");
+    expect(config.baseAgentPrompt).toBe("You are Solonbot.");
   });
 });
 
