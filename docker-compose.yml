@@ -25,7 +25,7 @@ services:
   app:
     build: .
     ports:
-      - "10567:3000"
+      - "127.0.0.1:10567:3000"
     environment:
       TZ: ${TZ:-UTC}
       PGHOST: postgres
