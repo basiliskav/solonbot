@@ -405,7 +405,7 @@ function wrapToolWithLogging(tool: AgentTool): AgentTool {
 }
 
 export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent> {
-  const model: Model<Api> = config.baseUrl !== undefined
+  const model: Model<Api> | undefined = config.baseUrl !== undefined
     ? {
         id: config.model,
         name: config.model,
@@ -419,6 +419,9 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
         maxTokens: config.maxTokens!,
       }
     : getModel(config.provider as any, config.model as any);
+  if (model === undefined) {
+    log.warn(`[stavrobot] Model "${config.model}" not found in provider "${config.provider}", using raw config values. Context window defaults to 200k.`);
+  }
   const tools = [createExecuteSqlTool(pool), createManageKnowledgeTool(pool), createManageCronTool(pool), createRunPythonTool(), createManagePagesTool(pool), createManageUploadsTool(), createSearchTool(pool, config.embeddings), createManageFilesTool(), createManageInterlocutorsTool(pool), createManageAgentsTool(pool), createSendAgentMessageTool(pool, () => currentAgentId)];
   tools.push(
     createManagePluginsTool({ coderEnabled: config.coder !== undefined }),
@@ -447,9 +450,11 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
     : config.baseSystemPrompt) + buildPromptSuffix(config.publicHostname);
 
   const MIN_CONTEXT_TOKENS = 10000;
+  const DEFAULT_CONTEXT_WINDOW = 200000;
+  const contextWindow = model?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const rawEffectiveContext = config.contextTokensK !== undefined
-    ? Math.min(config.contextTokensK * 1000, model.contextWindow)
-    : model.contextWindow;
+    ? Math.min(config.contextTokensK * 1000, contextWindow)
+    : contextWindow;
   const effectiveContext = Math.max(rawEffectiveContext, MIN_CONTEXT_TOKENS);
   const tokenBudget = Math.floor(effectiveContext * TRUNCATION_BUDGET_FRACTION);
   const compactionThreshold = Math.floor(effectiveContext * COMPACTION_THRESHOLD_FRACTION);
