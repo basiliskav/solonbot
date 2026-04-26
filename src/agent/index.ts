@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import pg from "pg";
 import { Type, getModel, type Model, type Api, type TextContent, type ImageContent, type AssistantMessage, type ToolCall } from "@mariozechner/pi-ai";
-import { Agent, type AgentTool, type AgentToolResult, type AgentMessage } from "@mariozechner/pi-agent-core";
+import { Agent, type AgentTool, type AgentToolResult, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Config } from "../config.js";
 import type { FileAttachment } from "../uploads.js";
 import { getApiKey } from "../auth.js";
@@ -405,6 +405,11 @@ function wrapToolWithLogging(tool: AgentTool): AgentTool {
 }
 
 export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent> {
+  const DEFAULT_CONTEXT_WINDOW = 200000;
+  const DEFAULT_MAX_TOKENS = 8192;
+  const knownModel = config.baseUrl === undefined
+    ? getModel(config.provider as any, config.model as any)
+    : undefined;
   const model: Model<Api> = config.baseUrl !== undefined
     ? {
         id: config.model,
@@ -418,7 +423,21 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
         contextWindow: config.contextWindow!,
         maxTokens: config.maxTokens!,
       }
-    : getModel(config.provider as any, config.model as any);
+    : knownModel ?? {
+        id: config.model,
+        name: config.model,
+        api: "anthropic-messages" as Api,
+        provider: config.provider,
+        baseUrl: "https://api.anthropic.com",
+        reasoning: false,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: DEFAULT_CONTEXT_WINDOW,
+        maxTokens: DEFAULT_MAX_TOKENS,
+      };
+  if (knownModel === undefined && config.baseUrl === undefined) {
+    log.warn(`[stavrobot] Model "${config.model}" not found in provider "${config.provider}" model registry, using fallback (contextWindow=${DEFAULT_CONTEXT_WINDOW}, maxTokens=${DEFAULT_MAX_TOKENS}).`);
+  }
   const tools = [createExecuteSqlTool(pool), createManageKnowledgeTool(pool), createManageCronTool(pool), createRunPythonTool(), createManagePagesTool(pool), createManageUploadsTool(), createSearchTool(pool, config.embeddings), createManageFilesTool(), createManageInterlocutorsTool(pool), createManageAgentsTool(pool), createSendAgentMessageTool(pool, () => currentAgentId)];
   tools.push(
     createManagePluginsTool({ coderEnabled: config.coder !== undefined }),
@@ -468,7 +487,7 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
     initialState: {
       systemPrompt: effectiveBasePrompt,
       model,
-      thinkingLevel: "off",
+      thinkingLevel: (config.thinkingLevel ?? "low") as ThinkingLevel,
       tools: tools.map(wrapToolWithLogging),
       messages: [],
     },
@@ -731,7 +750,7 @@ export async function handlePrompt(
     log.debug(`[solonbot] [debug] Reloaded ${conversationMessages.length} messages`);
   }
 
-  agent.replaceMessages(conversationMessages);
+  agent.state.messages = conversationMessages;
   log.debug(`[solonbot] Loaded ${conversationMessages.length} messages for agent ${agentId}.`);
 
   const allPlugins = await fetchPluginList();
@@ -750,7 +769,7 @@ export async function handlePrompt(
     systemPrompt = await buildSubagentSystemPrompt(config, subagentRow, allPlugins);
   }
 
-  agent.setSystemPrompt(systemPrompt);
+  agent.state.systemPrompt = systemPrompt;
 
   let saveChain: Promise<unknown> = Promise.resolve();
 
@@ -801,8 +820,7 @@ export async function handlePrompt(
 
     // Filter tools for subagents based on their allowed_tools list. The main
     // agent always gets the full tool set. For subagents, we temporarily swap
-    // the tool list before the prompt and restore it after. The Agent class
-    // provides a public setTools() method for this purpose.
+    // the tool list before the prompt and restore it after.
     const fullTools = agent.state.tools;
     if (!isMainAgent) {
       const allowedTools = subagentRow?.allowedTools ?? [];
@@ -810,7 +828,7 @@ export async function handlePrompt(
       // A wildcard means all tools are allowed (should only be the main agent in practice).
       if (!allowedTools.includes("*")) {
         const filteredTools = filterToolsForSubagent(fullTools, allowedTools, allowedPlugins);
-        agent.setTools(filteredTools);
+        agent.state.tools = filteredTools;
       }
     }
 
@@ -895,7 +913,7 @@ export async function handlePrompt(
     } finally {
       // Restore the full tool list if it was filtered for a subagent.
       if (!isMainAgent) {
-        agent.setTools(fullTools);
+        agent.state.tools = fullTools;
       }
       unsubscribe();
       await saveChain;
@@ -904,8 +922,8 @@ export async function handlePrompt(
     pendingAutoSearchBlocks.delete(agent);
   }
 
-  if (agent.state.error) {
-    const errorJson = JSON.stringify(agent.state.error);
+  if (agent.state.errorMessage) {
+    const errorJson = JSON.stringify(agent.state.errorMessage);
     // Check if the error was caused by an intentional abort by looking at the
     // last assistant message's stopReason. agent.state.error is a plain string
     // (the error message), not the message object, so we must inspect the
@@ -924,8 +942,7 @@ export async function handlePrompt(
       const assistantMessage = message as unknown as AssistantMessage;
       return assistantMessage.stopReason !== "error" && assistantMessage.stopReason !== "aborted";
     });
-    agent.replaceMessages(cleanedMessages);
-    agent.state.error = undefined;
+    agent.state.messages = cleanedMessages;
     if (wasAborted) {
       log.info("[solonbot] Agent aborted.");
       const cancellationMessage = {
@@ -933,7 +950,7 @@ export async function handlePrompt(
         content: [{ type: "text" as const, text: "[The user cancelled the previous request with /stop.]" }],
         timestamp: Date.now(),
       };
-      agent.appendMessage(cancellationMessage);
+      agent.state.messages = [...agent.state.messages, cancellationMessage];
       await saveMessage(pool, cancellationMessage, agentId);
       throw new AbortError();
     }

@@ -5,6 +5,10 @@
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 
+# Thinking level for the main agent. Known values: "off", "low", "medium", "high", "xhigh".
+# Defaults to "low" when omitted.
+# thinkingLevel = "low"
+
 # Password for HTTP Basic Auth. All endpoints except webhooks require this.
 # Change this to something secure. If removed or commented out, all endpoints
 # are open to the world.

@@ -71,6 +71,7 @@ export interface Config {
   baseAgentPrompt: string;
   customPrompt?: string;
   contextTokensK?: number;
+  thinkingLevel?: string;
   coder?: CoderConfig;
   embeddings?: EmbeddingsConfig;
   signal?: SignalConfig;
