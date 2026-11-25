@@ -1,3 +1,5 @@
+> **Solonbot** is a fork of [Stavrobot](https://github.com/skorokithakis/stavrobot), maintained at [basiliskav/solonbot](https://github.com/basiliskav/solonbot). It is periodically synced with upstream. The rest of this README is upstream's documentation and refers to the project as Stavrobot.
+
 # Stavrobot
 
 ![](misc/stavrobot.jpg)

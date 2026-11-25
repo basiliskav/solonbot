@@ -4,6 +4,14 @@ This file contains instructions for AI coding agents operating in this repositor
 
 The project's GitHub URL is https://github.com/skorokithakis/stavrobot/.
 
+## Fork
+
+- This repository is Solonbot, a fork. Remote `origin` is https://github.com/basiliskav/solonbot (push here). Remote `upstream` is https://github.com/skorokithakis/stavrobot (never push or open PRs there). The upstream URL above refers to the original project.
+- Syncing: `git fetch upstream`, then merge `upstream/master` into `master` (do not rebase; history is already published). Conflicts are normally rename-only: take upstream's side, then re-apply the rename to the whole tree, including new upstream code. After syncing, `git diff upstream/master` should show only rename and fork-specific changes.
+- Renamed to solonbot: log tags (`[solonbot]`, `[solonbot-coder]`, `[solonbot-plugin-runner]`); Postgres default user/password/db in `docker-compose.yml`, `docker-compose.harbormaster.yml`, `env.example` and `src/config.ts`; `pg-backup.sh` filename prefix; "You are Solonbot" in prompts; Basic auth realm; user-visible UI product name; MCP client name; `upload.py` and `signal-bridge/bridge.py` docstrings.
+- Kept as stavrobot: `STAVROBOT_TEMP_DIR` (plugin API contract), `STAVROBOT_LOG_LEVEL`, `/tmp/stavrobot-temp`, the `stavrobot-run-` prefix, package names, `stavrobot.stavros.io` and `github.com/stavrobot` URLs (real external resources), docs (README body, `ARCHITECTURE.md`, `coder/PLUGIN.md`, `misc/SKILL-AUTHORING.md`), and `design/` mockups.
+- Other fork-specific change: the app port is bound to localhost in `docker-compose.yml` (`127.0.0.1:10567:3000`); keep it.
+
 ## Architecture reference
 
 `ARCHITECTURE.md` is the authoritative reference for how the system works: containers,
