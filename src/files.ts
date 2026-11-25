@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Type } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { Type } from "@earendil-works/pi-ai";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { TEMP_ATTACHMENTS_DIR } from "./temp-dir.js";
 import { log } from "./log.js";
 import { toolError, toolSuccess } from "./tool-result.js";
@@ -24,8 +24,8 @@ Actions:
 
 Constraints:
 - Flat filenames must not contain "/" or "\\" (no subdirectories). Absolute paths must be under ${TEMP_ATTACHMENTS_DIR}.
-- Files are ephemeral. They live in ${FILES_DIR} and may be deleted automatically when passed as attachmentPath to send_signal_message or send_telegram_message.
-- To send a file as an attachment, pass its absolute path (returned by write or list) as the attachmentPath parameter to send_signal_message or send_telegram_message.
+- Files are ephemeral. They live in ${FILES_DIR} and may be deleted automatically when passed as attachmentPath to a send tool.
+- To send a file as an attachment, pass its absolute path (returned by write or list) as the attachmentPath parameter to send_signal_message, send_telegram_message, send_whatsapp_message, or send_email.
 - No size limits are enforced.`;
 
 function validateFilename(filename: string): string | null {

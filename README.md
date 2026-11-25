@@ -12,6 +12,7 @@ It has all the nice features of an AI assistant, but focuses on sandboxing, isol
 - **Light.** Doesn't run one container per component. Plugins all run in a single container, separated by Unix permissions.
 - **Use any model you want.** Local, OpenRouter, Anthropic/OpenAI. Whatever [Pi](https://pi.dev) supports, the bot can use.
 - **Signal/Telegram/WhatsApp/Email integration.** Two-way messaging, with formatting, attachments, etc.
+- **Pebble Index integration.** Ring recordings can be queued directly for the agent.
 - **Three-tier knowledge.** Remembers everything without blowing out its context.  Intelligently and transparently retrieves data from its memory.
 - **Low token usage.** Various optimizations have been made to be light on token usage. It even uses [TOON](https://github.com/toon-format/toon) internally.
 - **Plugins.** Install plugins and extend Stavrobot's capabilities by just giving it a git repo URL. Plugins are isolated from each other — each runs as a dedicated system user with no access to other plugins' files or configuration.
@@ -43,9 +44,20 @@ That's it. Message your bot on Telegram and it will respond. See the detailed se
 3. At minimum, set `authFile` (or `apiKey`) and `publicHostname`. Everything else is optional.
 4. Copy `env.example` to `.env` and set your timezone (`TZ`). Postgres credentials and other environment settings can also be overridden there. **Always set `POSTGRES_PASSWORD` to something secure** — the default is a weak placeholder and should not be used in production.
 
+### Config editor
+
+After the app starts, open `/settings/config` to edit `config.toml` in the browser. The
+page is protected by HTTP Basic Auth and displays the raw configuration, including any
+secrets it contains. A valid save creates a single `<CONFIG_PATH>.bak` backup, saves the
+new content, and restarts the app; this interrupts any in-progress agent turn.
+
+`plugin-runner`, `coder`, `signal-bridge`, and `python-runner` read `config.toml` only
+when they start. Changes that affect them, such as the password, require manually
+restarting those containers.
+
 ### Custom and OpenAI-compatible endpoints
 
-Stavrobot can be pointed at any OpenAI-compatible endpoint (Ollama, LiteLLM, vLLM, etc.) or a custom Anthropic-compatible proxy by setting `baseUrl` in `config.toml`. See `config.example.toml` for the required fields and example configurations.
+Stavrobot can be pointed at any OpenAI-compatible endpoint (Ollama, LiteLLM, vLLM, etc.) or a custom Anthropic-compatible proxy by setting `baseUrl` in `config.toml`. See `config.example.toml` for the required fields and example configurations. Set `reasoning = true` only for models that support thinking, since it is what makes `thinkingLevel` apply on a custom endpoint.
 
 ### Authentication
 
@@ -53,18 +65,20 @@ The app supports two authentication modes: API key or OAuth.
 
 - **API key:** Set `apiKey` in `config.toml`. No login or logout needed.
 - **OAuth:** Set `authFile` in `config.toml` (a path where credentials will be stored). The login page works with any OAuth provider supported by Pi.
-  - **Login:** Visit `<your-hostname>/login` in a browser. Follow the prompts on the page, and credentials are saved to the auth file. If auth expires while the bot is running, it sends a message with the login URL to you via your messaging platform.
+  - **Login:** Visit `<your-hostname>/login` in a browser. Follow the prompts on the page, and credentials are saved to the auth file. Stavrobot picks the provider's headless login method, so you never get redirected to an unreachable `localhost` callback. With Anthropic, after you select Authorize, Anthropic shows a code, which you copy and paste into the Stavrobot login page. Providers with a device-code flow show the code on the Stavrobot page instead, and you type it on the provider's site. If auth expires while the bot is running, it sends a message with the login URL to you via your messaging platform.
   - **Logout:** Delete the file at the `authFile` path. The bot will detect missing credentials on the next message and prompt you to log in again.
 
 ### Claude Code setup
 
-The `coder` container is optional (needed only for the self-programming feature). It uses Claude Code with subscription auth (OAuth), separate from the main app's API key.
+The `coder` container is optional (needed only for the self-programming feature). By default it uses Claude Code with subscription auth (OAuth), separate from the main app's API key. To use an Anthropic-compatible API endpoint instead, set both `[coder].apiKey` and `[coder].baseUrl` in `config.toml`; Claude Code then uses them as `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`. The top-level `apiKey`/`baseUrl` only configure the main app's model and never affect the coder. Setting only one of the two `[coder]` keys is a startup error.
+
+The interactive OAuth login below expires after a while, and every coding task then fails until you log in again. To avoid that, run `claude setup-token` (in the coder container or on any machine with Claude Code) and set the printed token as `[coder].oauthToken`. Claude Code then uses it as `CLAUDE_CODE_OAUTH_TOKEN`, and you can skip steps 3 and 4. `oauthToken` can't be combined with `[coder].apiKey`/`[coder].baseUrl`.
 
 Docker Compose profiles are comma-separated, so you can combine them (e.g. `COMPOSE_PROFILES=signal,coder`).
 
 1. Set `COMPOSE_PROFILES` in your `.env` file to include `coder` (e.g. `COMPOSE_PROFILES=coder`, or `COMPOSE_PROFILES=signal,coder` if you are also using Signal).
 2. Start the containers: `docker compose --profile coder up --build`
-3. Log in: `docker compose exec -u coder coder claude` (it will prompt you to log in if you haven't).
+3. Log in (skip this and the next step if you set `[coder].oauthToken` or `[coder].apiKey`/`[coder].baseUrl`): `docker compose exec -u coder coder claude` (it will prompt you to log in if you haven't).
 4. Follow the browser-based OAuth flow.
 5. Set `[coder].model` in your config to a Claude Code model alias (`sonnet`, `opus`, or `haiku`).
 
@@ -93,7 +107,7 @@ Signal requires a **separate phone number** — not your personal one. A prepaid
 3. Set `[telegram].botToken` in your config.
 3. Set the chat ID (*not your mobile phone number*) in `[owner].telegram` in your config.
 4. After first startup, add allowed chat IDs via the `/settings` web UI.
-5. The webhook is registered automatically when the app starts.
+5. Stavrobot long-polls Telegram for updates automatically when the app starts.
 
 ### WhatsApp setup
 
@@ -120,25 +134,222 @@ Email uses a Cloudflare Email Worker for inbound delivery and SMTP for outbound.
 3. In Cloudflare Email Routing, add a rule to forward inbound mail to the worker.
 4. Add allowed sender addresses via the `/settings` web UI.
 
+### Pebble Index setup
+
+Configure Pebble Index to send ring webhooks to `POST /pebble-index/webhook` with HTTP
+Basic authentication using Stavrobot's configured password. The multipart request must
+include `recordedAt` (epoch milliseconds) and `client`, and can include a `transcription`
+and an `audio/mp4` `audio` file. Audio recordings are queued for the agent as `.m4a`
+attachments.
+
 ### Running
 
 ```bash
 docker compose up --build
 ```
 
-The API is available at `http://localhost:10567/chat`.
+The API is available at `http://localhost:10567/chat`. See [HTTP API](#http-api) for the
+full list of endpoints.
 
-**Note:** Docker Compose only exposes the app on `localhost:10567`. To make it accessible externally (required for Telegram/Signal webhooks and the `publicHostname` setting), set up a reverse proxy (e.g. Nginx, Caddy) pointing to `localhost:10567`. You can also expose the port directly, but this is not recommended as traffic will be unencrypted.
+**Note:** Docker Compose only exposes the app on `localhost:10567`. To make it accessible externally, set up a reverse proxy (e.g. Nginx, Caddy) pointing to `localhost:10567`. This is required for Signal webhooks and for the `publicHostname` setting, which is used for links the bot sends (login, pages). Telegram needs no publicly reachable endpoint or webhook because the app long-polls it. You can also expose the port directly, but this is not recommended as traffic will be unencrypted.
 
 ### Without Docker
 
-Requires Node.js >= 20 and a running PostgreSQL instance.
+Requires Node.js >= 26 and a running PostgreSQL instance.
 
 ```bash
 npm install && npm run build && npm start
 ```
 
 Note: Python execution and Signal integration only work inside the Docker containers.
+
+## HTTP API
+
+Every endpoint requires HTTP Basic authentication with the `password` from `config.toml`
+(the username is ignored), except the ones marked **public** below. Error responses are
+JSON objects of the form `{"error": "..."}`.
+
+### `POST /chat`
+
+Sends a message to the agent and returns its reply. This is the main entry point: the web
+UI, the Signal bridge, the plugin runner, the coder, and the cron scheduler all use it.
+
+Messages are processed one at a time through a single queue. By default, the request
+blocks until the agent has finished its turn, which can take a while if the agent uses
+tools. Set `"async": true` to acknowledge after the message is submitted through
+`enqueueMessage` without waiting for the turn to finish.
+
+Request body is a JSON object (maximum 25 MB) with these fields. At least one of
+`message`, `files`, or `attachments` is required.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `message` | string | The text to send to the agent. |
+| `async` | boolean | Optional. Set to the literal `true` to receive `202` with `{"accepted":true}` after submission instead of waiting for the reply. Omit it or set it to `false` to wait normally. Other values are rejected. |
+| `source` | string | The channel the message came from. Controls routing (see below) and is shown to the agent alongside the message. Omit it for direct calls; the agent then sees `cli`. |
+| `sender` | string | Who sent the message within that channel: an E.164 phone number for `signal` and `whatsapp`, a chat ID for `telegram`, an email address for `email`. For a group chat this is the group ID. Shown to the agent. |
+| `participant` | object | Optional. `{ "id": "...", "name": "..." }` for the individual who sent a group message. Added to the agent's view as a `Participant` line and marked `[owner]` when `id` matches one of your identities. Ignored if malformed. |
+| `senderLabel` | string | Optional. A human-readable platform label for the sender (e.g. a group name). Used to annotate dropped senders in the "Recently rejected" list on `/settings`. |
+| `files` | array | Files sent inline. Each entry is `{ "data": "<base64>", "filename": "...", "mimeType": "..." }`. Files larger than 10 MB after decoding are skipped with a warning in the logs. Use this from outside the app container. |
+| `attachments` | array | Files already present in the app container's temporary upload directory. Each entry is `{ "storedPath", "originalFilename", "mimeType", "size" }`. Paths outside the upload directory are rejected. This is for internal callers only; external callers should use `files`. |
+
+Routing by `source`:
+
+- Absent, or one of `cli`, `cron`, `coder`, `upload`, or `plugin:<name>`: goes to the
+  main agent as a message from you.
+- `signal`, `telegram`, `whatsapp`, `email`: `sender` is required. If it matches one of
+  your identities in `[owner]`, the message goes to the main agent. Otherwise the sender
+  must be in the allowlist and be assigned to an agent as an interlocutor; if not, the
+  message is dropped.
+- Anything else: goes to the main agent with the source name shown to the agent. No
+  allowlist check.
+
+Two special cases:
+
+- If the message is exactly `/stop` and it is yours, the running agent turn is aborted.
+  Nothing is queued. A synchronous request receives `Aborted.`. A `/stop` is yours when
+  the call has no `source`, when `sender` matches one of your identities in `[owner]`, or
+  when the `participant` of a group message does. A `/stop` from anyone else, or with any
+  other `source`, is treated as ordinary text.
+- If the agent is busy with one of your messages and another message from you arrives, the
+  new message is injected into the running turn instead of being queued. A synchronous
+  steering request receives `Message received, steering the current request.` The agent's
+  reply becomes part of the running turn and is returned only when the HTTP request that
+  started that turn is synchronous.
+
+Response: with `async` omitted or set to `false`, `200` with
+`{"response": "<agent reply>"}`. With `async: true`, the response is `202` with
+`{"accepted":true}`; it follows the same enqueue path, preserving routing, the
+owner-only `/stop` command, and owner steering behavior, but no agent reply is returned
+to that request. For synchronous calls, a dropped message (unknown sender on a gated
+channel) also returns `200`, with an empty `response` string.
+
+The acknowledgement confirms submission to the in-memory queue, not eventual completion.
+Queued work is lost if the app restarts before processing it, and any later enqueue
+rejection is logged because the HTTP response has already been sent.
+
+Errors: `400` for invalid JSON, a body with none of the required fields, or a present
+non-boolean `async` field; `401` for a missing or wrong password, `413` if the body
+exceeds 25 MB, `500` for anything else.
+
+Examples:
+
+```bash
+curl -u :yourpassword -H 'Content-Type: application/json' \
+  -d '{"message": "What is on my calendar today?"}' \
+  http://localhost:10567/chat
+
+curl -u :yourpassword -H 'Content-Type: application/json' \
+  -d '{"message": "Process this in the background.", "async": true}' \
+  http://localhost:10567/chat
+
+curl -u :yourpassword -H 'Content-Type: application/json' \
+  -d "{\"message\": \"Summarize this.\", \"files\": [{\"data\": \"$(base64 -w0 notes.txt)\", \"filename\": \"notes.txt\", \"mimeType\": \"text/plain\"}]}" \
+  http://localhost:10567/chat
+```
+
+### `POST /api/upload`
+
+Uploads a single file and hands it to the agent as a message with no text and
+`source: upload`. Returns immediately; the agent processes the file in the background.
+
+Body is `multipart/form-data` with a `file` part (maximum 10 MB) and an optional
+`filename` text field that overrides the original filename.
+
+Response: `200` with `{"message": "File uploaded successfully", "filename": "<stored name>"}`.
+Errors: `400` if the `file` part is missing, `413` if the file exceeds 10 MB.
+
+### Webhooks
+
+These accept inbound messages from external services. Each has its own authentication.
+
+- `POST /email/webhook` (**public**). Called by the Cloudflare Email Worker. Authenticated
+  by `Authorization: Bearer <webhookSecret>` from the `[email]` config section. Body is
+  JSON `{ "from", "to", "raw" }` where `raw` is the full RFC 822 message. Responds
+  `200 {"ok": true}` immediately and processes the email in the background. Returns `404`
+  if email is not configured.
+- `POST /pebble-index/webhook`. Basic auth. Body is `multipart/form-data` with
+  `recordedAt` (epoch milliseconds), `client`, and at least one of a `transcription` text
+  field or an `audio` file part (`audio/mp4`, maximum 25 MB). Responds `200 {"ok": true}`
+  immediately and queues the recording for the agent in the background.
+
+### Pages
+
+Pages are files the agent publishes through its `manage_pages` tool. Each page is either
+public or private.
+
+- `GET /pages/<path>` (**public route, per-page auth**). Serves the latest version of the
+  page with its stored MIME type. Private pages require Basic auth. Deleted or unknown
+  pages return `404`.
+- `GET /api/pages/<path>/queries/<name>` (**public route, per-page auth**). Runs a named
+  read-only SQL query stored with the page and returns the rows as a JSON array. Query
+  placeholders of the form `$param:foo` are filled from the `?foo=` query string; a
+  missing parameter returns `400`. Auth follows the page's public flag.
+- `POST /api/pages/<path>/mutations/<name>` (**always requires auth**). Runs a named SQL
+  mutation stored with the page, with any verb and a single statement per name, and
+  returns `{ "rowCount", "rows" }`. The body must be a JSON object whose top-level keys
+  supply the `$param:foo` placeholders; a missing key returns `400`, and a non-JSON
+  content type returns `415` (CSRF protection). Unlike queries, mutations are not
+  public even when the page is, and are not run in a read-only transaction.
+
+### Database explorer
+
+- `GET /api/explorer/tables`: JSON list of tables.
+- `GET /api/explorer/tables/<table>`: JSON schema of one table, one entry per column with
+  `name`, `type`, `nullable`, and `primaryKey`. `404` if it does not exist.
+- `GET /api/explorer/tables/<table>/rows`: JSON rows. Query parameters: `limit` (1 to
+  100, default 50), `offset` (default 0), `orderBy` (column name), `orderDirection`
+  (`asc` or `desc`, default `asc`).
+
+### Plugin management
+
+These proxy to the plugin runner. Bodies are JSON.
+
+- `GET /api/settings/plugins/list`: all installed plugins.
+- `GET /api/settings/plugins/<name>/detail`: one plugin's manifest.
+- `GET /api/settings/plugins/<name>/config`: the plugin's configuration **without its
+  values**. Returns `{ "schema", "set" }`, where `schema` maps each key to its description
+  and whether it is required, and `set` maps each key to whether a value is stored. The
+  values themselves are never sent to the browser.
+- `POST /api/settings/plugins/install`: body `{ "url": "<git url>" }`.
+- `POST /api/settings/plugins/add-mcp`: body `{ "name", "description", "server" }`; adds an
+  MCP server as a plugin. `server` is the spec object described below.
+- `POST /api/settings/plugins/update`: body `{ "name": "<plugin>" }`. Skips the init
+  script and the instructions relay when a git-installed plugin is already at its latest
+  commit; otherwise it applies the update and reruns the init script.
+- `POST /api/settings/plugins/remove`: body `{ "name": "<plugin>" }`.
+- `POST /api/settings/plugins/configure`: body `{ "name": "<plugin>", "config": { ... } }`.
+  Replaces the plugin's configuration.
+
+### Allowlist
+
+- `GET /api/settings/allowlist`: returns `{ "allowlist", "ownerIdentities" }`. The
+  allowlist has `signal`, `whatsapp`, `email` (arrays of strings), `telegram` (array of
+  integers), and `notes` (object mapping an entry to a free-text label).
+- `PUT /api/settings/allowlist`: body is the same `allowlist` shape. All four arrays are
+  required; `notes` is optional. Phone numbers must be E.164, Telegram entries must be
+  integers, and `"*"` in any list allows everyone on that channel. Your own identities from
+  `[owner]` are always added back if omitted. Returns the saved allowlist.
+
+### Login and Signal captcha
+
+- `GET /login/events`: server-sent events stream that drives the OAuth login flow started
+  from the `/login` page. Event types: `auth`, `device_code`, `prompt`, `progress`,
+  `success`, `error_event`.
+- `POST /login/respond`: body `{ "value": "<code>" }`, answers the pending `prompt` from
+  the login flow. `409` if no prompt is pending.
+- `POST /signal/captcha`: body `{ "captcha": "signalcaptcha://..." }`, forwarded to the
+  Signal bridge when Signal registration requires a captcha.
+
+### Web UI pages
+
+`GET /` (chat), `/login`, `/explorer`, `/settings` (the Settings screen), `/settings/config`,
+`/settings/plugins`, `/settings/allowlist`, and `/signal/captcha` serve the HTML pages that
+use the endpoints above. `/plugins` redirects to `/settings/plugins`.
+
+All pages share a shell (`src/shell.ts`) and a single stylesheet, served at
+`GET /assets/sb.css`, with self-hosted IBM Plex fonts under `GET /assets/fonts/`. Both
+asset routes require authentication. The UI follows the OS light/dark preference.
 
 ## Knowledge system
 
@@ -201,6 +412,37 @@ then tell the bot "find a time for dinner with Alex next week". The bot creates 
 record for Alex, spins up a subagent, messages Alex on Signal, goes back and forth to
 find a date, and reports the result to you.
 
+## Group chats
+
+The bot can take part in groups on Telegram and Signal. A group is treated as a single
+interlocutor whose identity is the group's channel ID, and every message is labelled with
+a `Participant` line so the agent knows which member sent it.
+
+To set up a group:
+
+1. Send a message in the group so the bot receives it and records the sender.
+2. Open `/settings` and look at the "Recently rejected" section at the bottom of the
+   allowlist page. It shows the sender (the group ID) with an Add button.
+3. Add the group ID to the allowlist, then ask the bot to create an interlocutor and a
+   subagent for the group, exactly as you would for an individual.
+
+The group ID is Telegram's negative chat ID or Signal's opaque group ID.
+
+A group interlocutor can be marked mentions only, in which case the bot only acts on
+messages that mention it or reply to one of its messages; everything else is dropped
+silently. This only works on Signal and Telegram, and it applies to your own messages in
+the group too, except `/stop`, which always works when you send it. It is a cost-saving
+feature rather than a security boundary.
+
+Telegram groups need extra setup: a bot only receives every message if its privacy mode
+is disabled (talk to @BotFather and turn off Group Privacy) or if the bot is an
+administrator of the group. Otherwise it only sees commands and replies addressed to it.
+
+On Signal, a person may be identified by a phone number or a UUID. When phone number
+privacy is enabled, Signal reports senders by UUID instead of phone number, so add the
+UUID to the Signal allowlist (and, for your own account, use the UUID for `[owner].signal`
+in `config.toml`). One interlocutor can hold both a phone number and a UUID.
+
 ## Skills
 
 Skills are plain-text instruction files that teach the bot new capabilities — things like
@@ -227,6 +469,30 @@ against the `pages` branch.
 See [PLUGIN.md](coder/PLUGIN.md) for everything you need to know to create a Stavrobot
 plugin. The same document works as a reference for both humans and LLMs.
 
+## MCP servers
+
+You can add a [Model Context Protocol](https://modelcontextprotocol.io) server as a
+plugin, either by asking the bot (it uses `manage_plugins` with the `add_mcp` action) or
+from the Plugins page in the settings UI. The server's tools then work like any other
+plugin's tools.
+
+The server spec is JSON in one of two shapes:
+
+- Local server: `{"command": "npx", "args": ["-y", "@example/mcp-server"], "env": {"API_KEY": "..."}}`
+- Remote server: `{"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ..."}}`
+
+`env` and `headers` often hold secrets. They are stored in the plugin's `config.json` and
+are never shown to the agent again. If the first connection fails, the plugin is still
+created: fix the spec, then update it from the Plugins page.
+
+MCP plugins are not editable. The bot can update or remove them, but not change their
+code.
+
+Some servers need an interactive browser login the first time. There is no browser inside
+the container, so do that login on another machine with the same server, then copy the
+token file it writes into `data/plugins/<name>/`. For local servers that directory is the
+server's `HOME`, so it will find credentials stored there.
+
 ## Recommended plugins
 
 Plugins are fairly necessary to enable core functionality for the bot, such as the
@@ -244,7 +510,7 @@ https://github.com/orgs/stavrobot/repositories
 
 ## Architecture
 
-Three core Docker containers: `app` (TypeScript server, exposes `POST /chat`, handles Telegram webhooks at `POST /telegram/webhook`, handles inbound email webhooks at `POST /email/webhook`, and runs WhatsApp in-process via Baileys), `postgres` (PostgreSQL 17 for persistent state), and `plugin-runner` (Node.js server — lists, inspects, and executes plugins, both locally created and git-installed). An optional `coder` container (Claude Code headless agent for creating and modifying editable plugins) is enabled via the `coder` Docker Compose profile. The main agent can create subagents, each with their own conversation history, system prompt, and tool whitelist. Interlocutors are contact records assigned to agents for inbound message routing.
+Three core Docker containers: `app` (TypeScript server, exposes `POST /chat`, polls Telegram for inbound messages via long polling, handles inbound email webhooks at `POST /email/webhook`, and runs WhatsApp in-process via Baileys), `postgres` (PostgreSQL 17 for persistent state), and `plugin-runner` (Node.js server — lists, inspects, and executes plugins, both locally created and git-installed). An optional `coder` container (Claude Code headless agent for creating and modifying editable plugins) is enabled via the `coder` Docker Compose profile. The main agent can create subagents, each with their own conversation history, system prompt, and tool whitelist. Interlocutors are contact records assigned to agents for inbound message routing.
 
 ## License
 

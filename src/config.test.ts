@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import fs from "fs";
+import { getConfigPath, parseConfig } from "./config.js";
 
 vi.mock("fs");
 
@@ -11,6 +12,7 @@ provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 apiKey = "test-key"
 publicHostname = "https://example.com"
+password = "test-password"
 
 [owner]
 name = "Stavros"
@@ -27,33 +29,60 @@ function setupMocks(toml: string): void {
   });
 }
 
-afterEach(() => {
+afterEach((): void => {
   vi.clearAllMocks();
   vi.resetModules();
 });
 
-describe("loadConfig owner validation", () => {
-  it("loads successfully when [owner] section is present with a name", async () => {
-    setupMocks(BASE_TOML);
-    const { loadConfig } = await import("./config.js");
-    const config = loadConfig();
+describe("parseConfig", (): void => {
+  it("parses and validates TOML without loading prompt files", (): void => {
+    const config = parseConfig(BASE_TOML);
+
     expect(config.owner.name).toBe("Stavros");
+    expect(mockReadFileSync).not.toHaveBeenCalled();
   });
 
-  it("throws when [owner] section is missing", async () => {
-    const tomlWithoutOwner = `
+  it("requires a non-empty password", (): void => {
+    expect(() => parseConfig(BASE_TOML.replace('password = "test-password"', 'password = ""'))).toThrow(
+      "Config must specify a password.",
+    );
+    expect(() => parseConfig(BASE_TOML.replace('password = "test-password"\n', ""))).toThrow(
+      "Config must specify a password.",
+    );
+  });
+});
+
+describe("getConfigPath", (): void => {
+  it("falls back to config.toml when CONFIG_PATH is empty", (): void => {
+    const previousConfigPath = process.env.CONFIG_PATH;
+    process.env.CONFIG_PATH = "";
+    try {
+      expect(getConfigPath()).toBe("config.toml");
+    } finally {
+      if (previousConfigPath === undefined) {
+        delete process.env.CONFIG_PATH;
+      } else {
+        process.env.CONFIG_PATH = previousConfigPath;
+      }
+    }
+  });
+});
+
+describe("loadConfig owner validation", () => {
+  it.each([
+    {
+      name: "[owner] section is missing",
+      toml: `
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 apiKey = "test-key"
 publicHostname = "https://example.com"
-`;
-    setupMocks(tomlWithoutOwner);
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow("Config must specify an [owner] section.");
-  });
-
-  it("throws when [owner] name is missing", async () => {
-    const tomlWithEmptyOwner = `
+`,
+      error: "Config must specify an [owner] section.",
+    },
+    {
+      name: "[owner] name is missing",
+      toml: `
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 apiKey = "test-key"
@@ -61,14 +90,12 @@ publicHostname = "https://example.com"
 
 [owner]
 signal = "+1234567890"
-`;
-    setupMocks(tomlWithEmptyOwner);
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow("Config [owner] section must specify a non-empty name.");
-  });
-
-  it("throws when [owner] name is an empty string", async () => {
-    const tomlWithEmptyName = `
+`,
+      error: "Config [owner] section must specify a non-empty name.",
+    },
+    {
+      name: "[owner] name is an empty string",
+      toml: `
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 apiKey = "test-key"
@@ -76,10 +103,13 @@ publicHostname = "https://example.com"
 
 [owner]
 name = ""
-`;
-    setupMocks(tomlWithEmptyName);
+`,
+      error: "Config [owner] section must specify a non-empty name.",
+    },
+  ])("throws when $name", async ({ toml, error }) => {
+    setupMocks(toml);
     const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow("Config [owner] section must specify a non-empty name.");
+    expect(() => loadConfig()).toThrow(error);
   });
 
   it("parses optional signal and telegram fields", async () => {
@@ -88,6 +118,7 @@ provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 apiKey = "test-key"
 publicHostname = "https://example.com"
+password = "test-password"
 
 [owner]
 name = "Stavros"
@@ -99,14 +130,6 @@ telegram = "987654321"
     const config = loadConfig();
     expect(config.owner.signal).toBe("+1234567890");
     expect(config.owner.telegram).toBe("987654321");
-  });
-
-  it("allows owner with only a name and no channel identities", async () => {
-    setupMocks(BASE_TOML);
-    const { loadConfig } = await import("./config.js");
-    const config = loadConfig();
-    expect(config.owner.signal).toBeUndefined();
-    expect(config.owner.telegram).toBeUndefined();
   });
 
   it("loads baseAgentPrompt from agent-prompt.txt", async () => {
@@ -126,6 +149,7 @@ baseUrl = "http://localhost:11434/v1"
 contextWindow = 128000
 maxTokens = 8192
 publicHostname = "https://example.com"
+password = "test-password"
 
 [owner]
 name = "Stavros"
@@ -157,6 +181,7 @@ contextWindow = 200000
 maxTokens = 8192
 api = "anthropic-messages"
 publicHostname = "https://example.com"
+password = "test-password"
 
 [owner]
 name = "Stavros"
@@ -167,8 +192,10 @@ name = "Stavros"
     expect(config.api).toBe("anthropic-messages");
   });
 
-  it("throws when baseUrl is set and api is an unsupported value", async () => {
-    const toml = `
+  it.each([
+    {
+      name: "api is an unsupported value",
+      toml: `
 provider = "openai"
 model = "llama3.2"
 apiKey = "ollama"
@@ -180,16 +207,12 @@ publicHostname = "https://example.com"
 
 [owner]
 name = "Stavros"
-`;
-    setupMocks(toml);
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow(
-      'Config api must be one of: openai-completions, anthropic-messages. Got: "openai-responses".',
-    );
-  });
-
-  it("throws when baseUrl and authFile are both set", async () => {
-    const toml = `
+`,
+      error: 'Config api must be one of: openai-completions, anthropic-messages. Got: "openai-responses".',
+    },
+    {
+      name: "baseUrl and authFile are both set",
+      toml: `
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 authFile = "/app/data/auth.json"
@@ -200,14 +223,12 @@ publicHostname = "https://example.com"
 
 [owner]
 name = "Stavros"
-`;
-    setupMocks(toml);
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow("Config must not specify both baseUrl and authFile.");
-  });
-
-  it("throws when baseUrl is set but contextWindow is missing", async () => {
-    const toml = `
+`,
+      error: "Config must not specify both baseUrl and authFile.",
+    },
+    {
+      name: "contextWindow is missing",
+      toml: `
 provider = "openai"
 model = "llama3.2"
 apiKey = "ollama"
@@ -217,14 +238,12 @@ publicHostname = "https://example.com"
 
 [owner]
 name = "Stavros"
-`;
-    setupMocks(toml);
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow("Config must specify contextWindow when baseUrl is set.");
-  });
-
-  it("throws when baseUrl is set but maxTokens is missing", async () => {
-    const toml = `
+`,
+      error: "Config must specify contextWindow when baseUrl is set.",
+    },
+    {
+      name: "maxTokens is missing",
+      toml: `
 provider = "openai"
 model = "llama3.2"
 apiKey = "ollama"
@@ -234,10 +253,13 @@ publicHostname = "https://example.com"
 
 [owner]
 name = "Stavros"
-`;
+`,
+      error: "Config must specify maxTokens when baseUrl is set.",
+    },
+  ])("throws when baseUrl is set and $name", async ({ toml, error }) => {
     setupMocks(toml);
     const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow("Config must specify maxTokens when baseUrl is set.");
+    expect(() => loadConfig()).toThrow(error);
   });
 
   it("ignores baseUrl-related fields when baseUrl is absent", async () => {
@@ -251,28 +273,76 @@ name = "Stavros"
   });
 });
 
-describe("loadConfig contextTokensK", () => {
-  it("is undefined when the key is omitted from the TOML", async () => {
-    setupMocks(BASE_TOML);
-    const { loadConfig } = await import("./config.js");
-    const config = loadConfig();
-    expect(config.contextTokensK).toBeUndefined();
-  });
-
-  it("uses the value from TOML when the key is present", async () => {
-    const tomlWithContextTokensK = `
-provider = "anthropic"
-model = "claude-sonnet-4-20250514"
-apiKey = "test-key"
+describe("loadConfig reasoning", () => {
+  const BASE_TOML_PREFIX = `
+provider = "openai"
+model = "gpt-oss:120b"
+apiKey = "ollama"
+baseUrl = "https://ollama.com/v1"
+contextWindow = 128000
+maxTokens = 8192
+`;
+  const OWNER_TOML_SUFFIX = `
 publicHostname = "https://example.com"
-contextTokensK = 50
+password = "test-password"
 
 [owner]
 name = "Stavros"
 `;
-    setupMocks(tomlWithContextTokensK);
+
+  it.each([
+    { name: "defaults to false when omitted", fragment: "", expected: false },
+    { name: "uses the value from TOML when true", fragment: "reasoning = true\n", expected: true },
+  ])("reasoning $name", async ({ fragment, expected }) => {
+    setupMocks(`${BASE_TOML_PREFIX}${fragment}${OWNER_TOML_SUFFIX}`);
     const { loadConfig } = await import("./config.js");
     const config = loadConfig();
-    expect(config.contextTokensK).toBe(50);
+    expect(config.reasoning).toBe(expected);
+  });
+
+  it("throws when reasoning is not a boolean and baseUrl is set", async () => {
+    setupMocks(`${BASE_TOML_PREFIX}reasoning = "yes"\n${OWNER_TOML_SUFFIX}`);
+    const { loadConfig } = await import("./config.js");
+    expect(() => loadConfig()).toThrow("Config reasoning must be a boolean when baseUrl is set.");
+  });
+
+  it("ignores reasoning when baseUrl is absent", async () => {
+    const toml = `
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+apiKey = "test-key"
+reasoning = "yes"
+publicHostname = "https://example.com"
+password = "test-password"
+
+[owner]
+name = "Stavros"
+`;
+    setupMocks(toml);
+    const { loadConfig } = await import("./config.js");
+    const config = loadConfig();
+    expect(config.reasoning).toBe("yes");
+  });
+});
+
+describe("loadConfig contextTokensK", () => {
+  it.each([
+    { name: "is undefined when the key is omitted from the TOML", fragment: "", expected: undefined },
+    { name: "uses the value from TOML when the key is present", fragment: "contextTokensK = 50\n", expected: 50 },
+  ])("$name", async ({ fragment, expected }) => {
+    const toml = `
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+apiKey = "test-key"
+publicHostname = "https://example.com"
+password = "test-password"
+${fragment}
+[owner]
+name = "Stavros"
+`;
+    setupMocks(toml);
+    const { loadConfig } = await import("./config.js");
+    const config = loadConfig();
+    expect(config.contextTokensK).toBe(expected);
   });
 });

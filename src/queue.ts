@@ -1,16 +1,19 @@
 import type pg from "pg";
-import type { Agent, AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Config } from "./config.js";
 import { handlePrompt, formatUserMessage } from "./agent/index.js";
-import { AbortError } from "./errors.js";
+import { AbortError, TurnProgressPersistedError } from "./errors.js";
 import { AuthError, invalidateCredentials } from "./auth.js";
-import { isInAllowlist } from "./allowlist.js";
+import { isInAllowlist, recordRejectedSender } from "./allowlist.js";
 import { sendSignalMessage } from "./signal.js";
 import { sendTelegramMessage } from "./telegram-api.js";
 import { sendWhatsappTextMessage } from "./whatsapp-api.js";
 import type { FileAttachment } from "./uploads.js";
 import { getMainAgentId, isOwnerIdentity, resolveInterlocutor, loadAgent } from "./database.js";
 import { log } from "./log.js";
+import { shouldForwardSubagentFinalText } from "./subagent-report.js";
+
+export { NOTHING_TO_REPORT } from "./subagent-report.js";
 
 export const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 30_000;
@@ -50,12 +53,28 @@ export interface RoutingResult {
   isMainAgent: boolean;
 }
 
+export interface Participant {
+  id: string;
+  name: string;
+}
+
+// A routing outcome that deliberately drops the message without treating it as
+// an error. The mentions-only drop is a cost-saving feature that can fire for
+// every message in a busy group, so it must not share the warn-level unresolved
+// path.
+interface DroppedRouting {
+  dropReason: "mentions_only";
+}
+
 interface QueueEntry {
   message: string | undefined;
   source: string | undefined;
   sender: string | undefined;
   attachments: FileAttachment[] | undefined;
   targetAgentId: number | undefined;
+  participant: Participant | undefined;
+  senderLabel: string | undefined;
+  addressedToBot: boolean | undefined;
   retries: number;
   resolve: (value: string) => void;
   reject: (reason: unknown) => void;
@@ -90,7 +109,9 @@ async function resolveTargetAgent(
   source: string | undefined,
   sender: string | undefined,
   targetAgentId: number | undefined,
-): Promise<RoutingResult | null> {
+  senderLabel: string | undefined,
+  addressedToBot: boolean | undefined,
+): Promise<RoutingResult | DroppedRouting | null> {
   const mainAgentId = getMainAgentId();
 
   // Agent-to-agent message: targetAgentId must be set.
@@ -180,6 +201,7 @@ async function resolveTargetAgent(
   // Hard gate: sender must be in the allowlist. Owner messages bypass this
   // check above, and internal sources are handled earlier in this function.
   if (!isInAllowlist(source, sender)) {
+    recordRejectedSender(source, sender, senderLabel);
     log.info(`[solonbot] Dropping message from sender not in allowlist: source=${source}, sender=${sender}`);
     return null;
   }
@@ -189,6 +211,19 @@ async function resolveTargetAgent(
   if (interlocutor === null) {
     return null;
   }
+
+  // Mentions-only is a cost-saving measure, not a security boundary, so it sits
+  // next to the interlocutor lookup rather than in the allowlist. Only Signal and
+  // Telegram can report that a message addresses the bot; on any other source
+  // the flag would drop every message, so it has no effect there.
+  if (
+    interlocutor.mentionsOnly &&
+    (source === "signal" || source === "telegram") &&
+    addressedToBot !== true
+  ) {
+    return { dropReason: "mentions_only" };
+  }
+
   return {
     agentId: interlocutor.agentId,
     senderIdentityId: interlocutor.identityId,
@@ -251,21 +286,46 @@ async function sendErrorToSource(
   }
 }
 
+// Forwards a subagent's final text to the main agent as an agent message, the
+// same way send_agent_message does. The enqueue is deliberately not awaited:
+// the main agent's turn runs behind this one in the same queue, so awaiting
+// would deadlock.
+function forwardSubagentFinalMessage(routing: RoutingResult, response: string): void {
+  if (routing.isMainAgent) {
+    return;
+  }
+  if (!shouldForwardSubagentFinalText(response)) {
+    log.info(`[solonbot] Subagent ${routing.agentId} has nothing to report, not forwarding.`);
+    return;
+  }
+  log.info(`[solonbot] Forwarding subagent ${routing.agentId} final message to main agent.`);
+  void enqueueMessage(response.trim(), "agent", String(routing.agentId), undefined, getMainAgentId());
+}
+
 async function processQueue(): Promise<void> {
   processing = true;
   while (queue.length > 0) {
     const entry = queue.shift()!;
-    const preview = (entry.message ?? "").slice(0, 200);
-    log.info(`[solonbot] message in: ${entry.source} - ${entry.sender} - ${preview}`);
     currentEntry = entry;
     try {
-      const routing = await resolveTargetAgent(queuePool!, entry.source, entry.sender, entry.targetAgentId);
+      const routing = await resolveTargetAgent(queuePool!, entry.source, entry.sender, entry.targetAgentId, entry.senderLabel, entry.addressedToBot);
       if (routing === null) {
         log.warn(`[solonbot] Dropping message: could not resolve target agent. source=${entry.source}, sender=${entry.sender}`);
         entry.resolve("");
         continue;
       }
-      const response = await handlePrompt(queueAgent!, queuePool!, entry.message, queueConfig!, routing, entry.source, entry.attachments, entry.retries > 0);
+      if ("dropReason" in routing) {
+        // Deliberately quiet and text-free: a busy mentions-only group would
+        // otherwise flood the log with message previews and warnings.
+        log.info(`[solonbot] Dropping message from mentions-only interlocutor: source=${entry.source}, sender=${entry.sender}`);
+        entry.resolve("");
+        continue;
+      }
+      // Logged after routing so messages dropped above never print their text.
+      const preview = (entry.message ?? "").slice(0, 200);
+      log.info(`[solonbot] message in: ${entry.source} - ${entry.sender} - ${preview}`);
+      const response = await handlePrompt(queueAgent!, queuePool!, entry.message, queueConfig!, routing, entry.source, entry.attachments, entry.retries > 0, entry.participant);
+      forwardSubagentFinalMessage(routing, response);
       entry.resolve(response);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -277,6 +337,24 @@ async function processQueue(): Promise<void> {
         const loginMessage = `Authentication required. Visit ${queueConfig!.publicHostname}/login to log in.`;
         await sendErrorToSource(entry.source, entry.sender, queueConfig!, loginMessage);
         entry.resolve(loginMessage);
+      } else if (error instanceof TurnProgressPersistedError) {
+        // The turn already persisted assistant/toolResult messages before
+        // failing. Retrying would reload them and replay every tool side
+        // effect, so treat this as terminal like retry exhaustion. A wrapped
+        // 401 is handled the same as the plain 401 branch below: invalidate the
+        // stale credentials and prompt re-login, without retrying.
+        if (errorMessage.includes("401 ")) {
+          log.error(`[solonbot] Auth failure (401) after progress was persisted, not retrying: ${errorMessage}`);
+          invalidateCredentials(queueConfig!);
+          const loginMessage = `Authentication required. Visit ${queueConfig!.publicHostname}/login to log in.`;
+          await sendErrorToSource(entry.source, entry.sender, queueConfig!, loginMessage);
+          entry.resolve(loginMessage);
+        } else {
+          log.error(`[solonbot] Turn failed after progress was persisted, not retrying: ${errorMessage}`);
+          const userMessage = `Something went wrong: ${parseProviderErrorMessage(errorMessage)}`;
+          await sendErrorToSource(entry.source, entry.sender, queueConfig!, userMessage);
+          entry.resolve(userMessage);
+        }
       } else if (errorMessage.includes("401 ")) {
         log.error(`[solonbot] Auth failure (401), not retrying: ${errorMessage}`);
         invalidateCredentials(queueConfig!);
@@ -312,8 +390,22 @@ export function enqueueMessage(
   sender?: string,
   attachments?: FileAttachment[],
   targetAgentId?: number,
+  participant?: Participant,
+  senderLabel?: string,
+  addressedToBot?: boolean,
 ): Promise<string> {
-  if (message !== undefined && message.trim().toLowerCase() === "/stop") {
+  const isStopText = message !== undefined && message.trim().toLowerCase() === "/stop";
+  // Agent-to-agent messages are data, not owner commands, so a subagent that
+  // happens to reply "/stop" must be delivered literally instead of aborting.
+  // Only the owner may stop a turn either: this check runs before routing and
+  // before the Signal allowlist, so accepting /stop from anyone would let an
+  // arbitrary external sender abort the main agent's running turn.
+  const isOwnerStop =
+    source !== "agent" &&
+    isStopText &&
+    (isInteractiveOwnerMessage(source, sender) ||
+      (participant !== undefined && source !== undefined && isOwnerIdentity(source, participant.id)));
+  if (isOwnerStop) {
     if (processing) {
       log.info("[solonbot] /stop received, aborting running agent.");
       queueAgent!.abort();
@@ -336,7 +428,7 @@ export function enqueueMessage(
   }
 
   return new Promise<string>((resolve, reject) => {
-    queue.push({ message, source, sender, attachments, targetAgentId, retries: 0, resolve, reject });
+    queue.push({ message, source, sender, attachments, targetAgentId, participant, senderLabel, addressedToBot, retries: 0, resolve, reject });
     if (!processing) {
       void processQueue();
     }

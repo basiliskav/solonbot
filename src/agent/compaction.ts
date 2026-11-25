@@ -1,7 +1,8 @@
-import { complete, type TextContent, type ImageContent, type ThinkingContent, type ToolCall } from "@mariozechner/pi-ai";
-import type { Model, Api } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { Agent } from "@mariozechner/pi-agent-core";
+import { complete } from "@earendil-works/pi-ai/compat";
+import { type TextContent, type ImageContent, type ThinkingContent, type ToolCall } from "@earendil-works/pi-ai";
+import type { Model, Api } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
 import type { Config } from "../config.js";
 import type { SearchResults } from "../search.js";
 import { extractText } from "../embeddings.js";
@@ -123,11 +124,13 @@ export function estimateTokens(messages: AgentMessage[]): number {
 // boundary when:
 //   - It is the first message (index 0), OR
 //   - The previous message is also a user message (consecutive user messages), OR
+//   - The previous message is a system message (the prompt or a tool
+//     declaration), OR
 //   - The previous message is an assistant message with no toolCall blocks.
 //
 // Steering injects user messages mid-turn (between an assistant toolCall and its
-// toolResult). Cutting there would orphan the toolResult and cause a 400 from the
-// Anthropic API. Those injected messages are NOT turn boundaries.
+// toolResult). Cutting there would orphan the toolResult and cause a 400 from
+// the Anthropic API. Those injected messages are NOT turn boundaries.
 export function isTurnBoundary(messages: AgentMessage[], index: number): boolean {
   if (messages[index].role !== "user") {
     return false;
@@ -137,6 +140,9 @@ export function isTurnBoundary(messages: AgentMessage[], index: number): boolean
   }
   const previous = messages[index - 1];
   if (previous.role === "user") {
+    return true;
+  }
+  if (previous.role === "system") {
     return true;
   }
   if (previous.role === "assistant") {
@@ -153,6 +159,10 @@ export const TRUNCATION_BUDGET_FRACTION = 0.8;
 export const COMPACTION_THRESHOLD_FRACTION = 0.6;
 // Fraction of the compaction threshold to keep after compaction.
 export const COMPACTION_KEEP_FRACTION = 0.5;
+// Fraction of the effective context used as the maximum level 3 (deterministic
+// truncation) output budget. Keeps a failed summarization from storing a
+// near-copy of its input and growing the compaction row on every run.
+export const LEVEL3_MAX_OUTPUT_FRACTION = 0.1;
 
 // Selects the index of the first message to keep after compaction, or null if
 // no safe cut point exists. The cut always lands on a turn-boundary user message
@@ -432,12 +442,17 @@ export async function escalatingSummarize(
   config: Config,
   model: Model<Api>,
   apiKey: string,
+  compactionThreshold: number,
 ): Promise<string> {
   const inputLength = inputText.length;
 
+  // Use a model variant with reasoning disabled so the summarizer produces
+  // only text output, not thinking blocks that waste the output budget.
+  const summaryModel: Model<Api> = { ...model, reasoning: false };
+
   // Level 1: use the existing compaction prompt.
   const level1Response = await complete(
-    model,
+    summaryModel,
     {
       systemPrompt: config.compactionPrompt,
       messages: [
@@ -462,18 +477,19 @@ export async function escalatingSummarize(
     .map((block) => block.text)
     .join("");
 
-  if (level1Text.length < inputLength) {
+  if (level1Text.trim().length > 0 && level1Text.length < inputLength) {
     return level1Text;
   }
 
   // Level 2: bullet-point prompt targeting half the input's estimated token count.
   const targetTokens = Math.round(inputLength / 3 / 2);
-  log.info(`[solonbot] Compaction level 1 failed (summary ${level1Text.length} chars >= input ${inputLength} chars), attempting level 2 bullet-point summary (target: ${targetTokens} tokens).`);
+  const level1NonTextBlocks = level1Response.content.filter((block) => block.type !== "text").length;
+  log.info(`[solonbot] Compaction level 1 failed (textLength=${level1Text.length}, input=${inputLength}, stopReason=${level1Response.stopReason}, errorMessage=${level1Response.errorMessage}, nonTextBlocks=${level1NonTextBlocks}), attempting level 2 bullet-point summary (target: ${targetTokens} tokens).`);
 
   const bulletPrompt = config.compactionBulletPrompt.replace("{target}", String(targetTokens));
 
   const level2Response = await complete(
-    model,
+    summaryModel,
     {
       systemPrompt: bulletPrompt,
       messages: [
@@ -498,18 +514,25 @@ export async function escalatingSummarize(
     .map((block) => block.text)
     .join("");
 
-  if (level2Text.length < inputLength) {
+  if (level2Text.trim().length > 0 && level2Text.length < inputLength) {
     return level2Text;
   }
 
-  // Level 3: deterministic truncation — no LLM call.
-  log.info(`[solonbot] Compaction level 2 failed (summary ${level2Text.length} chars >= input ${inputLength} chars), falling back to level 3 truncation.`);
+  // Level 3: deterministic truncation — no LLM call. Cap the result at a small
+  // fraction of the effective context and keep the end of the input (the newest
+  // material, which connects to the kept context). The marker goes at the start
+  // because the start is what gets cut.
+  const level2NonTextBlocks = level2Response.content.filter((block) => block.type !== "text").length;
+  log.info(`[solonbot] Compaction level 2 failed (textLength=${level2Text.length}, input=${inputLength}, stopReason=${level2Response.stopReason}, errorMessage=${level2Response.errorMessage}, nonTextBlocks=${level2NonTextBlocks}), falling back to level 3 truncation.`);
 
-  const suffix = "\n[truncated due to compaction failure]";
-  // Guarantee the result is strictly shorter than the input. If the input is
-  // shorter than the suffix itself (an extreme edge case that should never
-  // occur in practice), just return the suffix — the input was tiny and
-  // shouldn't have triggered compaction.
-  const truncateLength = Math.max(0, inputLength - suffix.length - 1);
-  return inputText.slice(0, truncateLength) + suffix;
+  const marker = "[truncated due to compaction failure]\n";
+  const effectiveContext = compactionThreshold / COMPACTION_THRESHOLD_FRACTION;
+  const level3MaxChars = Math.floor(effectiveContext * LEVEL3_MAX_OUTPUT_FRACTION * CHARS_PER_TOKEN);
+  // Guarantee the result is strictly shorter than the input by leaving room for
+  // the marker plus at least one dropped character.
+  const maxTailLength = Math.max(0, Math.min(level3MaxChars, inputLength - marker.length - 1));
+  if (maxTailLength === 0) {
+    return marker.slice(0, Math.max(0, inputLength - 1));
+  }
+  return marker + inputText.slice(inputLength - maxTailLength);
 }

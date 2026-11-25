@@ -1,12 +1,15 @@
 import { describe, it, expect, vi, type MockedFunction, beforeEach } from "vitest";
-import type { Agent, AgentMessage, AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
-import { complete } from "@mariozechner/pi-ai";
+import type { Agent, AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { JsonObject } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { Pool } from "pg";
-import { serializeMessagesForSummary, filterToolsForSubagent, formatPluginListSection, truncateContext, createManageKnowledgeTool, injectAutoSearchBlock, pendingAutoSearchBlocks, handlePrompt, createAgent, escalatingSummarize, selectCompactionCutIndex, isTurnBoundary } from "./agent/index.js";
+import { serializeMessagesForSummary, filterToolsForSubagent, formatPluginListSection, truncateContext, createManageKnowledgeTool, injectAutoSearchBlock, pendingAutoSearchBlocks, handlePrompt, createAgent, escalatingSummarize, selectCompactionCutIndex, isTurnBoundary, triggerCompactionIfNeeded, formatUserMessage, CHARS_PER_TOKEN, COMPACTION_THRESHOLD_FRACTION, LEVEL3_MAX_OUTPUT_FRACTION } from "./agent/index.js";
 import { getApiKey } from "./auth.js";
-import { loadMessages, loadAllMemories, loadAllScratchpadTitles, getMainAgentId, saveMessage } from "./database.js";
+import { loadMessages, loadAllMemories, loadAllScratchpadTitles, getMainAgentId, saveMessage, loadAgent, loadLatestCompaction, saveCompaction, isOwnerIdentity } from "./database.js";
 import { runSearch } from "./search.js";
 import { internalFetch } from "./internal-fetch.js";
+import { AbortError, TurnProgressPersistedError } from "./errors.js";
+import { NOTHING_TO_REPORT } from "./subagent-report.js";
 
 // Mock all heavy dependencies so the module loads without real infrastructure.
 vi.mock("./database.js", () => ({
@@ -29,6 +32,7 @@ vi.mock("./database.js", () => ({
   resolveRecipient: vi.fn(),
   resolveInterlocutorByName: vi.fn(),
   getMainAgentId: vi.fn(),
+  isOwnerIdentity: vi.fn().mockReturnValue(false),
   loadAgent: vi.fn(),
 }));
 vi.mock("./config.js", () => ({
@@ -40,7 +44,15 @@ vi.mock("./log.js", () => ({
 }));
 vi.mock("./allowlist.js", () => ({ isInAllowlist: vi.fn() }));
 vi.mock("./uploads.js", () => ({}));
-vi.mock("./auth.js", () => ({ getApiKey: vi.fn() }));
+vi.mock("./auth.js", () => ({
+  getApiKey: vi.fn(),
+  AuthError: class AuthError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "AuthError";
+    }
+  },
+}));
 vi.mock("./queue.js", () => ({}));
 vi.mock("./scheduler.js", () => ({ reloadScheduler: vi.fn() }));
 vi.mock("./plugin-tools.js", () => ({
@@ -68,8 +80,21 @@ vi.mock("./whatsapp-api.js", () => ({
 }));
 vi.mock("./email-api.js", () => ({ sendEmail: vi.fn() }));
 vi.mock("./temp-dir.js", () => ({ TEMP_ATTACHMENTS_DIR: "/tmp/attachments" }));
-vi.mock("./errors.js", () => ({ AbortError: class AbortError extends Error {} }));
-vi.mock("@mariozechner/pi-ai", () => ({
+vi.mock("./errors.js", () => ({
+  AbortError: class AbortError extends Error {
+    constructor() {
+      super("Agent aborted.");
+      this.name = "AbortError";
+    }
+  },
+  TurnProgressPersistedError: class TurnProgressPersistedError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "TurnProgressPersistedError";
+    }
+  },
+}));
+vi.mock("@earendil-works/pi-ai", () => ({
   Type: {
     Object: vi.fn().mockReturnValue({}),
     String: vi.fn().mockReturnValue({}),
@@ -81,8 +106,13 @@ vi.mock("@mariozechner/pi-ai", () => ({
     Array: vi.fn().mockReturnValue({}),
     Record: vi.fn().mockReturnValue({}),
   },
-  getModel: vi.fn().mockReturnValue({ contextWindow: 200000 }),
+}));
+vi.mock("@earendil-works/pi-ai/compat", () => ({
   complete: vi.fn(),
+  streamSimple: vi.fn(),
+}));
+vi.mock("@earendil-works/pi-ai/providers/all", () => ({
+  getBuiltinModel: vi.fn().mockReturnValue({ contextWindow: 200000 }),
 }));
 // makeMinimalTool is hoisted so it can be used in vi.mock factories below.
 // Tool factory mocks need to return a valid AgentTool so createAgent can call
@@ -108,31 +138,58 @@ const { FakeAgent } = vi.hoisted(() => {
   class FakeAgent {
     private transformContextFn?: (messages: unknown[]) => Promise<unknown[]>;
     public capturedContextMessages: unknown[] | undefined;
-    public messages: unknown[] = [];
-    public error: unknown = undefined;
-    public tools: unknown[] = [];
+    // State is a single mutable object so assignments from the code under test
+    // (agent.state.tools = ..., agent.state.messages = ...) persist, mirroring
+    // the real Agent. A getter returning a fresh object each call would
+    // silently swallow such mutations and hide regressions like a filtered tool
+    // list leaking into the next turn.
+    public state: {
+      tools: unknown[];
+      messages: unknown[];
+      systemPrompt: string;
+      model: { contextWindow: number };
+      errorMessage: string | undefined;
+    };
     // Set this before calling prompt() to make it throw.
     public promptError: Error | undefined = undefined;
+    // Per-prompt throw overrides. Each call shifts one entry, so a test can let
+    // the first prompt succeed and make a later prompt (e.g. the nudge) fail.
+    public promptErrors: Array<Error | undefined> = [];
+    // Per-prompt values for state.errorMessage, applied after the prompt's
+    // scripted events. Lets a test model an abort detected at the end of a
+    // specific prompt without throwing out of prompt() itself.
+    public promptStateErrorMessages: Array<string | undefined> = [];
+    // Events emitted before promptError is thrown. Lets a test model a turn
+    // that streams an assistant message_end (persisting progress) and then
+    // fails mid-stream.
+    public eventsBeforeError: unknown[] = [];
     // Steered messages to emit as message_end events during prompt().
     public steeringMessages: unknown[] = [];
+    // Events to emit during successive prompt() calls, after the initial user
+    // message and any steering messages. Each call shifts one batch, so tests
+    // can script a nudge followed by a reply. Message_end events are also
+    // appended to state.messages, mirroring the real agent's transcript.
+    public promptEvents: unknown[][] = [];
+    public promptMessages: unknown[] = [];
     private listeners: Array<(e: unknown) => void> = [];
 
-    constructor(opts?: { transformContext?: (messages: unknown[]) => Promise<unknown[]> }) {
+    constructor(opts?: {
+      initialState?: {
+        tools?: unknown[];
+        messages?: unknown[];
+        systemPrompt?: string;
+        model?: unknown;
+      };
+      transformContext?: (messages: unknown[]) => Promise<unknown[]>;
+    }) {
       this.transformContextFn = opts?.transformContext;
-    }
-
-    get state(): { tools: unknown[]; messages: unknown[]; error: unknown } {
-      return { tools: this.tools, messages: this.messages, error: this.error };
-    }
-
-    replaceMessages(ms: unknown[]): void {
-      this.messages = ms;
-    }
-
-    setSystemPrompt(_v: string): void {}
-
-    setTools(t: unknown[]): void {
-      this.tools = t;
+      this.state = {
+        tools: opts?.initialState?.tools ?? [],
+        messages: opts?.initialState?.messages ?? [],
+        systemPrompt: opts?.initialState?.systemPrompt ?? "",
+        model: (opts?.initialState?.model as { contextWindow: number }) ?? { contextWindow: 200000 },
+        errorMessage: undefined,
+      };
     }
 
     subscribe(fn: (e: unknown) => void): () => void {
@@ -148,11 +205,14 @@ const { FakeAgent } = vi.hoisted(() => {
       }
     }
 
-    appendMessage(_m: unknown): void {}
-
     async prompt(message: unknown): Promise<void> {
-      if (this.promptError !== undefined) {
-        throw this.promptError;
+      this.promptMessages.push(message);
+      const promptError = this.promptErrors.length > 0 ? this.promptErrors.shift() : this.promptError;
+      if (promptError !== undefined) {
+        for (const event of this.eventsBeforeError) {
+          this.emit(event);
+        }
+        throw promptError;
       }
       if (this.transformContextFn !== undefined) {
         // Mirror the real Agent: append the incoming user message to the stored
@@ -161,7 +221,7 @@ const { FakeAgent } = vi.hoisted(() => {
         const userMessage = typeof message === "string"
           ? { role: "user", content: message, timestamp: Date.now() }
           : message;
-        this.capturedContextMessages = await this.transformContextFn([...this.messages, userMessage]);
+        this.capturedContextMessages = await this.transformContextFn([...this.state.messages, userMessage]);
       }
       // Fire message_end for the initial prompt message (mirrors the real agent-loop).
       const promptMessage = typeof message === "string"
@@ -173,13 +233,29 @@ const { FakeAgent } = vi.hoisted(() => {
         this.emit({ type: "message_end", message: steered });
       }
       this.steeringMessages = [];
+      // Emit the scripted events for this prompt call, appending message_end
+      // messages to the transcript like the real agent does.
+      const events = this.promptEvents.shift() ?? [];
+      for (const event of events) {
+        const messageEvent = event as { type?: string; message?: unknown };
+        if (messageEvent.type === "message_end" && messageEvent.message !== undefined) {
+          this.state.messages.push(messageEvent.message);
+        }
+        this.emit(event);
+      }
+      if (this.promptStateErrorMessages.length > 0) {
+        const stateErrorMessage = this.promptStateErrorMessages.shift();
+        if (stateErrorMessage !== undefined) {
+          this.state.errorMessage = stateErrorMessage;
+        }
+      }
     }
   }
 
   return { FakeAgent };
 });
 
-vi.mock("@mariozechner/pi-agent-core", () => ({
+vi.mock("@earendil-works/pi-agent-core", () => ({
   Agent: FakeAgent,
 }));
 
@@ -202,100 +278,47 @@ function toolResultMessage(toolName: string, text: string): AgentMessage {
 }
 
 describe("serializeMessagesForSummary", () => {
-  it("serializes a plain user message", () => {
-    const messages: AgentMessage[] = [
-      { role: "user", content: "Hello there", timestamp: 0 },
-    ];
-    expect(serializeMessagesForSummary(messages)).toBe("User: Hello there");
-  });
+  interface ToolCallArgumentCase {
+    label: string;
+    toolName: string;
+    arguments: JsonObject;
+    expected: string;
+  }
 
-  it("serializes an assistant text-only message", () => {
-    const messages: AgentMessage[] = [
-      assistantMessage([{ type: "text", text: "Hi!" }]),
-    ];
-    expect(serializeMessagesForSummary(messages)).toBe("Assistant: Hi!");
-  });
+  const toolCallArgumentCases: ToolCallArgumentCase[] = [
+    {
+      label: "string arguments",
+      toolName: "send_signal_message",
+      arguments: { recipient: "+1234567890", message: "Hello!" },
+      expected: `Assistant called send_signal_message(recipient="+1234567890", message="Hello!")`,
+    },
+    {
+      label: "number and boolean arguments",
+      toolName: "some_tool",
+      arguments: { count: 42, enabled: true, disabled: false },
+      expected: "Assistant called some_tool(count=42, enabled=true, disabled=false)",
+    },
+    {
+      label: "a null argument",
+      toolName: "some_tool",
+      arguments: { value: null },
+      expected: "Assistant called some_tool(value=null)",
+    },
+    {
+      label: "an object argument",
+      toolName: "execute_sql",
+      arguments: { query: "SELECT 1", options: { timeout: 5000 } },
+      expected: `Assistant called execute_sql(query="SELECT 1", options={"timeout":5000})`,
+    },
+  ];
 
-  it("serializes a tool call with string arguments", () => {
+  it.each(toolCallArgumentCases)("serializes a tool call with $label", ({ toolName, arguments: toolArguments, expected }) => {
     const messages: AgentMessage[] = [
       assistantMessage([
-        {
-          type: "toolCall",
-          id: "tc1",
-          name: "send_signal_message",
-          arguments: { recipient: "+1234567890", message: "Hello!" },
-        },
+        { type: "toolCall", id: "tc1", name: toolName, arguments: toolArguments },
       ]),
     ];
-    expect(serializeMessagesForSummary(messages)).toBe(
-      `Assistant called send_signal_message(recipient="+1234567890", message="Hello!")`,
-    );
-  });
-
-  it("serializes a tool call with number and boolean arguments without quotes", () => {
-    const messages: AgentMessage[] = [
-      assistantMessage([
-        {
-          type: "toolCall",
-          id: "tc2",
-          name: "some_tool",
-          arguments: { count: 42, enabled: true, disabled: false },
-        },
-      ]),
-    ];
-    expect(serializeMessagesForSummary(messages)).toBe(
-      "Assistant called some_tool(count=42, enabled=true, disabled=false)",
-    );
-  });
-
-  it("serializes a tool call with null argument without quotes", () => {
-    const messages: AgentMessage[] = [
-      assistantMessage([
-        {
-          type: "toolCall",
-          id: "tc3",
-          name: "some_tool",
-          arguments: { value: null },
-        },
-      ]),
-    ];
-    expect(serializeMessagesForSummary(messages)).toBe(
-      "Assistant called some_tool(value=null)",
-    );
-  });
-
-  it("serializes a tool call with an object argument using JSON.stringify", () => {
-    const messages: AgentMessage[] = [
-      assistantMessage([
-        {
-          type: "toolCall",
-          id: "tc4",
-          name: "execute_sql",
-          arguments: { query: "SELECT 1", options: { timeout: 5000 } },
-        },
-      ]),
-    ];
-    expect(serializeMessagesForSummary(messages)).toBe(
-      `Assistant called execute_sql(query="SELECT 1", options={"timeout":5000})`,
-    );
-  });
-
-  it("emits tool call lines after the assistant text line when both are present", () => {
-    const messages: AgentMessage[] = [
-      assistantMessage([
-        { type: "text", text: "Sending now." },
-        {
-          type: "toolCall",
-          id: "tc5",
-          name: "send_signal_message",
-          arguments: { recipient: "+1", message: "Hi" },
-        },
-      ]),
-    ];
-    const result = serializeMessagesForSummary(messages);
-    expect(result).toBe(
-      `Assistant: Sending now.\nAssistant called send_signal_message(recipient="+1", message="Hi")`,
-    );
+    expect(serializeMessagesForSummary(messages)).toBe(expected);
   });
 
   it("emits one line per tool call when multiple tool calls are present", () => {
@@ -318,15 +341,6 @@ describe("serializeMessagesForSummary", () => {
     const result = serializeMessagesForSummary(messages);
     expect(result).toBe(
       `Assistant called tool_a(x="foo")\nAssistant called tool_b(y=1)`,
-    );
-  });
-
-  it("serializes a tool result message", () => {
-    const messages: AgentMessage[] = [
-      toolResultMessage("execute_sql", "1 row returned"),
-    ];
-    expect(serializeMessagesForSummary(messages)).toBe(
-      "Tool result (execute_sql): 1 row returned",
     );
   });
 
@@ -356,9 +370,13 @@ describe("serializeMessagesForSummary", () => {
   });
 });
 
+function resultText(result: Awaited<ReturnType<AgentTool["execute"]>>): string {
+  const block = result.content.find((entry) => entry.type === "text");
+  return block !== undefined && block.type === "text" ? block.text : "";
+}
+
 // Minimal AgentTool factory for testing filterToolsForSubagent.
-function makeTool(name: string): AgentTool {
-  return {
+function makeTool(name: string): AgentTool {  return {
     name,
     label: name,
     description: `Tool ${name}`,
@@ -374,20 +392,17 @@ describe("filterToolsForSubagent", () => {
   it("excludes tools not in the allowed list", () => {
     const tools = [makeTool("execute_sql"), makeTool("manage_cron"), makeTool("send_agent_message")];
     const result = filterToolsForSubagent(tools, ["execute_sql"], []);
-    expect(result.map((t) => t.name)).toEqual(["execute_sql", "send_agent_message"]);
+    expect(result.map((t) => t.name)).toEqual(["execute_sql"]);
   });
 
-  it("always includes send_agent_message even when not listed", () => {
+  it.each([
+    { label: "allowedTools lists it", allowedTools: ["execute_sql", "send_agent_message"], expected: ["execute_sql"] },
+    { label: "it is the only allowed tool", allowedTools: ["send_agent_message"], expected: [] },
+    { label: "allowedTools is empty", allowedTools: [], expected: [] },
+  ])("excludes send_agent_message when $label", ({ allowedTools, expected }) => {
     const tools = [makeTool("execute_sql"), makeTool("send_agent_message")];
-    const result = filterToolsForSubagent(tools, ["execute_sql"], []);
-    expect(result.map((t) => t.name)).toContain("send_agent_message");
-  });
-
-  it("includes send_agent_message only once when explicitly listed", () => {
-    const tools = [makeTool("execute_sql"), makeTool("send_agent_message")];
-    const result = filterToolsForSubagent(tools, ["execute_sql", "send_agent_message"], []);
-    const names = result.map((t) => t.name);
-    expect(names.filter((n) => n === "send_agent_message")).toHaveLength(1);
+    const result = filterToolsForSubagent(tools, allowedTools, []);
+    expect(result.map((t) => t.name)).toEqual(expected);
   });
 
   it("includes a tool as-is when a bare name is given", async () => {
@@ -440,50 +455,38 @@ describe("filterToolsForSubagent", () => {
     expect(included).toBe(tool);
   });
 
-  it("rejects calls with no action param when tool is action-scoped", async () => {
+  it.each([
+    { label: "no action param", params: { query: "SELECT 1" } },
+    { label: "action: undefined", params: { action: undefined } },
+  ])("rejects calls with $label when tool is action-scoped", async ({ params }) => {
     const tool = makeTool("some_tool");
     const result = filterToolsForSubagent([tool], ["some_tool.list"], []);
     const wrapped = result.find((t) => t.name === "some_tool");
-    // No action field in params: should be rejected, not delegated.
-    const response = await wrapped!.execute("id1", { query: "SELECT 1" }) as AgentToolResult<{ message: string }>;
+    const response = await wrapped!.execute("id1", params) as AgentToolResult<{ message: string }>;
     expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("requires an action parameter") });
     expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("some_tool") });
     expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("list") });
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
-  it("rejects calls with action: undefined when tool is action-scoped", async () => {
-    const tool = makeTool("some_tool");
-    const result = filterToolsForSubagent([tool], ["some_tool.list"], []);
-    const wrapped = result.find((t) => t.name === "some_tool");
-    // Explicit action: undefined should also be rejected.
-    const response = await wrapped!.execute("id1", { action: undefined }) as AgentToolResult<{ message: string }>;
-    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("requires an action parameter") });
-    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("some_tool") });
-    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("list") });
-    expect(tool.execute).not.toHaveBeenCalled();
-  });
-
-  it("returns empty list (except send_agent_message) when allowed list is empty", () => {
+  it("returns an empty list when allowed list is empty", () => {
     const tools = [makeTool("execute_sql"), makeTool("manage_cron")];
     const result = filterToolsForSubagent(tools, [], []);
-    // send_agent_message is not in the tools array, so nothing is returned.
     expect(result).toHaveLength(0);
   });
 
-  it("includes send_agent_message from tools when allowed list is empty", () => {
-    const tools = [makeTool("execute_sql"), makeTool("send_agent_message")];
+  it("always includes manage_knowledge even when the allowed list is empty", () => {
+    const manageKnowledge = makeTool("manage_knowledge");
+    const tools = [makeTool("execute_sql"), manageKnowledge];
     const result = filterToolsForSubagent(tools, [], []);
-    expect(result.map((t) => t.name)).toEqual(["send_agent_message"]);
+    expect(result).toEqual([manageKnowledge]);
   });
 
-  it("error message lists allowed actions sorted alphabetically", async () => {
-    const tool = makeTool("manage_interlocutors");
-    const result = filterToolsForSubagent([tool], ["manage_interlocutors.update", "manage_interlocutors.list"], []);
-    const wrapped = result.find((t) => t.name === "manage_interlocutors");
-    const response = await wrapped!.execute("id1", { action: "delete" }) as AgentToolResult<{ message: string }>;
-    const text = (response.content[0] as { type: string; text: string }).text;
-    expect(text).toContain("list, update");
+  it("includes manage_knowledge unscoped when allowedTools scopes it to actions", () => {
+    const manageKnowledge = makeTool("manage_knowledge");
+    const result = filterToolsForSubagent([manageKnowledge], ["manage_knowledge.read"], []);
+    // It must be the original tool, not a wrapper that restricts actions.
+    expect(result[0]).toBe(manageKnowledge);
   });
 
   it("wrapped tool description includes restriction notice with sorted actions", () => {
@@ -493,24 +496,14 @@ describe("filterToolsForSubagent", () => {
     expect(wrapped!.description).toBe("Tool manage_interlocutors (Restricted to actions: list, update.)");
   });
 
-  it("unwrapped tool (bare name entry) has its original description unchanged", () => {
-    const tool = makeTool("manage_interlocutors");
-    const result = filterToolsForSubagent([tool], ["manage_interlocutors"], []);
-    const included = result.find((t) => t.name === "manage_interlocutors");
-    expect(included!.description).toBe("Tool manage_interlocutors");
-  });
-
   // run_plugin_tool enforcement via allowedPlugins
 
-  it("excludes run_plugin_tool when allowedPlugins is empty", () => {
+  it.each([
+    { label: "allowedTools is empty", allowedTools: [] },
+    { label: "it appears in allowedTools", allowedTools: ["run_plugin_tool"] },
+  ])("excludes run_plugin_tool when allowedPlugins is empty and $label", ({ allowedTools }) => {
     const tools = [makeTool("run_plugin_tool"), makeTool("send_agent_message")];
-    const result = filterToolsForSubagent(tools, [], []);
-    expect(result.map((t) => t.name)).not.toContain("run_plugin_tool");
-  });
-
-  it("excludes run_plugin_tool even when it appears in allowedTools (allowedPlugins is empty)", () => {
-    const tools = [makeTool("run_plugin_tool"), makeTool("send_agent_message")];
-    const result = filterToolsForSubagent(tools, ["run_plugin_tool"], []);
+    const result = filterToolsForSubagent(tools, allowedTools, []);
     expect(result.map((t) => t.name)).not.toContain("run_plugin_tool");
   });
 
@@ -601,40 +594,6 @@ describe("filterToolsForSubagent", () => {
 });
 
 describe("formatPluginListSection", () => {
-  it("formats a list of plugins without tool details", () => {
-    const plugins = [
-      { name: "hackernews", description: "Hacker News integration" },
-      { name: "weather", description: "Weather forecasts" },
-    ];
-    const result = formatPluginListSection(plugins);
-    expect(result).toBe(
-      "Available plugins:\n- hackernews: Hacker News integration\n- weather: Weather forecasts",
-    );
-  });
-
-  it("includes tool names when toolDetails is provided", () => {
-    const plugins = [{ name: "hackernews", description: "Hacker News integration" }];
-    const toolDetails = new Map([["hackernews", ["get_front_page", "get_comments"]]]);
-    const result = formatPluginListSection(plugins, toolDetails);
-    expect(result).toBe(
-      "Available plugins:\n- hackernews: Hacker News integration\n  Tools: get_front_page, get_comments",
-    );
-  });
-
-  it("omits the Tools line when the plugin has no tools in toolDetails", () => {
-    const plugins = [{ name: "hackernews", description: "Hacker News integration" }];
-    const toolDetails = new Map([["hackernews", [] as string[]]]);
-    const result = formatPluginListSection(plugins, toolDetails);
-    expect(result).toBe("Available plugins:\n- hackernews: Hacker News integration");
-  });
-
-  it("omits the Tools line when the plugin is absent from toolDetails", () => {
-    const plugins = [{ name: "hackernews", description: "Hacker News integration" }];
-    const toolDetails = new Map<string, string[]>();
-    const result = formatPluginListSection(plugins, toolDetails);
-    expect(result).toBe("Available plugins:\n- hackernews: Hacker News integration");
-  });
-
   it("formats multiple plugins with mixed tool detail availability", () => {
     const plugins = [
       { name: "hackernews", description: "Hacker News integration" },
@@ -649,25 +608,28 @@ describe("formatPluginListSection", () => {
       "Available plugins:\n- hackernews: Hacker News integration\n  Tools: get_front_page, get_comments\n- weather: Weather forecasts",
     );
   });
+
+  it.each([
+    { label: "no tool details are supplied", toolDetails: undefined },
+    { label: "the plugin is absent from toolDetails", toolDetails: new Map<string, string[]>() },
+  ])("omits the Tools line when $label", ({ toolDetails }) => {
+    const plugins = [{ name: "hackernews", description: "Hacker News integration" }];
+    const result = formatPluginListSection(plugins, toolDetails);
+    expect(result).toBe("Available plugins:\n- hackernews: Hacker News integration");
+  });
 });
 
 describe("truncateContext", () => {
   // Each character is 1/3 token, so 3 chars = 1 token.
 
-  it("returns messages unchanged when total tokens are within budget", () => {
+  it.each([
+    { label: "total tokens are within budget", content: "Hello", budget: 10 },
+    { label: "no truncation is needed", content: "Hi", budget: 100 },
+  ])("returns the same array reference when $label", ({ content, budget }) => {
     const messages: AgentMessage[] = [
-      { role: "user", content: "Hello", timestamp: 0 },
+      { role: "user", content, timestamp: 0 },
     ];
-    // "Hello" = 5 chars = 1.25 tokens; budget of 10 is plenty.
-    const result = truncateContext(messages, 10);
-    expect(result).toBe(messages);
-  });
-
-  it("returns the same array reference when no truncation is needed", () => {
-    const messages: AgentMessage[] = [
-      { role: "user", content: "Hi", timestamp: 0 },
-    ];
-    const result = truncateContext(messages, 100);
+    const result = truncateContext(messages, budget);
     expect(result).toBe(messages);
   });
 
@@ -684,19 +646,34 @@ describe("truncateContext", () => {
     expect(content.length).toBeLessThan(longText.length);
   });
 
-  it("truncates a text block in a tool result message", () => {
-    // 400 chars = ~133 tokens; budget = 10 tokens.
-    const longText = "x".repeat(400);
-    const messages: AgentMessage[] = [
-      {
+  it.each([
+    {
+      label: "a tool result message",
+      message: {
         role: "toolResult",
         toolCallId: "tc1",
         toolName: "execute_sql",
-        content: [{ type: "text", text: longText }],
+        content: [{ type: "text", text: "x".repeat(400) }],
         isError: false,
         timestamp: 0,
       } as unknown as AgentMessage,
-    ];
+    },
+    {
+      label: "an assistant message",
+      message: assistantMessage([{ type: "text", text: "a".repeat(400) }]),
+    },
+    {
+      label: "a user message with array content",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "b".repeat(400) }],
+        timestamp: 0,
+      } as unknown as AgentMessage,
+    },
+  ])("truncates a text block in $label", ({ message }) => {
+    // 400 chars = ~133 tokens; budget = 10 tokens.
+    const longText = (message.content as Array<{ type: string; text: string }>)[0].text;
+    const messages: AgentMessage[] = [message];
     const result = truncateContext(messages, 10);
     expect(result).not.toBe(messages);
     const block = (result[0] as { content: Array<{ type: string; text: string }> }).content[0];
@@ -785,32 +762,6 @@ describe("truncateContext", () => {
     expect(block.data).toBe("base64data");
   });
 
-  it("handles an assistant message with a text block", () => {
-    const longText = "a".repeat(400);
-    const messages: AgentMessage[] = [
-      assistantMessage([{ type: "text", text: longText }]),
-    ];
-    const result = truncateContext(messages, 10);
-    const block = (result[0] as { content: Array<{ type: string; text: string }> }).content[0];
-    expect(block.text).toContain("[truncated]");
-    expect(block.text.length).toBeLessThan(longText.length);
-  });
-
-  it("handles a user message with array content containing a text block", () => {
-    const longText = "b".repeat(400);
-    const messages: AgentMessage[] = [
-      {
-        role: "user",
-        content: [{ type: "text", text: longText }],
-        timestamp: 0,
-      } as unknown as AgentMessage,
-    ];
-    const result = truncateContext(messages, 10);
-    const block = (result[0] as { content: Array<{ type: string; text: string }> }).content[0];
-    expect(block.text).toContain("[truncated]");
-    expect(block.text.length).toBeLessThan(longText.length);
-  });
-
   it("does not grow the context when a text block is shorter than the truncation suffix", () => {
     // A 4-char block is ~1.3 tokens. The truncation suffix "\n[truncated]" is 12 chars.
     // Without the guard, truncating would replace 4 chars with 12, making things worse.
@@ -834,62 +785,124 @@ describe("truncateContext", () => {
   });
 });
 
-describe("createManageKnowledgeTool — read action", () => {
-  // Import the mocked readScratchpad after vi.mock has been set up.
-  async function getReadScratchpadMock(): Promise<MockedFunction<() => Promise<unknown>>> {
-    const db = await import("./database.js");
-    return db.readScratchpad as unknown as MockedFunction<() => Promise<unknown>>;
+describe("createManageKnowledgeTool — agent scoping", () => {
+  const AGENT_ID = 2;
+  const pool = {} as Pool;
+
+  function makeTool(): AgentTool {
+    return createManageKnowledgeTool(pool, () => AGENT_ID);
   }
 
-  it("returns the title and body when the entry exists", async () => {
-    const readScratchpad = await getReadScratchpadMock();
+  // Import the mocks after vi.mock has been set up.
+  async function getMock(name: "readScratchpad" | "upsertMemory" | "deleteMemory" | "upsertScratchpad" | "deleteScratchpad"): Promise<MockedFunction<(...args: never[]) => Promise<unknown>>> {
+    const db = await import("./database.js");
+    return db[name] as unknown as MockedFunction<(...args: never[]) => Promise<unknown>>;
+  }
+
+  it("passes the current agent id when reading a scratchpad entry", async () => {
+    const readScratchpad = await getMock("readScratchpad");
     readScratchpad.mockResolvedValueOnce({ id: 5, title: "My note", body: "Some content." });
 
-    const tool = createManageKnowledgeTool({} as Pool);
-    const result = await tool.execute("tc1", { action: "read", store: "scratchpad", id: 5 });
+    const result = await makeTool().execute("tc1", { action: "read", store: "scratchpad", id: 5 });
 
+    expect(readScratchpad).toHaveBeenCalledWith(pool, AGENT_ID, 5);
     expect(result.content[0]).toMatchObject({ type: "text", text: "Title: My note\n\nSome content." });
   });
 
-  it("returns an error when the entry is not found", async () => {
-    const readScratchpad = await getReadScratchpadMock();
+  it("returns an error when reading another agent's entry", async () => {
+    const readScratchpad = await getMock("readScratchpad");
+    // The DB layer filters by agent_id, so another agent's row looks like a miss.
     readScratchpad.mockResolvedValueOnce(null);
 
-    const tool = createManageKnowledgeTool({} as Pool);
-    const result = await tool.execute("tc1", { action: "read", store: "scratchpad", id: 99 });
+    const result = await makeTool().execute("tc1", { action: "read", store: "scratchpad", id: 99 });
 
-    expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("not found") });
+    expect(resultText(result)).toContain("not found");
   });
 
-  it("returns an error when store is not scratchpad", async () => {
-    const tool = createManageKnowledgeTool({} as Pool);
-    const result = await tool.execute("tc1", { action: "read", store: "memory", id: 1 });
+  it.each([
+    {
+      label: "memory",
+      mockName: "upsertMemory" as const,
+      mockResult: { id: 11, rowCount: 1 },
+      params: { action: "upsert", store: "memory", content: "A fact." },
+      expectedDbArgs: [pool, AGENT_ID, undefined, "A fact."],
+    },
+    {
+      label: "scratchpad entry",
+      mockName: "upsertScratchpad" as const,
+      mockResult: { id: 12, rowCount: 1 },
+      params: { action: "upsert", store: "scratchpad", title: "Note", body: "Body." },
+      expectedDbArgs: [pool, AGENT_ID, undefined, "Note", "Body."],
+    },
+  ])("creates a $label owned by the current agent", async ({ mockName, mockResult, params, expectedDbArgs }) => {
+    const upsert = await getMock(mockName);
+    upsert.mockResolvedValueOnce(mockResult);
 
-    expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("only supported for the scratchpad store") });
+    await makeTool().execute("tc1", params);
+
+    expect(upsert).toHaveBeenCalledWith(...expectedDbArgs);
   });
 
-  it("returns an error when id is missing", async () => {
-    const tool = createManageKnowledgeTool({} as Pool);
-    const result = await tool.execute("tc1", { action: "read", store: "scratchpad" });
+  it.each([
+    {
+      label: "updating another agent's memory",
+      mockName: "upsertMemory" as const,
+      mockResult: { id: 7, rowCount: 0 },
+      params: { action: "upsert", store: "memory", id: 7, content: "Changed." },
+      expectedDbArgs: [pool, AGENT_ID, 7, "Changed."],
+      expectedText: "memory 7 not found",
+    },
+    {
+      label: "deleting another agent's memory",
+      mockName: "deleteMemory" as const,
+      mockResult: 0,
+      params: { action: "delete", store: "memory", id: 7 },
+      expectedDbArgs: [pool, AGENT_ID, 7],
+      expectedText: "memory 7 not found",
+    },
+    {
+      label: "updating another agent's scratchpad entry",
+      mockName: "upsertScratchpad" as const,
+      mockResult: { id: 9, rowCount: 0 },
+      params: { action: "upsert", store: "scratchpad", id: 9, title: "Note", body: "Body." },
+      expectedDbArgs: [pool, AGENT_ID, 9, "Note", "Body."],
+      expectedText: "scratchpad entry 9 not found",
+    },
+    {
+      label: "deleting another agent's scratchpad entry",
+      mockName: "deleteScratchpad" as const,
+      mockResult: 0,
+      params: { action: "delete", store: "scratchpad", id: 9 },
+      expectedDbArgs: [pool, AGENT_ID, 9],
+      expectedText: "scratchpad entry 9 not found",
+    },
+  ])("returns an error when $label", async ({ mockName, mockResult, params, expectedDbArgs, expectedText }) => {
+    const dbCall = await getMock(mockName);
+    dbCall.mockResolvedValueOnce(mockResult);
 
-    expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("id is required") });
+    const result = await makeTool().execute("tc1", params);
+
+    expect(dbCall).toHaveBeenCalledWith(...expectedDbArgs);
+    expect(resultText(result)).toContain(expectedText);
   });
 });
 
 describe("injectAutoSearchBlock", () => {
-  it("returns messages unchanged when searchBlock is undefined", () => {
-    const messages: AgentMessage[] = [
-      { role: "user", content: "Hello", timestamp: 0 },
-    ];
-    const result = injectAutoSearchBlock(messages, undefined);
-    expect(result).toBe(messages);
-  });
+  const unchangedCases: Array<{ label: string; messages: AgentMessage[]; searchBlock: string | undefined }> = [
+    {
+      label: "searchBlock is undefined",
+      messages: [{ role: "user", content: "Hello", timestamp: 0 }],
+      searchBlock: undefined,
+    },
+    {
+      label: "there are no user messages",
+      messages: [assistantMessage([{ type: "text", text: "Hi!" }])],
+      searchBlock: "search results",
+    },
+  ];
 
-  it("returns messages unchanged when there are no user messages", () => {
-    const messages: AgentMessage[] = [
-      assistantMessage([{ type: "text", text: "Hi!" }]),
-    ];
-    const result = injectAutoSearchBlock(messages, "search results");
+  it.each(unchangedCases)("returns messages unchanged when $label", ({ messages, searchBlock }) => {
+    const result = injectAutoSearchBlock(messages, searchBlock);
     expect(result).toBe(messages);
   });
 
@@ -943,30 +956,29 @@ describe("injectAutoSearchBlock", () => {
     expect(content[1]).toMatchObject({ type: "text", text: "search results" });
   });
 
-  it("does not mutate the original messages or their content arrays", () => {
-    const originalContent = [{ type: "text" as const, text: "Hello" }];
-    const originalMessage = {
-      role: "user" as const,
-      content: originalContent,
-      timestamp: 0,
-    } as unknown as AgentMessage;
-    const messages: AgentMessage[] = [originalMessage];
+  it.each([
+    {
+      label: "array content",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "Hello" }],
+        timestamp: 0,
+      } as unknown as AgentMessage,
+    },
+    {
+      label: "string content",
+      message: { role: "user", content: "Hello", timestamp: 0 } as unknown as AgentMessage,
+    },
+  ])("does not mutate the original messages or their content ($label)", ({ message }) => {
+    const messages: AgentMessage[] = [message];
+    const originalContent = message.content;
+    const originalContentSnapshot = JSON.stringify(message.content);
 
     injectAutoSearchBlock(messages, "search results");
 
-    expect(messages[0]).toBe(originalMessage);
-    expect((originalMessage as { content: typeof originalContent }).content).toBe(originalContent);
-    expect(originalContent[0].text).toBe("Hello");
-  });
-
-  it("does not mutate the original messages array when content is a string", () => {
-    const originalMessage = { role: "user" as const, content: "Hello", timestamp: 0 };
-    const messages: AgentMessage[] = [originalMessage];
-
-    injectAutoSearchBlock(messages, "search results");
-
-    expect(messages[0]).toBe(originalMessage);
-    expect(originalMessage.content).toBe("Hello");
+    expect(messages[0]).toBe(message);
+    expect(message.content).toBe(originalContent);
+    expect(JSON.stringify(message.content)).toBe(originalContentSnapshot);
   });
 });
 
@@ -1110,6 +1122,9 @@ describe("escalatingSummarize", () => {
     compactionBulletPrompt: "Bullet points. Target: {target} tokens maximum.",
   } as Parameters<typeof escalatingSummarize>[1];
   const fakeApiKey = "test-api-key";
+  // Compaction threshold in tokens. Large enough that the level 3 output cap
+  // (10% of effective context) does not change the existing assertions.
+  const fakeCompactionThreshold = 3000;
 
   function makeCompleteResponse(text: string): ReturnType<typeof complete> {
     return Promise.resolve({
@@ -1126,7 +1141,7 @@ describe("escalatingSummarize", () => {
     const shortSummary = "Short summary.";
     mockComplete.mockReturnValueOnce(makeCompleteResponse(shortSummary));
 
-    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey);
+    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey, fakeCompactionThreshold);
 
     expect(result).toBe(shortSummary);
     expect(mockComplete).toHaveBeenCalledTimes(1);
@@ -1142,7 +1157,7 @@ describe("escalatingSummarize", () => {
       .mockReturnValueOnce(makeCompleteResponse(bloatedSummary))
       .mockReturnValueOnce(makeCompleteResponse(bulletSummary));
 
-    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey);
+    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey, fakeCompactionThreshold);
 
     expect(result).toBe(bulletSummary);
     expect(mockComplete).toHaveBeenCalledTimes(2);
@@ -1152,14 +1167,18 @@ describe("escalatingSummarize", () => {
     expect(level2Prompt).toContain("tokens maximum");
   });
 
-  it("falls back to level 3 truncation when both LLM levels fail to shorten", async () => {
-    const input = "A".repeat(200);
+  it.each([
+    { inputLength: 200 },
+    { inputLength: 3000 },
+    { inputLength: 50 },
+  ])("falls back to level 3 truncation strictly shorter than a $inputLength-char input", async ({ inputLength }) => {
+    const input = "A".repeat(inputLength);
     const bloated = "B".repeat(input.length + 10);
     mockComplete
       .mockReturnValueOnce(makeCompleteResponse(bloated))
       .mockReturnValueOnce(makeCompleteResponse(bloated));
 
-    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey);
+    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey, fakeCompactionThreshold);
 
     expect(mockComplete).toHaveBeenCalledTimes(2);
     expect(result).toContain("[truncated due to compaction failure]");
@@ -1167,33 +1186,29 @@ describe("escalatingSummarize", () => {
     expect(result.length).toBeLessThan(input.length);
   });
 
-  it("level 3 result is strictly shorter than the input for a long input", async () => {
-    const input = "X".repeat(3000);
-    const bloated = "Y".repeat(input.length + 1);
-    mockComplete
-      .mockReturnValueOnce(makeCompleteResponse(bloated))
-      .mockReturnValueOnce(makeCompleteResponse(bloated));
-
-    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey);
-
-    expect(result).toContain("[truncated due to compaction failure]");
-    expect(result.length).toBeLessThan(input.length);
-  });
-
-  it("level 3 result is strictly shorter than a short input (50 chars) when both LLM levels fail", async () => {
-    // With a 50-char input, the old code would produce 50 + 38 = 88 chars (longer than input).
-    // The fix must ensure the result is always strictly shorter than the input.
-    const input = "A".repeat(50);
+  it("caps level 3 output at a fraction of the effective context and keeps the tail", async () => {
+    // compactionThreshold = 600 tokens → effective context = 1000 tokens →
+    // cap = 1000 * 0.1 = 100 tokens = 300 chars (CHARS_PER_TOKEN = 3).
+    const compactionThreshold = 600;
+    const expectedCapChars = Math.floor(
+      (compactionThreshold / COMPACTION_THRESHOLD_FRACTION) * LEVEL3_MAX_OUTPUT_FRACTION * CHARS_PER_TOKEN,
+    );
+    const marker = "[truncated due to compaction failure]\n";
+    const input = "A".repeat(4990) + "KEEPME";
     const bloated = "B".repeat(input.length + 10);
     mockComplete
       .mockReturnValueOnce(makeCompleteResponse(bloated))
       .mockReturnValueOnce(makeCompleteResponse(bloated));
 
-    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey);
+    const result = await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey, compactionThreshold);
 
-    expect(mockComplete).toHaveBeenCalledTimes(2);
-    expect(result).toContain("[truncated due to compaction failure]");
+    // The marker is at the start because the start is what was cut.
+    expect(result.startsWith("[truncated due to compaction failure]")).toBe(true);
+    // The end of the input (the newest material) is preserved, capped at the budget.
+    expect(result.endsWith(input.slice(-expectedCapChars))).toBe(true);
+    expect(result.includes("KEEPME")).toBe(true);
     expect(result.length).toBeLessThan(input.length);
+    expect(result.length).toBeLessThanOrEqual(expectedCapChars + marker.length);
   });
 
   it("replaces {target} placeholder in bullet prompt with computed token count", async () => {
@@ -1205,7 +1220,7 @@ describe("escalatingSummarize", () => {
       .mockReturnValueOnce(makeCompleteResponse(bloated))
       .mockReturnValueOnce(makeCompleteResponse(bulletSummary));
 
-    await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey);
+    await escalatingSummarize(input, fakeConfig, fakeModel, fakeApiKey, fakeCompactionThreshold);
 
     const level2Prompt = mockComplete.mock.calls[1][1].systemPrompt as string;
     // 300 chars / 3 / 2 = 50 tokens target.
@@ -1352,24 +1367,53 @@ describe("selectCompactionCutIndex", () => {
     const result = selectCompactionCutIndex(messages, 300);
     expect(result).toBe(2);
   });
+});
 
-  it("skips a steered user message in the backward scan fallback", () => {
-    // When the forward scan finds no turn-boundary user message, the backward scan
-    // must also skip steered (mid-turn) user messages and land on [2].
-    // threshold=300, keepBudget=150. The large toolResult at [5] forces the
-    // backward walk to set cutIndex=6, and neither scan finds a boundary after it.
-    const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: {} }]);
-    const messages: AgentMessage[] = [
-      userMsg(150),             // [0] real turn boundary
-      assistantMsg(150),        // [1] text-only
-      userMsg(150),             // [2] real turn boundary ← expected cut point
-      assistantWithToolCall,    // [3] has toolCall
-      userMsg(150),             // [4] steered mid-turn (NOT a boundary)
-      toolResultMessage("execute_sql", "a".repeat(450)),  // [5] large
-      assistantMsg(150),        // [6]
-    ];
-    const result = selectCompactionCutIndex(messages, 300);
-    expect(result).toBe(2);
+describe("triggerCompactionIfNeeded — summarizer input cap", () => {
+  const mockComplete = vi.mocked(complete);
+
+  const fakeConfig = {
+    compactionPrompt: "Summarize this.",
+    compactionBulletPrompt: "Bullet points. Target: {target} tokens maximum.",
+  } as Parameters<typeof escalatingSummarize>[1];
+
+  it("truncates an oversized previous-summary message before summarization", async () => {
+    vi.clearAllMocks();
+    vi.mocked(getApiKey).mockResolvedValue("test-key");
+    vi.mocked(loadLatestCompaction).mockResolvedValue(null);
+    vi.mocked(saveCompaction).mockResolvedValue(undefined);
+    // Level 1 succeeds with a short summary; the test only inspects its input.
+    mockComplete.mockResolvedValue({
+      content: [{ type: "text", text: "short summary" }],
+    } as Awaited<ReturnType<typeof complete>>);
+
+    const pool = {
+      query: vi.fn().mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("MAX(id)")) {
+          return Promise.resolve({ rows: [{ max_id: 100 }] });
+        }
+        if (typeof sql === "string" && sql.includes("OFFSET")) {
+          return Promise.resolve({ rows: [{ id: 50 }] });
+        }
+        return Promise.resolve({ rows: [] });
+      }),
+    } as unknown as Pool;
+
+    // The huge "previous summary" user message alone is ~60000 chars
+    // (~20000 tokens), far above the 3000-token compaction threshold.
+    const messages = [userMsg(60000), userMsg(100)];
+    const agent = { state: { messages, model: {} } } as unknown as Agent;
+
+    await triggerCompactionIfNeeded(agent, pool, 1, fakeConfig, 3000);
+
+    expect(mockComplete).toHaveBeenCalledTimes(1);
+    const level1Input = mockComplete.mock.calls[0][1].messages[0].content as string;
+    expect(level1Input).toContain("[truncated]");
+    expect(level1Input.length).toBeLessThan(60000);
+    // Bounded by the compaction threshold (3000 tokens * 3 chars/token), plus a
+    // small allowance for the serializer prefix and truncation marker.
+    expect(level1Input.length).toBeLessThanOrEqual(3000 * CHARS_PER_TOKEN + 500);
+    expect(saveCompaction).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1525,56 +1569,664 @@ describe("handlePrompt — user message persistence", () => {
   });
 });
 
+describe("handlePrompt — nudge for silent chat-triggered subagents", () => {
+  const mockLoadAgent = vi.mocked(loadAgent);
+  const mockSaveMessage = vi.mocked(saveMessage);
+
+  // Kept as a literal so an accidental edit to the constant under test fails.
+  const noSendNudgeText = "[System notice] You finished your turn without sending anything to the person or group who messaged you. They do not see your final response; only the main agent does. If any part of it was meant for them, send it now with the send tool for this channel. If you chose not to reply, do not send anything. Then give your final response for the main agent again, or exactly NOTHING_TO_REPORT if you have nothing for it.";
+
+  const subagentRouting = {
+    agentId: 2,
+    senderIdentityId: undefined,
+    senderAgentId: undefined,
+    senderLabel: "test-user",
+    isMainAgent: false,
+  };
+
+  function setupCommonMocks(): void {
+    vi.clearAllMocks();
+    vi.mocked(loadMessages).mockResolvedValue([]);
+    vi.mocked(loadAllMemories).mockResolvedValue([]);
+    vi.mocked(loadAllScratchpadTitles).mockResolvedValue([]);
+    vi.mocked(getMainAgentId).mockReturnValue(1);
+    vi.mocked(internalFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ plugins: [] }),
+    } as unknown as Response);
+    vi.mocked(getApiKey).mockResolvedValue("test-key");
+    vi.mocked(runSearch).mockResolvedValue({ tableResults: [], messages: [] });
+    mockSaveMessage.mockResolvedValue(42);
+    mockLoadAgent.mockResolvedValue({
+      id: 2,
+      name: "helper",
+      systemPrompt: "You are a helpful subagent.",
+      allowedTools: ["*"],
+      allowedPlugins: [],
+      createdAt: new Date(),
+    });
+  }
+
+  function assistantEvent(content: unknown[], stopReason: string = "stop"): unknown {
+    return { type: "message_end", message: { role: "assistant", content, stopReason } };
+  }
+
+  it("does not nudge when the subagent already called a send tool", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [[
+      assistantEvent([
+        { type: "toolCall", id: "tc1", name: "send_telegram_message", arguments: { message: "Hi" } },
+        { type: "text", text: "Sent." },
+      ]),
+    ]];
+
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "telegram");
+
+    expect(fakeAgent.promptMessages).toHaveLength(1);
+  });
+
+  it("counts a send tool call whose result is an error", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [[
+      assistantEvent([
+        { type: "toolCall", id: "tc1", name: "send_signal_message", arguments: { message: "Hi" } },
+      ]),
+      {
+        type: "message_end",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc1",
+          toolName: "send_signal_message",
+          content: [{ type: "text", text: "send failed" }],
+          isError: true,
+          timestamp: 0,
+        },
+      },
+      assistantEvent([{ type: "text", text: "Could not send." }]),
+    ]];
+
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "signal");
+
+    expect(fakeAgent.promptMessages).toHaveLength(1);
+  });
+
+  it.each([NOTHING_TO_REPORT, "nothing_to_report", "  Nothing_To_Report \n"])(
+    "does not nudge when the final text is the NOTHING_TO_REPORT marker (%j)",
+    async (finalText) => {
+      setupCommonMocks();
+      const agent = await createAgent(minimalConfig, makePool());
+      const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+      fakeAgent.promptEvents = [[assistantEvent([{ type: "text", text: finalText }])]];
+
+      const response = await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "telegram");
+
+      expect(fakeAgent.promptMessages).toHaveLength(1);
+      expect(response).toBe(finalText);
+    },
+  );
+
+  it("does not nudge when the final text is empty", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [[assistantEvent([])]];
+
+    const response = await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "telegram");
+
+    expect(fakeAgent.promptMessages).toHaveLength(1);
+    expect(response).toBe("");
+  });
+
+  it("nudges once and persists the nudge when no send happened, then sends after the nudge", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [
+      [assistantEvent([{ type: "text", text: "Looking into it." }])],
+      [
+        assistantEvent([
+          { type: "toolCall", id: "tc1", name: "send_whatsapp_message", arguments: { message: "All done." } },
+          { type: "text", text: "Done." },
+        ]),
+      ],
+    ];
+
+    const response = await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "whatsapp");
+
+    expect(fakeAgent.promptMessages).toHaveLength(2);
+    expect(fakeAgent.promptMessages[1]).toBe(noSendNudgeText);
+    expect(response).toBe("Done.");
+
+    // The nudge is persisted like a steered user message, without sender metadata.
+    const userSaves = mockSaveMessage.mock.calls.filter(
+      (call) => (call[1] as { role: string }).role === "user",
+    );
+    expect(userSaves).toHaveLength(2);
+    expect((userSaves[1][1] as { content: unknown }).content).toEqual([
+      { type: "text", text: noSendNudgeText },
+    ]);
+    expect(userSaves[1][3]).toBeUndefined();
+    expect(userSaves[1][4]).toBeUndefined();
+  });
+
+  it("accepts the turn after a single nudge when the subagent still does not send", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [
+      [assistantEvent([{ type: "text", text: "Still thinking." }])],
+      [assistantEvent([{ type: "text", text: "NOTHING_TO_REPORT" }])],
+    ];
+
+    const response = await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "telegram");
+
+    // Exactly one nudge: two prompts total, not three.
+    expect(fakeAgent.promptMessages).toHaveLength(2);
+    expect(fakeAgent.promptMessages[1]).toBe(noSendNudgeText);
+    expect(response).toBe("NOTHING_TO_REPORT");
+  });
+
+  it("accepts a silent turn after the nudge and returns its last text", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [
+      [assistantEvent([{ type: "text", text: "Still thinking." }])],
+      [assistantEvent([{ type: "text", text: "Could not send anything." }])],
+    ];
+
+    const response = await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "telegram");
+
+    expect(fakeAgent.promptMessages).toHaveLength(2);
+    expect(fakeAgent.promptMessages[1]).toBe(noSendNudgeText);
+    expect(response).toBe("Could not send anything.");
+  });
+
+  it("does not nudge when the first prompt throws", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptError = new Error("model unreachable");
+
+    await expect(
+      handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "signal"),
+    ).rejects.toThrow("model unreachable");
+
+    expect(fakeAgent.promptMessages).toHaveLength(1);
+  });
+
+  it("does not nudge when the first prompt is aborted", async () => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [[assistantEvent([], "aborted")]];
+    fakeAgent.promptStateErrorMessages = ["aborted"];
+
+    await expect(
+      handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "signal"),
+    ).rejects.toBeInstanceOf(AbortError);
+
+    // The nudge would have been a second prompt, so the abort must have skipped it.
+    expect(fakeAgent.promptMessages).toHaveLength(1);
+  });
+
+  it("surfaces a provider error during the nudge as TurnProgressPersistedError", async () => {
+    setupCommonMocks();
+    mockLoadAgent.mockResolvedValue({
+      id: 2,
+      name: "restricted",
+      systemPrompt: "You are a restricted subagent.",
+      allowedTools: ["manage_cron"],
+      allowedPlugins: [],
+      createdAt: new Date(),
+    });
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    const fullTools = fakeAgent.state.tools;
+    fakeAgent.promptEvents = [[assistantEvent([{ type: "text", text: "Looking into it." }])]];
+    fakeAgent.promptErrors = [undefined, new Error("provider failed")];
+
+    let caughtError: unknown;
+    try {
+      await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "signal");
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(TurnProgressPersistedError);
+    expect((caughtError as Error).message).toBe("provider failed");
+    // The first prompt triggered the nudge, so two prompts were attempted.
+    expect(fakeAgent.promptMessages).toHaveLength(2);
+    expect(fakeAgent.promptMessages[1]).toBe(noSendNudgeText);
+    // The restricted tool list must still be restored on a nudge failure.
+    expect(fakeAgent.state.tools).toBe(fullTools);
+  });
+
+  it("surfaces an abort during the nudge as AbortError and saves the cancellation row", async () => {
+    setupCommonMocks();
+    mockLoadAgent.mockResolvedValue({
+      id: 2,
+      name: "restricted",
+      systemPrompt: "You are a restricted subagent.",
+      allowedTools: ["manage_cron"],
+      allowedPlugins: [],
+      createdAt: new Date(),
+    });
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    const fullTools = fakeAgent.state.tools;
+    fakeAgent.promptEvents = [
+      [assistantEvent([{ type: "text", text: "Looking into it." }])],
+      [assistantEvent([], "aborted")],
+    ];
+    fakeAgent.promptStateErrorMessages = [undefined, "aborted"];
+
+    let caughtError: unknown;
+    try {
+      await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting, "signal");
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(AbortError);
+    expect(fakeAgent.promptMessages).toHaveLength(2);
+    expect(fakeAgent.promptMessages[1]).toBe(noSendNudgeText);
+
+    // The abort path must persist the cancellation marker for the transcript.
+    const cancellationSave = mockSaveMessage.mock.calls.find(
+      (call) => (call[1] as { role: string }).role === "user"
+        && JSON.stringify((call[1] as { content: unknown }).content).includes("cancelled the previous request"),
+    );
+    expect(cancellationSave).toBeDefined();
+
+    expect(fakeAgent.state.tools).toBe(fullTools);
+  });
+
+  it.each([
+    { label: "an agent-triggered subagent turn", source: "agent", routing: subagentRouting },
+    { label: "an email-triggered subagent turn", source: "email", routing: subagentRouting },
+    { label: "a main agent turn", source: "signal", routing: mainAgentRouting },
+  ])("does not nudge $label", async ({ source, routing }) => {
+    setupCommonMocks();
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    fakeAgent.promptEvents = [[assistantEvent([{ type: "text", text: "Report." }])]];
+
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, routing, source);
+
+    expect(fakeAgent.promptMessages).toHaveLength(1);
+  });
+});
+
+describe("handlePrompt — system prompt placement", () => {
+  function setupCommonMocks(): void {
+    vi.clearAllMocks();
+    vi.mocked(loadMessages).mockResolvedValue([]);
+    vi.mocked(loadAllMemories).mockResolvedValue([]);
+    vi.mocked(loadAllScratchpadTitles).mockResolvedValue([]);
+    vi.mocked(getMainAgentId).mockReturnValue(1);
+    vi.mocked(internalFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ plugins: [] }),
+    } as unknown as Response);
+    vi.mocked(getApiKey).mockResolvedValue("test-key");
+    vi.mocked(runSearch).mockResolvedValue({ tableResults: [], messages: [] });
+    vi.mocked(saveMessage).mockResolvedValue(42);
+  }
+
+  it("carries the rebuilt system prompt as the leading system message of the transcript", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, mainAgentRouting);
+
+    // Pi's transcript owns the system prompt now, so it must reach the model as
+    // a system message rather than through the read-only state field.
+    const messages = fakeAgent.state.messages as Array<{ role: string; content: unknown }>;
+    const leadingMessage = messages[0];
+    expect(leadingMessage?.role).toBe("system");
+    const promptText = typeof leadingMessage?.content === "string"
+      ? leadingMessage.content
+      : JSON.stringify(leadingMessage?.content);
+    expect(promptText).toContain(minimalConfig.baseSystemPrompt);
+    expect(promptText).toContain(minimalConfig.publicHostname);
+  });
+});
+
+describe("handlePrompt — per-agent knowledge injection", () => {
+  const subagentRouting = {
+    agentId: 2,
+    senderIdentityId: undefined,
+    senderAgentId: undefined,
+    senderLabel: "test-user",
+    isMainAgent: false,
+  };
+
+  function setupCommonMocks(): void {
+    vi.clearAllMocks();
+    vi.mocked(loadMessages).mockResolvedValue([]);
+    vi.mocked(getMainAgentId).mockReturnValue(1);
+    vi.mocked(internalFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ plugins: [] }),
+    } as unknown as Response);
+    vi.mocked(getApiKey).mockResolvedValue("test-key");
+    vi.mocked(runSearch).mockResolvedValue({ tableResults: [], messages: [] });
+    vi.mocked(saveMessage).mockResolvedValue(42);
+    vi.mocked(loadAgent).mockResolvedValue({
+      id: 2,
+      name: "helper",
+      systemPrompt: "You are a helpful subagent.",
+      allowedTools: [],
+      allowedPlugins: [],
+      createdAt: new Date(),
+    });
+
+    // The DB layer scopes both loaders by agent_id, so the mock returns each
+    // agent only its own rows.
+    vi.mocked(loadAllMemories).mockImplementation((_pool, agentId) => Promise.resolve(
+      agentId === 1
+        ? [{ id: 1, content: "main agent fact", createdAt: new Date(0), updatedAt: new Date(0) }]
+        : [{ id: 2, content: "subagent fact", createdAt: new Date(0), updatedAt: new Date(0) }],
+    ));
+    vi.mocked(loadAllScratchpadTitles).mockImplementation((_pool, agentId) => Promise.resolve(
+      agentId === 1
+        ? [{ id: 11, title: "main agent note" }]
+        : [{ id: 22, title: "subagent note" }],
+    ));
+  }
+
+  function leadingSystemPrompt(agent: unknown): string {
+    const messages = (agent as InstanceType<typeof FakeAgent>).state.messages as Array<{ role: string; content: unknown }>;
+    const leadingMessage = messages[0];
+    expect(leadingMessage?.role).toBe("system");
+    return typeof leadingMessage?.content === "string"
+      ? leadingMessage.content
+      : JSON.stringify(leadingMessage?.content);
+  }
+
+  it("injects only the main agent's memories and scratchpad titles", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, mainAgentRouting);
+
+    expect(loadAllMemories).toHaveBeenCalledWith(expect.anything(), 1);
+    expect(loadAllScratchpadTitles).toHaveBeenCalledWith(expect.anything(), 1);
+
+    const promptText = leadingSystemPrompt(agent);
+    expect(promptText).toContain("main agent fact");
+    expect(promptText).toContain("[Scratchpad 11] main agent note");
+    expect(promptText).not.toContain("subagent fact");
+    expect(promptText).not.toContain("subagent note");
+  });
+
+  it("injects only the subagent's own memories and scratchpad titles", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting);
+
+    expect(loadAllMemories).toHaveBeenCalledWith(expect.anything(), 2);
+    expect(loadAllScratchpadTitles).toHaveBeenCalledWith(expect.anything(), 2);
+
+    const promptText = leadingSystemPrompt(agent);
+    expect(promptText).toContain("subagent fact");
+    expect(promptText).toContain("[Scratchpad 22] subagent note");
+    expect(promptText).not.toContain("main agent fact");
+    expect(promptText).not.toContain("main agent note");
+  });
+});
+
+describe("handlePrompt — TurnProgressPersistedError wrapping", () => {
+  const mockSaveMessage = vi.mocked(saveMessage);
+
+  function setupCommonMocks(): void {
+    vi.clearAllMocks();
+    vi.mocked(loadMessages).mockResolvedValue([]);
+    vi.mocked(loadAllMemories).mockResolvedValue([]);
+    vi.mocked(loadAllScratchpadTitles).mockResolvedValue([]);
+    vi.mocked(getMainAgentId).mockReturnValue(1);
+    vi.mocked(internalFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ plugins: [] }),
+    } as unknown as Response);
+    vi.mocked(getApiKey).mockResolvedValue("test-key");
+    vi.mocked(runSearch).mockResolvedValue({ tableResults: [], messages: [] });
+    mockSaveMessage.mockResolvedValue(42);
+  }
+
+  it("wraps a prompt() throw in TurnProgressPersistedError when an assistant message was already persisted", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+
+    // Model a turn that streams an assistant message_end (which the subscribe
+    // callback persists, setting progressPersistedThisTurn) and then throws.
+    const assistantMessageEnd = {
+      type: "message_end",
+      message: assistantMessage([{ type: "text", text: "partial response" }]),
+    };
+    fakeAgent.eventsBeforeError = [assistantMessageEnd];
+    fakeAgent.promptError = new Error("stream failed mid-turn");
+
+    let caughtError: unknown;
+    try {
+      await handlePrompt(agent, makePool(), "hello", minimalConfig, mainAgentRouting);
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(TurnProgressPersistedError);
+    // The wrapped error preserves the original message so the queue can surface it.
+    expect((caughtError as Error).message).toBe("stream failed mid-turn");
+    // The assistant message must have been persisted before the throw.
+    const assistantSaves = mockSaveMessage.mock.calls.filter(
+      (call) => (call[1] as { role: string }).role === "assistant",
+    );
+    expect(assistantSaves).toHaveLength(1);
+  });
+
+  it("does not wrap a prompt() throw when no progress was persisted", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+
+    // prompt() throws before any assistant/toolResult message_end fires, so no
+    // progress was persisted and the error must escape unwrapped (retryable).
+    fakeAgent.eventsBeforeError = [];
+    fakeAgent.promptError = new Error("model unreachable");
+
+    let caughtError: unknown;
+    try {
+      await handlePrompt(agent, makePool(), "hello", minimalConfig, mainAgentRouting);
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).not.toBeInstanceOf(TurnProgressPersistedError);
+    expect((caughtError as Error).message).toBe("model unreachable");
+  });
+});
+
+describe("handlePrompt — subagent tool restoration", () => {
+  const mockLoadAgent = vi.mocked(loadAgent);
+
+  function setupCommonMocks(): void {
+    vi.clearAllMocks();
+    vi.mocked(loadMessages).mockResolvedValue([]);
+    vi.mocked(loadAllMemories).mockResolvedValue([]);
+    vi.mocked(loadAllScratchpadTitles).mockResolvedValue([]);
+    vi.mocked(getMainAgentId).mockReturnValue(1);
+    vi.mocked(internalFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ plugins: [] }),
+    } as unknown as Response);
+    vi.mocked(runSearch).mockResolvedValue({ tableResults: [], messages: [] });
+    vi.mocked(saveMessage).mockResolvedValue(42);
+  }
+
+  it("restores the full tool list when getApiKey throws after the subagent swap", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    const fullTools = fakeAgent.state.tools;
+    // Sanity check: createAgent populated a real, multi-tool list.
+    expect(fullTools.length).toBeGreaterThan(1);
+
+    // A subagent whose allowedTools filters the full list down to one tool.
+    mockLoadAgent.mockResolvedValue({
+      id: 2,
+      name: "restricted",
+      systemPrompt: "You are a restricted subagent.",
+      allowedTools: ["manage_cron"],
+      allowedPlugins: [],
+      createdAt: new Date(),
+    });
+
+    // getApiKey runs after the tool swap but before the inner try/finally, so
+    // this is the failure path that the old (inner-only) restoration missed.
+    vi.mocked(getApiKey).mockImplementation(async () => {
+      // The filtered list is now in place and is a different, smaller array.
+      expect(fakeAgent.state.tools).not.toBe(fullTools);
+      expect(fakeAgent.state.tools.length).toBeLessThan(fullTools.length);
+      throw new Error("auth failed");
+    });
+
+    const subagentRouting = {
+      agentId: 2,
+      senderIdentityId: undefined,
+      senderAgentId: undefined,
+      senderLabel: "test-user",
+      isMainAgent: false,
+    };
+
+    await expect(
+      handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting),
+    ).rejects.toThrow("auth failed");
+
+    // The outer finally must have restored the exact full-tool-list reference.
+    expect(fakeAgent.state.tools).toBe(fullTools);
+  });
+
+  it("does not swap tools for a subagent with wildcard allowedTools", async () => {
+    setupCommonMocks();
+
+    const agent = await createAgent(minimalConfig, makePool());
+    const fakeAgent = agent as unknown as InstanceType<typeof FakeAgent>;
+    const fullTools = fakeAgent.state.tools;
+
+    mockLoadAgent.mockResolvedValue({
+      id: 2,
+      name: "wildcard",
+      systemPrompt: "You are a wildcard subagent.",
+      allowedTools: ["*"],
+      allowedPlugins: [],
+      createdAt: new Date(),
+    });
+    vi.mocked(getApiKey).mockResolvedValue("test-key");
+
+    const subagentRouting = {
+      agentId: 2,
+      senderIdentityId: undefined,
+      senderAgentId: undefined,
+      senderLabel: "test-user",
+      isMainAgent: false,
+    };
+
+    await handlePrompt(agent, makePool(), "hello", minimalConfig, subagentRouting);
+
+    // Wildcard means no swap happened, so the list is unchanged throughout.
+    expect(fakeAgent.state.tools).toBe(fullTools);
+  });
+});
+
 describe("isTurnBoundary", () => {
-  it("returns true for the first message when it is a user message", () => {
-    const messages: AgentMessage[] = [
-      userMsg(10),
-      assistantMsg(10),
-    ];
-    expect(isTurnBoundary(messages, 0)).toBe(true);
+  const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: {} }]);
+
+  it.each([
+    {
+      label: "the first message is a user message",
+      messages: [userMsg(10), assistantMsg(10)],
+      index: 0,
+      expected: true,
+    },
+    {
+      label: "a user message follows a system message",
+      messages: [{ role: "system", content: "prompt", timestamp: 0 } as unknown as AgentMessage, userMsg(10), assistantMsg(10)],
+      index: 1,
+      expected: true,
+    },
+    {
+      label: "the message is not a user message",
+      messages: [userMsg(10), assistantMsg(10)],
+      index: 1,
+      expected: false,
+    },
+    {
+      label: "a user message follows a text-only assistant message",
+      messages: [userMsg(10), assistantMsg(10), userMsg(10)],
+      index: 2,
+      expected: true,
+    },
+    {
+      label: "a user message follows an assistant message with a toolCall block",
+      messages: [userMsg(10), assistantWithToolCall, userMsg(10)],
+      index: 2,
+      expected: false,
+    },
+    {
+      label: "a user message follows a toolResult message",
+      messages: [userMsg(10), toolResultMessage("execute_sql", "result"), userMsg(10)],
+      index: 2,
+      expected: false,
+    },
+    {
+      label: "two user messages are consecutive",
+      messages: [userMsg(10), userMsg(10)],
+      index: 1,
+      expected: true,
+    },
+  ])("returns $expected when $label", ({ messages, index, expected }) => {
+    expect(isTurnBoundary(messages, index)).toBe(expected);
+  });
+});
+
+describe("formatUserMessage", () => {
+  const mockIsOwnerIdentity = vi.mocked(isOwnerIdentity);
+
+  it("omits the Participant line when no participant is given", () => {
+    const formatted = formatUserMessage("hello", "telegram", "Group chat");
+    expect(formatted).toContain("Source: telegram\nSender: Group chat\nText: hello");
+    expect(formatted).not.toContain("Participant:");
   });
 
-  it("returns false for a non-user message", () => {
-    const messages: AgentMessage[] = [
-      userMsg(10),
-      assistantMsg(10),
-    ];
-    expect(isTurnBoundary(messages, 1)).toBe(false);
+  it("uses the default cli source and unknown sender when both are omitted", () => {
+    const formatted = formatUserMessage("hello");
+    expect(formatted).toContain("Source: cli\nSender: unknown\nText: hello");
+    expect(formatted).not.toContain("Participant:");
   });
 
-  it("returns true for a user message after a text-only assistant message", () => {
-    const messages: AgentMessage[] = [
-      userMsg(10),
-      assistantMsg(10),
-      userMsg(10),
-    ];
-    expect(isTurnBoundary(messages, 2)).toBe(true);
+  it("inserts the Participant line between Sender and Text", () => {
+    mockIsOwnerIdentity.mockReturnValue(false);
+    const formatted = formatUserMessage("hi group", "telegram", "Group chat", { id: "42", name: "Alice" });
+    expect(formatted).toContain("Sender: Group chat\nParticipant: Alice (42)\nText: hi group");
   });
 
-  it("returns false for a user message after an assistant message with a toolCall block", () => {
-    const assistantWithToolCall = assistantMessage([{ type: "toolCall", id: "tc1", name: "execute_sql", arguments: {} }]);
-    const messages: AgentMessage[] = [
-      userMsg(10),
-      assistantWithToolCall,
-      userMsg(10),
-    ];
-    expect(isTurnBoundary(messages, 2)).toBe(false);
-  });
-
-  it("returns false for a user message after a toolResult message", () => {
-    const messages: AgentMessage[] = [
-      userMsg(10),
-      toolResultMessage("execute_sql", "result"),
-      userMsg(10),
-    ];
-    expect(isTurnBoundary(messages, 2)).toBe(false);
-  });
-
-  it("returns true for consecutive user messages", () => {
-    const messages: AgentMessage[] = [
-      userMsg(10),
-      userMsg(10),
-    ];
-    expect(isTurnBoundary(messages, 1)).toBe(true);
+  it.each([true, false])("appends the owner marker only for an owner participant (isOwner: %s)", (isOwner) => {
+    mockIsOwnerIdentity.mockReturnValue(isOwner);
+    const formatted = formatUserMessage("hi group", "telegram", "Group chat", { id: "42", name: "Alice" });
+    expect(formatted).toContain(isOwner ? "Participant: Alice (42) [owner]" : "Participant: Alice (42)\n");
+    expect(formatted.includes("[owner]")).toBe(isOwner);
+    expect(mockIsOwnerIdentity).toHaveBeenCalledWith("telegram", "42");
   });
 });

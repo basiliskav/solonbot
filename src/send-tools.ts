@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import pg from "pg";
-import { Type } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { Type } from "@earendil-works/pi-ai";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Config } from "./config.js";
 import { isInAllowlist } from "./allowlist.js";
 import { resolveRecipient, resolveInterlocutorByName, getMainAgentId } from "./database.js";
@@ -101,7 +101,7 @@ async function checkSubagentRecipientScope(
   const normalize = serviceKey === "email" ? (s: string) => s.toLowerCase() : (s: string) => s;
   const assignedIdentifiers = result.rows.map((row) => normalize(row.identifier));
   if (!assignedIdentifiers.includes(normalize(recipient))) {
-    const errorMessage = `You can only message your assigned interlocutor. If you need to message someone else, ask the main agent (agent ${getMainAgentId()}) via send_agent_message.`;
+    const errorMessage = `You can only message your assigned interlocutor. If you need to message someone else, ask the main agent (agent ${getMainAgentId()}) in your final response.`;
     log.warn(`[solonbot] ${toolName} rejected: subagent ${currentAgentId} attempted to message '${recipient}' on ${serviceKey}, not in assigned identifiers`);
     return toolError(errorMessage);
   }
@@ -140,9 +140,9 @@ export function createSendSignalMessageTool(pool: pg.Pool, config: Config): Agen
   return {
     name: "send_signal_message",
     label: "Send Signal message",
-    description: "Send a message via Signal to a display name or phone number. Can send text, a file attachment (from manage_files or a plugin tool), or both.",
+    description: "Send a message via Signal to a display name, phone number, UUID, or group ID. Can send text, a file attachment (from manage_files or a plugin tool), or both.",
     parameters: Type.Object({
-      recipient: Type.String({ description: "Display name of the recipient (e.g., \"Mom\") or phone number in international format (e.g., \"+1234567890\")." }),
+      recipient: Type.String({ description: "Display name of the recipient (e.g., \"Mom\"), phone number or UUID, or group ID." }),
       message: Type.Optional(Type.String({ description: "Text message to send." })),
       attachmentPath: Type.Optional(Type.String({ description: "File path to an attachment under the temp directory (e.g., from manage_files write or a plugin tool)." })),
     }),
@@ -490,7 +490,7 @@ export function createSendEmailTool(pool: pg.Pool, config: Config): AgentTool {
   return {
     name: "send_email",
     label: "Send email",
-    description: "Send an email to a display name or email address. Sends plain text only.",
+    description: "Send an email to a display name or email address. The body is plain text; a file attachment is optional.",
     parameters: Type.Object({
       recipient: Type.String({ description: "Display name of the recipient (e.g., \"Mom\") or email address (e.g., \"mom@example.com\")." }),
       subject: Type.String({ description: "Email subject line." }),

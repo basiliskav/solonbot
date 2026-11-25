@@ -1,9 +1,11 @@
+import { createHash, timingSafeEqual } from "crypto";
 import http from "http";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 import { loadBundles, getBundles, findBundle, findTool, readJsonFile } from "./bundle-registry.js";
+import { callTool, connect, translateCallToolResult } from "./mcp-client.js";
 import { getPluginUserIds } from "./plugin-user.js";
 import {
   runScript,
@@ -11,6 +13,10 @@ import {
   postCallback,
   setAppPassword,
   isTransportedFile,
+  createRunTempDir,
+  removeRunTempDir,
+  removeLegacyPluginTempDir,
+  removeStaleRunTempDirs,
   TOOL_TIMEOUT_MS,
   ASYNC_TIMEOUT_MS,
   MAX_FILE_TRANSPORT_BYTES,
@@ -20,14 +26,74 @@ import {
   handleUpdate,
   handleRemove,
   handleCreate,
+  handleAddMcp,
   handleConfigure,
   migrateExistingPlugins,
+  migrateGitInstalledMarkers,
   isEditable,
 } from "./plugin-lifecycle.js";
 import type { TransportedFile, ScriptResult } from "./script-runner.js";
 
 const CONFIG_TOML_PATH = "/root/config/config.toml";
 const INSTRUCTIONS_MAX_LENGTH = 5000;
+const SYNC_CALL_TIMED_OUT = Symbol("sync-call-timed-out");
+
+async function waitForSyncCall<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T | typeof SYNC_CALL_TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<typeof SYNC_CALL_TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(SYNC_CALL_TIMED_OUT), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// Returns false and writes a 403 when the plugin is disabled or the tool is not
+// in its permissions list.
+function checkToolPermissions(
+  bundleName: string,
+  bundleDir: string,
+  toolName: string,
+  response: http.ServerResponse,
+): boolean {
+  // Read permissions fresh from config.json so changes take effect without a
+  // restart. Fall back to ["*"] if the value is missing or malformed.
+  const configPath = path.join(bundleDir, "config.json");
+  const rawConfig = readJsonFile(configPath);
+  const configObject =
+    typeof rawConfig === "object" && rawConfig !== null
+      ? (rawConfig as Record<string, unknown>)
+      : {};
+  const rawPermissions = configObject["permissions"];
+  const permissions: string[] =
+    Array.isArray(rawPermissions) && rawPermissions.every((item) => typeof item === "string")
+      ? (rawPermissions as string[])
+      : ["*"];
+
+  if (permissions.length === 0) {
+    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} rejected: plugin is disabled`);
+    response.writeHead(403, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "Plugin is disabled" }));
+    return false;
+  }
+
+  if (!permissions.includes("*") && !permissions.includes(toolName)) {
+    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} rejected: not in permissions list`);
+    response.writeHead(403, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "Tool not permitted" }));
+    return false;
+  }
+
+  return true;
+}
 
 // Loaded once at startup. The process refuses to start if the password cannot be read.
 let appPassword: string | undefined;
@@ -89,7 +155,8 @@ function handleListBundles(response: http.ServerResponse): void {
   const result = getBundles().map((bundle) => ({
     name: bundle.manifest.name,
     description: bundle.manifest.description,
-    editable: isEditable(bundle.manifest.name),
+    type: bundle.type,
+    editable: bundle.type === "mcp" ? false : isEditable(bundle.manifest.name),
     permissions: bundle.permissions,
   }));
 
@@ -97,7 +164,7 @@ function handleListBundles(response: http.ServerResponse): void {
   response.end(JSON.stringify({ plugins: result }));
 }
 
-function handleGetBundle(bundleName: string, response: http.ServerResponse): void {
+async function handleGetBundle(bundleName: string, response: http.ServerResponse): Promise<void> {
   loadBundles();
 
   const bundle = findBundle(bundleName);
@@ -107,7 +174,22 @@ function handleGetBundle(bundleName: string, response: http.ServerResponse): voi
     return;
   }
 
-  const tools = bundle.tools.map((tool) => {
+  let connectionError: string | undefined;
+  if (bundle.type === "mcp") {
+    try {
+      await connect(bundleName);
+    } catch (error) {
+      connectionError = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[solonbot-plugin-runner] Could not connect MCP server for "${bundleName}": ${connectionError}`
+      );
+    }
+    loadBundles();
+  }
+
+  const currentBundle = findBundle(bundleName) ?? bundle;
+
+  const tools = currentBundle.tools.map((tool) => {
     // Omit the entrypoint from the tool manifest in the response — it's an
     // implementation detail that callers don't need.
     const { entrypoint: _entrypoint, ...rest } = tool.manifest;
@@ -115,22 +197,145 @@ function handleGetBundle(bundleName: string, response: http.ServerResponse): voi
   });
 
   const responseBody: Record<string, unknown> = {
-    name: bundle.manifest.name,
-    description: bundle.manifest.description,
-    editable: isEditable(bundle.manifest.name),
-    permissions: bundle.permissions,
+    name: currentBundle.manifest.name,
+    description: currentBundle.manifest.description,
+    type: currentBundle.type,
+    editable: currentBundle.type === "mcp" ? false : isEditable(currentBundle.manifest.name),
+    permissions: currentBundle.permissions,
     tools,
   };
 
-  if (bundle.manifest.instructions !== undefined) {
-    responseBody["instructions"] = bundle.manifest.instructions.slice(0, INSTRUCTIONS_MAX_LENGTH);
+  if (currentBundle.manifest.instructions !== undefined) {
+    responseBody["instructions"] = currentBundle.manifest.instructions.slice(0, INSTRUCTIONS_MAX_LENGTH);
+  }
+
+  if (connectionError !== undefined) {
+    responseBody["error"] = connectionError;
   }
 
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify(responseBody));
 }
 
-async function handleRunTool(
+async function handleRunMcpTool(
+  bundleName: string,
+  toolName: string,
+  body: string,
+  response: http.ServerResponse,
+): Promise<void> {
+  let parsedBody: unknown;
+  try {
+    parsedBody = JSON.parse(body);
+  } catch {
+    response.writeHead(400, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "Body must be a JSON object" }));
+    return;
+  }
+
+  if (typeof parsedBody !== "object" || parsedBody === null || Array.isArray(parsedBody)) {
+    response.writeHead(400, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "Body must be a JSON object" }));
+    return;
+  }
+
+  const args = parsedBody as Record<string, unknown>;
+  const source = `plugin:${bundleName}/${toolName}`;
+
+  console.log(`[solonbot-plugin-runner] Running MCP tool: ${bundleName}/${toolName}`);
+
+  const controller = new AbortController();
+  let totalTimedOut = false;
+  const totalTimer = setTimeout(() => {
+    totalTimedOut = true;
+    controller.abort();
+  }, ASYNC_TIMEOUT_MS);
+
+  // The call starts once; the sync wait and the async continuation share the
+  // same in-flight request.
+  const callPromise = callTool(bundleName, toolName, args, {
+    signal: controller.signal,
+    timeoutMs: ASYNC_TIMEOUT_MS,
+  });
+
+  let syncResult: Awaited<typeof callPromise> | typeof SYNC_CALL_TIMED_OUT;
+  try {
+    syncResult = await waitForSyncCall(callPromise, TOOL_TIMEOUT_MS);
+  } catch (error) {
+    clearTimeout(totalTimer);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error(`[solonbot-plugin-runner] MCP tool ${bundleName}/${toolName} failed: ${errorMessage}`);
+    response.writeHead(500, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ success: false, error: errorMessage }));
+    return;
+  }
+
+  if (syncResult !== SYNC_CALL_TIMED_OUT) {
+    clearTimeout(totalTimer);
+    const translated = translateCallToolResult(syncResult);
+
+    if (!translated.success) {
+      console.error(`[solonbot-plugin-runner] MCP tool ${bundleName}/${toolName} failed: ${translated.error}`);
+      response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ success: false, error: translated.error }));
+      return;
+    }
+
+    const responseBody: Record<string, unknown> = { success: true, output: translated.output };
+    if (translated.files.length > 0) {
+      responseBody["files"] = translated.files;
+    }
+
+    console.log(`[solonbot-plugin-runner] MCP tool ${bundleName}/${toolName} completed successfully`);
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(responseBody));
+    return;
+  }
+
+  console.log(`[solonbot-plugin-runner] MCP tool ${bundleName}/${toolName} still running; responding 202`);
+  response.writeHead(202, { "Content-Type": "application/json" });
+  response.end(JSON.stringify({ status: "running" }));
+
+  void (async (): Promise<void> => {
+    try {
+      const asyncResult = await callPromise;
+      clearTimeout(totalTimer);
+      const translated = translateCallToolResult(asyncResult);
+
+      if (translated.success) {
+        console.log(
+          `[solonbot-plugin-runner] Async MCP tool ${bundleName}/${toolName} completed successfully`
+        );
+        await postCallback(
+          source,
+          `The run of tool "${toolName}" (plugin "${bundleName}") returned:\n\`\`\`\n${translated.output}\n\`\`\``,
+          translated.files,
+        );
+        return;
+      }
+
+      console.error(
+        `[solonbot-plugin-runner] Async MCP tool ${bundleName}/${toolName} failed: ${translated.error}`
+      );
+      await postCallback(
+        source,
+        `The run of tool "${toolName}" (plugin "${bundleName}") failed:\n\`\`\`\n${translated.error}\n\`\`\``
+      );
+    } catch (error) {
+      clearTimeout(totalTimer);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorText = totalTimedOut
+        ? `Tool "${toolName}" (plugin "${bundleName}") exceeded the timeout of ${ASYNC_TIMEOUT_MS / 1000} seconds`
+        : errorMessage;
+      console.error(`[solonbot-plugin-runner] Async MCP tool ${bundleName}/${toolName} failed: ${errorText}`);
+      await postCallback(
+        source,
+        `The run of tool "${toolName}" (plugin "${bundleName}") failed:\n\`\`\`\n${errorText}\n\`\`\``
+      );
+    }
+  })();
+}
+
+export async function handleRunTool(
   bundleName: string,
   toolName: string,
   request: http.IncomingMessage,
@@ -138,11 +343,33 @@ async function handleRunTool(
 ): Promise<void> {
   loadBundles();
 
-  const bundle = findBundle(bundleName);
+  let bundle = findBundle(bundleName);
   if (bundle === null) {
     response.writeHead(404, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: "Bundle not found" }));
     return;
+  }
+
+  if (bundle.type === "mcp") {
+    // A disabled or non-permitted MCP tool must not start its server, so the
+    // permissions check runs before connecting.
+    if (!checkToolPermissions(bundleName, bundle.bundleDir, toolName, response)) {
+      return;
+    }
+
+    // Tool manifests for MCP bundles are empty until the server has been
+    // contacted, so connect before the shared tool lookup.
+    try {
+      await connect(bundleName);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error(`[solonbot-plugin-runner] Could not connect MCP server for "${bundleName}": ${errorMessage}`);
+      response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ success: false, error: `Could not connect to MCP server: ${errorMessage}` }));
+      return;
+    }
+    loadBundles();
+    bundle = findBundle(bundleName) ?? bundle;
   }
 
   const tool = findTool(bundle, toolName);
@@ -161,35 +388,18 @@ async function handleRunTool(
     return;
   }
 
-  // Read permissions fresh from config.json so changes take effect without a
-  // restart. Fall back to ["*"] if the value is missing or malformed.
-  const configPath = path.join(bundle.bundleDir, "config.json");
-  const rawConfig = readJsonFile(configPath);
-  const configObject =
-    typeof rawConfig === "object" && rawConfig !== null
-      ? (rawConfig as Record<string, unknown>)
-      : {};
-  const rawPermissions = configObject["permissions"];
-  const permissions: string[] =
-    Array.isArray(rawPermissions) && rawPermissions.every((item) => typeof item === "string")
-      ? (rawPermissions as string[])
-      : ["*"];
-
-  if (permissions.length === 0) {
-    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} rejected: plugin is disabled`);
-    response.writeHead(403, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ error: "Plugin is disabled" }));
-    return;
-  }
-
-  if (!permissions.includes("*") && !permissions.includes(toolName)) {
-    console.log(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} rejected: not in permissions list`);
-    response.writeHead(403, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ error: "Tool not permitted" }));
+  // MCP bundles already checked permissions before connecting.
+  if (bundle.type !== "mcp" && !checkToolPermissions(bundleName, bundle.bundleDir, toolName, response)) {
     return;
   }
 
   const body = await readRequestBody(request);
+
+  if (bundle.type === "mcp") {
+    await handleRunMcpTool(bundleName, toolName, body, response);
+    return;
+  }
+
   const { toolDir, manifest } = tool;
 
   console.log(
@@ -199,12 +409,19 @@ async function handleRunTool(
   const entrypoint = path.join(toolDir, manifest.entrypoint);
   const { uid, gid } = getPluginUserIds(bundleName);
 
-  const pluginTempDir = `/tmp/${bundleName}`;
-  // Clear any leftover files from previous runs.
-  fs.rmSync(pluginTempDir, { recursive: true, force: true });
-  fs.mkdirSync(pluginTempDir, { recursive: true });
-  // Make it writable by the plugin user.
-  fs.chownSync(pluginTempDir, uid, gid);
+  const runTempDir = createRunTempDir(uid, gid);
+
+  // Every early return after this point must remove the run temp directory.
+  const failRun = (statusCode: number, body: Record<string, unknown>): void => {
+    removeRunTempDir(runTempDir);
+    response.writeHead(statusCode, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(body));
+  };
+
+  const finishRun = (): void => {
+    removeRunTempDir(runTempDir);
+    removeLegacyPluginTempDir(bundleName);
+  };
 
   // Attempt to parse the body as JSON and materialize any file parameters into
   // the temp directory. If parsing fails, pass the raw body through unchanged
@@ -229,26 +446,27 @@ async function handleRunTool(
       }
 
       if (totalBytes > MAX_FILE_TRANSPORT_BYTES) {
-        fs.rmSync(pluginTempDir, { recursive: true, force: true });
-        response.writeHead(413, { "Content-Type": "application/json" });
-        response.end(JSON.stringify({ error: "Input files exceed the maximum allowed size" }));
+        failRun(413, { error: "Input files exceed the maximum allowed size" });
         return;
       }
 
-      for (const [paramName, file] of fileEntries) {
-        const filePath = path.join(pluginTempDir, file.filename);
-        // Reject filenames that escape the temp directory (e.g. "../../../etc/passwd").
-        if (!filePath.startsWith(pluginTempDir + path.sep) && filePath !== pluginTempDir) {
-          fs.rmSync(pluginTempDir, { recursive: true, force: true });
-          response.writeHead(400, { "Content-Type": "application/json" });
-          response.end(JSON.stringify({ error: `Invalid filename in file parameter "${paramName}"` }));
-          return;
+      try {
+        for (const [paramName, file] of fileEntries) {
+          const filePath = path.join(runTempDir, file.filename);
+          // Reject filenames that escape the temp directory (e.g. "../../../etc/passwd").
+          if (!filePath.startsWith(runTempDir + path.sep) && filePath !== runTempDir) {
+            failRun(400, { error: `Invalid filename in file parameter "${paramName}"` });
+            return;
+          }
+          const fileData = Buffer.from(file.data, "base64");
+          fs.writeFileSync(filePath, fileData);
+          fs.chownSync(filePath, uid, gid);
+          params[paramName] = filePath;
+          console.log(`[solonbot-plugin-runner] Materialized input file for param "${paramName}": ${filePath} (${fileData.length} bytes)`);
         }
-        const fileData = Buffer.from(file.data, "base64");
-        fs.writeFileSync(filePath, fileData);
-        fs.chownSync(filePath, uid, gid);
-        params[paramName] = filePath;
-        console.log(`[solonbot-plugin-runner] Materialized input file for param "${paramName}": ${filePath} (${fileData.length} bytes)`);
+      } catch (error) {
+        removeRunTempDir(runTempDir);
+        throw error;
       }
 
       stdinBody = JSON.stringify(params);
@@ -261,12 +479,10 @@ async function handleRunTool(
 
     for (const key of Object.keys(params)) {
       if (!(key in schema)) {
-        fs.rmSync(pluginTempDir, { recursive: true, force: true });
-        response.writeHead(400, { "Content-Type": "application/json" });
-        response.end(JSON.stringify({
+        failRun(400, {
           error: `Unknown parameter: "${key}"`,
           parameters: schema,
-        }));
+        });
         return;
       }
     }
@@ -298,12 +514,10 @@ async function handleRunTool(
       }
 
       if (!typeOk) {
-        fs.rmSync(pluginTempDir, { recursive: true, force: true });
-        response.writeHead(400, { "Content-Type": "application/json" });
-        response.end(JSON.stringify({
+        failRun(400, {
           error: `Parameter "${key}" must be of type "${expectedType}"`,
           parameters: schema,
-        }));
+        });
         return;
       }
     }
@@ -317,11 +531,11 @@ async function handleRunTool(
       const source = `plugin:${bundleName}/${toolName}`;
       let result: ScriptResult;
       try {
-        result = await runScript(entrypoint, toolDir, uid, gid, stdinBody, ASYNC_TIMEOUT_MS);
+        result = await runScript(entrypoint, toolDir, uid, gid, stdinBody, ASYNC_TIMEOUT_MS, runTempDir);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         console.error(`[solonbot-plugin-runner] Async tool ${bundleName}/${toolName} threw unexpectedly: ${errorMessage}`);
-        fs.rmSync(pluginTempDir, { recursive: true, force: true });
+        finishRun();
         await postCallback(
           source,
           `The run of tool "${toolName}" (plugin "${bundleName}") failed:\n\`\`\`\n${errorMessage}\n\`\`\``
@@ -329,9 +543,16 @@ async function handleRunTool(
         return;
       }
 
+      let files: TransportedFile[] = [];
+      try {
+        if (result.success) {
+          files = scanPluginTempDir(runTempDir, bundleName);
+        }
+      } finally {
+        finishRun();
+      }
+
       if (result.success) {
-        const files = scanPluginTempDir(pluginTempDir, bundleName);
-        fs.rmSync(pluginTempDir, { recursive: true, force: true });
         console.log(`[solonbot-plugin-runner] Async tool ${bundleName}/${toolName} completed successfully`);
         await postCallback(
           source,
@@ -344,7 +565,6 @@ async function handleRunTool(
           ? `Tool "${toolName}" (plugin "${bundleName}") exceeded the timeout of ${ASYNC_TIMEOUT_MS / 1000} seconds`
           : (result.error ?? result.output);
         console.error(`[solonbot-plugin-runner] Async tool ${bundleName}/${toolName} failed: ${errorText}`);
-        fs.rmSync(pluginTempDir, { recursive: true, force: true });
         await postCallback(
           source,
           `The run of tool "${toolName}" (plugin "${bundleName}") failed:\n\`\`\`\n${errorText}\n\`\`\``
@@ -355,11 +575,18 @@ async function handleRunTool(
     return;
   }
 
-  const result = await runScript(entrypoint, toolDir, uid, gid, stdinBody, TOOL_TIMEOUT_MS);
+  let result: ScriptResult;
+  let files: TransportedFile[] = [];
+  try {
+    result = await runScript(entrypoint, toolDir, uid, gid, stdinBody, TOOL_TIMEOUT_MS, runTempDir);
+    if (result.success) {
+      files = scanPluginTempDir(runTempDir, bundleName);
+    }
+  } finally {
+    finishRun();
+  }
 
   if (!result.success) {
-    fs.rmSync(pluginTempDir, { recursive: true, force: true });
-
     if (result.spawnFailed === true) {
       console.error(`[solonbot-plugin-runner] Tool ${bundleName}/${toolName} failed to spawn: ${result.error}`);
       response.writeHead(500, { "Content-Type": "application/json" });
@@ -381,9 +608,6 @@ async function handleRunTool(
     response.end(JSON.stringify({ success: false, error: result.error }));
     return;
   }
-
-  const files = scanPluginTempDir(pluginTempDir, bundleName);
-  fs.rmSync(pluginTempDir, { recursive: true, force: true });
 
   let output: unknown;
   try {
@@ -421,11 +645,16 @@ async function handleRequest(
 
   const authHeader = request.headers["authorization"];
   const expectedCredentials = Buffer.from(`:${appPassword}`).toString("base64");
-  if (
-    typeof authHeader !== "string" ||
-    !authHeader.startsWith("Basic ") ||
-    authHeader.slice("Basic ".length) !== expectedCredentials
-  ) {
+  const providedCredentials =
+    typeof authHeader === "string" && authHeader.startsWith("Basic ")
+      ? authHeader.slice("Basic ".length)
+      : "";
+  // Compare sha256 digests so the buffers passed to timingSafeEqual are always
+  // the same length (it throws on length mismatch) and the comparison runs in
+  // constant time to avoid timing-based credential recovery.
+  const providedDigest = createHash("sha256").update(providedCredentials).digest();
+  const expectedDigest = createHash("sha256").update(expectedCredentials).digest();
+  if (!timingSafeEqual(providedDigest, expectedDigest)) {
     response.writeHead(401, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: "Unauthorized" }));
     return;
@@ -439,7 +668,7 @@ async function handleRequest(
 
     const getBundleMatch = url.match(/^\/bundles\/([^/]+)$/);
     if (method === "GET" && getBundleMatch !== null) {
-      handleGetBundle(getBundleMatch[1], response);
+      await handleGetBundle(getBundleMatch[1], response);
       return;
     }
 
@@ -457,6 +686,11 @@ async function handleRequest(
 
     if (method === "POST" && url === "/create") {
       await handleCreate(request, response, readRequestBody);
+      return;
+    }
+
+    if (method === "POST" && url === "/add-mcp") {
+      await handleAddMcp(request, response, readRequestBody);
       return;
     }
 
@@ -492,7 +726,9 @@ async function handleRequest(
 
 async function main(): Promise<void> {
   loadAppPassword();
+  removeStaleRunTempDirs();
   migrateExistingPlugins();
+  migrateGitInstalledMarkers();
   loadBundles();
 
   const server = http.createServer((request: http.IncomingMessage, response: http.ServerResponse): void => {

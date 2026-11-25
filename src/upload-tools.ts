@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Type } from "@mariozechner/pi-ai";
-import type { ImageContent } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { Type } from "@earendil-works/pi-ai";
+import type { ImageContent } from "@earendil-works/pi-ai";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { TEMP_ATTACHMENTS_DIR } from "./temp-dir.js";
 import { log } from "./log.js";
 import { toolError, toolSuccess } from "./tool-result.js";
@@ -22,6 +22,7 @@ Actions:
 
 Constraints:
 - The path must be the full path to the file inside ${TEMP_ATTACHMENTS_DIR}.
+- Uploaded files are deleted automatically after 3 days.
 - Files must be inside the uploads directory; paths outside it are rejected.`;
 
 function inferMimeType(extension: string): string {
@@ -61,7 +62,7 @@ export function createManageUploadsTool(): AgentTool {
         Type.Literal("delete"),
         Type.Literal("help"),
       ], { description: "Action to perform: read, delete, or help." }),
-      path: Type.Optional(Type.String({ description: "The full path to the uploaded file, e.g. /tmp/uploads/upload-abc123.txt. Required for read and delete." })),
+      path: Type.Optional(Type.String({ description: "The full path to the uploaded file, e.g. /tmp/stavrobot-temp/upload-abc123.txt. Required for read and delete." })),
     }),
     execute: async (
       toolCallId: string,

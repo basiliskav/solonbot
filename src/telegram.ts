@@ -1,8 +1,7 @@
-import { randomUUID } from "node:crypto";
 import { Marked, type RendererObject, type Tokens } from "marked";
 import type { TelegramConfig } from "./config.js";
-import { isInAllowlist } from "./allowlist.js";
-import { enqueueMessage } from "./queue.js";
+import { isInAllowlist, recordRejectedSender } from "./allowlist.js";
+import { enqueueMessage, type Participant } from "./queue.js";
 import { saveAttachment, type FileAttachment } from "./uploads.js";
 import { log } from "./log.js";
 
@@ -19,8 +18,25 @@ interface TelegramEntity {
   language?: string;
 }
 
+interface TelegramUser {
+  id: number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+}
+
+// Only the fields the reply quote needs; Telegram's reply_to_message carries a full
+// Message, but chat and the entity lists are irrelevant to a plain-text quote.
+interface TelegramReplyMessage {
+  from?: TelegramUser;
+  text?: string;
+  caption?: string;
+  forum_topic_created?: unknown;
+}
+
 interface TelegramMessage {
-  chat: { id: number };
+  chat: { id: number; type: string; title?: string };
+  from?: TelegramUser;
   text?: string;
   caption?: string;
   entities?: TelegramEntity[];
@@ -29,15 +45,35 @@ interface TelegramMessage {
   audio?: TelegramVoice;
   photo?: Array<{ file_id: string; file_size?: number }>;
   document?: { file_id: string; file_name?: string; mime_type?: string };
+  reply_to_message?: TelegramReplyMessage;
+}
+
+export interface TelegramBotInfo {
+  id: number;
+  username: string;
 }
 
 interface TelegramUpdate {
+  update_id?: number;
   message?: TelegramMessage;
+}
+
+interface GetUpdatesResponse {
+  ok: boolean;
+  error_code?: number;
+  description?: string;
+  result?: TelegramUpdate[];
 }
 
 interface GetFileResponse {
   ok: boolean;
   result: { file_path: string };
+}
+
+interface GetMeResponse {
+  ok: boolean;
+  description?: string;
+  result: TelegramUser;
 }
 
 // Escapes characters that have special meaning in Telegram's HTML parse mode.
@@ -260,55 +296,126 @@ function isTelegramMessage(value: unknown): value is TelegramMessage {
   );
 }
 
-export async function registerTelegramWebhook(config: TelegramConfig, publicHostname: string): Promise<string> {
-  const webhookUrl = `${publicHostname}/telegram/webhook`;
-  const secret = randomUUID();
-  const secretFingerprint = secret.slice(0, 8);
-  log.info("[solonbot] Registering Telegram webhook:", webhookUrl);
+const TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
+// Abort slightly above the long-poll timeout so a half-open connection cannot hang the loop forever.
+const TELEGRAM_POLL_ABORT_MILLISECONDS = 40000;
+const TELEGRAM_POLL_ERROR_RETRY_MILLISECONDS = 5000;
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${config.botToken}/setWebhook`,
+type FetchFunction = (url: string, init?: RequestInit) => Promise<Response>;
+type SleepFunction = (milliseconds: number) => Promise<void>;
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+async function deleteTelegramWebhook(config: TelegramConfig, fetchFunction: FetchFunction): Promise<void> {
+  log.info("[solonbot] Deleting Telegram webhook to enable long polling.");
+
+  const response = await fetchFunction(
+    `https://api.telegram.org/bot${config.botToken}/deleteWebhook`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: webhookUrl, secret_token: secret }),
+      body: JSON.stringify({ drop_pending_updates: false }),
     }
   );
 
   const result = await response.json() as { ok: boolean; description?: string };
 
   if (!result.ok) {
-    throw new Error(`Failed to register Telegram webhook: ${result.description ?? "unknown error"}`);
+    throw new Error(`Failed to delete Telegram webhook: ${result.description ?? "unknown error"}`);
   }
 
-  log.info("[solonbot] Telegram webhook registered successfully.");
+  log.info("[solonbot] Telegram webhook deleted; starting long polling.");
+}
 
-  log.debug(`[solonbot] [debug] setWebhook: url=${webhookUrl}, secret=${secretFingerprint}..., status=${response.status}`);
+async function getTelegramBotInfo(config: TelegramConfig, fetchFunction: FetchFunction): Promise<TelegramBotInfo> {
+  log.info("[solonbot] Fetching Telegram bot identity.");
 
-  // Verify the webhook state Telegram actually stored.
-  if (log.isDebugEnabled()) {
-    const infoResponse = await fetch(
-      `https://api.telegram.org/bot${config.botToken}/getWebhookInfo`
-    );
-    const info = await infoResponse.json() as {
-      ok: boolean;
-      result?: {
-        url?: string;
-        has_custom_certificate?: boolean;
-        pending_update_count?: number;
-        last_error_date?: number;
-        last_error_message?: string;
-      };
-    };
-    if (info.ok && info.result !== undefined) {
-      const r = info.result;
-      log.debug(`[solonbot] [debug] getWebhookInfo: url=${r.url}, pending=${r.pending_update_count}, lastError=${r.last_error_message ?? "none"}, customCert=${r.has_custom_certificate}`);
-    } else {
-      log.debug("[solonbot] [debug] getWebhookInfo: failed or empty result");
+  const response = await fetchFunction(`https://api.telegram.org/bot${config.botToken}/getMe`);
+  const result = await response.json() as GetMeResponse;
+
+  if (!result.ok) {
+    throw new Error(`Failed to fetch Telegram bot identity: ${result.description ?? "unknown error"}`);
+  }
+  if (result.result.username === undefined || result.result.username === "") {
+    throw new Error("Telegram getMe returned no username.");
+  }
+
+  log.info(`[solonbot] Telegram bot identity: @${result.result.username} (${result.result.id}).`);
+  return { id: result.result.id, username: result.result.username };
+}
+
+// Deletes any webhook, then runs the getUpdates loop in the background forever.
+export async function startTelegramPolling(
+  config: TelegramConfig,
+  fetchFunction: FetchFunction = fetch,
+  sleepFunction: SleepFunction = sleep
+): Promise<void> {
+  await deleteTelegramWebhook(config, fetchFunction);
+  const bot = await getTelegramBotInfo(config, fetchFunction);
+  void runTelegramPollingLoop(config, bot, fetchFunction, sleepFunction);
+}
+
+// Long-polls getUpdates and hands each update to the handler, advancing the offset past
+// the last update seen. Errors are logged and retried forever; the loop never exits.
+export async function runTelegramPollingLoop(
+  config: TelegramConfig,
+  bot: TelegramBotInfo,
+  fetchFunction: FetchFunction = fetch,
+  sleepFunction: SleepFunction = sleep
+): Promise<void> {
+  let offset: number | undefined;
+
+  for (;;) {
+    try {
+      const response = await fetchFunction(
+        `https://api.telegram.org/bot${config.botToken}/getUpdates`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            timeout: TELEGRAM_POLL_TIMEOUT_SECONDS,
+            allowed_updates: ["message"],
+            ...(offset !== undefined ? { offset } : {}),
+          }),
+          signal: AbortSignal.timeout(TELEGRAM_POLL_ABORT_MILLISECONDS),
+        }
+      );
+
+      const result = await response.json() as GetUpdatesResponse;
+
+      if (!result.ok) {
+        if (result.error_code === 409) {
+          log.error("[solonbot] Telegram polling conflict (409): another instance is polling getUpdates, or a webhook is still set. Stop the other instance or delete the webhook.");
+        } else {
+          log.error(`[solonbot] Telegram getUpdates failed${result.error_code !== undefined ? ` (${result.error_code})` : ""}: ${result.description ?? "unknown error"}`);
+        }
+        await sleepFunction(TELEGRAM_POLL_ERROR_RETRY_MILLISECONDS);
+        continue;
+      }
+
+      const updates = result.result ?? [];
+      for (const update of updates) {
+        await handleTelegramUpdate(update, config, bot);
+        // Advance per update so that, if a later handler in the batch throws, the
+        // already-enqueued earlier updates are not fetched and replayed again.
+        if (typeof update.update_id === "number") {
+          offset = update.update_id + 1;
+        }
+      }
+    } catch (error) {
+      // Node's fetch wraps socket failures as "fetch failed" with the real reason in cause,
+      // so include the cause code to make transient resets readable without a stack dump.
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const cause = error instanceof Error ? error.cause : undefined;
+      const causeCode = cause instanceof Error && "code" in cause ? String(cause.code) : undefined;
+      log.error(`[solonbot] Telegram polling error: ${errorMessage}${causeCode !== undefined ? ` (${causeCode})` : ""}, retrying in ${TELEGRAM_POLL_ERROR_RETRY_MILLISECONDS / 1000}s`);
+      await sleepFunction(TELEGRAM_POLL_ERROR_RETRY_MILLISECONDS);
     }
   }
-
-  return secret;
 }
 
 async function downloadTelegramFile(config: TelegramConfig, fileId: string): Promise<Buffer> {
@@ -337,12 +444,78 @@ async function downloadTelegramFile(config: TelegramConfig, fileId: string): Pro
 }
 
 
-export async function handleTelegramWebhook(
+// Telegram users may have a full name, only a username, or neither. Build the
+// most human-readable name available, falling back to the numeric id.
+function telegramUserName(from: TelegramUser): string {
+  const fullName = [from.first_name, from.last_name]
+    .filter((part): part is string => part !== undefined && part.trim() !== "")
+    .join(" ")
+    .trim();
+  if (fullName !== "") {
+    return fullName;
+  }
+  if (from.username !== undefined && from.username.trim() !== "") {
+    return from.username;
+  }
+  return String(from.id);
+}
+
+// Mention entity offsets count UTF-16 code units, which is exactly what string indexes
+// are, so a plain slice locates the mentioned text without any conversion.
+export function hasBotMention(
+  text: string | undefined,
+  entities: TelegramEntity[] | undefined,
+  botUsername: string
+): boolean {
+  if (text === undefined || entities === undefined) {
+    return false;
+  }
+  const botMention = `@${botUsername}`.toLowerCase();
+  return entities.some((entity) =>
+    entity.type === "mention" &&
+    text.slice(entity.offset, entity.offset + entity.length).toLowerCase() === botMention
+  );
+}
+
+const MAX_REPLY_QUOTE_LENGTH = 300;
+
+// Slicing by code point rather than by UTF-16 index keeps a surrogate pair, such as an
+// emoji, from being cut in half at the truncation point.
+function truncateReplyQuote(text: string): string {
+  const codePoints = [...text];
+  if (codePoints.length <= MAX_REPLY_QUOTE_LENGTH) {
+    return text;
+  }
+  return `${codePoints.slice(0, MAX_REPLY_QUOTE_LENGTH).join("")}…`;
+}
+
+export function buildReplyQuote(replyTo: TelegramReplyMessage, botId: number): string | undefined {
+  const quotedText = replyTo.text ?? replyTo.caption;
+  if (quotedText === undefined) {
+    return undefined;
+  }
+
+  const author = replyTo.from === undefined
+    ? "unknown"
+    : replyTo.from.id === botId
+      ? "you"
+      : telegramUserName(replyTo.from);
+  // Collapsing every whitespace run also handles a lone carriage return and the Unicode
+  // line separators that Telegram can deliver, so the quote always occupies one line.
+  const singleLine = quotedText.replace(/\s+/g, " ").trim();
+  if (singleLine === "") {
+    return undefined;
+  }
+  return `[In reply to ${author}: "${truncateReplyQuote(singleLine)}"]`;
+}
+
+export async function handleTelegramUpdate(
   body: unknown,
-  config: TelegramConfig
+  config: TelegramConfig,
+  bot: TelegramBotInfo
 ): Promise<void> {
   if (!isTelegramUpdate(body)) {
-    log.debug("[solonbot] Telegram webhook received non-object body, ignoring.");
+    log.debug("[solonbot] Telegram update is not an object, ignoring.");
     return;
   }
 
@@ -362,10 +535,20 @@ export async function handleTelegramWebhook(
   const message = rawMessage;
   const chatId = message.chat.id;
 
+  // Group messages are still routed per chat ID; the participant identifies the
+  // individual member who sent them, and the sender label labels the chat for
+  // the rejected-sender buffer.
+  const isGroupChat = message.chat.type !== "private";
+  const fromName = message.from !== undefined ? telegramUserName(message.from) : String(chatId);
+  const participant: Participant | undefined =
+    isGroupChat && message.from !== undefined ? { id: String(message.from.id), name: fromName } : undefined;
+  const senderLabel = isGroupChat ? message.chat.title ?? String(chatId) : fromName;
+
   const updateType = message.voice || message.audio ? "voice" : message.photo ? "photo" : message.document ? "document" : message.text ? "text" : "unknown";
-  log.debug(`[solonbot] [debug] Webhook accepted: chatId=${chatId}, type=${updateType}`);
+  log.debug(`[solonbot] [debug] Update accepted: chatId=${chatId}, type=${updateType}`);
 
   if (!isInAllowlist("telegram", String(chatId))) {
+    recordRejectedSender("telegram", String(chatId), senderLabel);
     log.info("[solonbot] Telegram message from disallowed chat ID:", chatId);
     return;
   }
@@ -376,6 +559,26 @@ export async function handleTelegramWebhook(
   const formattedCaption = message.caption !== undefined
     ? applyTelegramEntitiesToMarkdown(message.caption, message.caption_entities)
     : undefined;
+
+  const replyTo = message.reply_to_message;
+  // Telegram attaches the topic-creation service message as reply_to_message to every
+  // message in a forum topic, so it never counts as a reply even when the bot created
+  // the topic.
+  const isReply = replyTo !== undefined && replyTo.forum_topic_created === undefined;
+
+  const addressedToBot =
+    hasBotMention(message.text, message.entities, bot.username) ||
+    hasBotMention(message.caption, message.caption_entities, bot.username) ||
+    (isReply && replyTo.from !== undefined && replyTo.from.id === bot.id);
+
+  const replyQuote = isReply ? buildReplyQuote(replyTo, bot.id) : undefined;
+  const messageText = formattedText ?? formattedCaption;
+  // A reply with no text of its own must stay textless: steering carries text only, so a
+  // quote-only text would make an attachment-only owner message lose its file. Commands
+  // are matched on the trimmed text, so a quote in front would turn "/stop" into a prompt.
+  const shouldQuote =
+    replyQuote !== undefined && messageText !== undefined && !messageText.trimStart().startsWith("/");
+  const agentText = shouldQuote ? `${replyQuote}\n${messageText}` : messageText;
 
   const voiceOrAudio = message.voice ?? message.audio;
 
@@ -394,7 +597,7 @@ export async function handleTelegramWebhook(
         mimeType,
         size: buffer.length,
       };
-      void enqueueMessage(formattedText ?? formattedCaption, "telegram", String(chatId), [attachment]);
+      void enqueueMessage(agentText, "telegram", String(chatId), [attachment], undefined, participant, senderLabel, addressedToBot);
     }).catch((error: unknown) => {
       log.error("[solonbot] Error downloading Telegram voice/audio:", error);
     });
@@ -417,7 +620,7 @@ export async function handleTelegramWebhook(
         mimeType,
         size: buffer.length,
       };
-      void enqueueMessage(formattedCaption, "telegram", String(chatId), [attachment]);
+      void enqueueMessage(agentText, "telegram", String(chatId), [attachment], undefined, participant, senderLabel, addressedToBot);
     }).catch((error: unknown) => {
       log.error("[solonbot] Error downloading Telegram photo:", error);
     });
@@ -439,7 +642,7 @@ export async function handleTelegramWebhook(
         mimeType,
         size: buffer.length,
       };
-      void enqueueMessage(formattedCaption, "telegram", String(chatId), [attachment]);
+      void enqueueMessage(agentText, "telegram", String(chatId), [attachment], undefined, participant, senderLabel, addressedToBot);
     }).catch((error: unknown) => {
       log.error("[solonbot] Error downloading Telegram document:", error);
     });
@@ -449,7 +652,7 @@ export async function handleTelegramWebhook(
   if (formattedText !== undefined) {
     log.debug("[solonbot] Telegram text message from chat:", chatId);
     // Fire-and-forget: Telegram requires a fast 200 response, so we don't await.
-    void enqueueMessage(formattedText, "telegram", String(chatId));
+    void enqueueMessage(agentText, "telegram", String(chatId), undefined, undefined, participant, senderLabel, addressedToBot);
     return;
   }
 

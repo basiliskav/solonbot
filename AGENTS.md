@@ -173,8 +173,6 @@ both linting and formatting with good TypeScript ESM support).
 - Do not mention AI in commit messages. Write them as if the human wrote the code.
 - DO NOT REVERT ANY CHANGES. If you notice unrelated changes in the repo, pause and ask
   the user, as they might be changes the user has made.
-- After completing any task that modifies files, ALWAYS run `jj describe -m "..."` with
-  an appropriate message describing the whole change. DO NOT SKIP THIS.
 - When a change fixes a GitHub issue, include `Fixes #<number>` in the commit message
   so the issue is closed automatically when pushed.
 
@@ -184,7 +182,7 @@ both linting and formatting with good TypeScript ESM support).
 they are not related branches and must never be merged. `master` is the application
 source code. `pages` is the documentation/GitHub Pages branch (skills, install guides,
 etc.) served via Cloudflare Pages at `stavrobot.stavros.io`. Changes to one branch have
-no effect on the other. Task tickets (`.tickets/`) only exist on `master`.
+no effect on the other.
 
 ## Coder subsystem
 
@@ -202,6 +200,7 @@ The self-programming feature is split across two containers:
   - `POST /remove` — remove a plugin
   - `POST /configure` — set plugin configuration
   - `POST /create` — create a new empty editable plugin
+  - `POST /add-mcp` — add an MCP server as a plugin
 - **Claude Code container (`coder/`):** Python HTTP server that wraps the `claude`
   headless binary. Receives coding tasks for a specific plugin, runs as that plugin's
   user, and works in `/plugins/<plugin>/`. Posts results back to the main app via
@@ -232,7 +231,7 @@ changes.  This file is the plugin authoring guide used by the coder agent.
 ## Context7
 
 - The LLM agent library used in this project is from the Pi mono repo. The Context7
-  library ID is `/badlogic/pi-mono`.
+  library ID is `/earendil-works/pi`.
 
 ## Deployment model
 
@@ -266,13 +265,14 @@ changes.  This file is the plugin authoring guide used by the coder agent.
 
 ## Pages
 
-- The `pages` table schema: `id` (serial PK), `path` (text), `version` (integer), `mimetype` (text), `data` (BYTEA), `is_public` (boolean, default false), `queries` (JSONB, nullable), `created_at` (timestamptz). Unique constraint on `(path, version)`.
+- The `pages` table schema: `id` (serial PK), `path` (text), `version` (integer), `mimetype` (text), `data` (BYTEA), `is_public` (boolean, default false), `queries` (JSONB, nullable), `mutations` (JSONB, nullable), `created_at` (timestamptz). Unique constraint on `(path, version)`.
 - Versioning model: every edit inserts a new version row; a delete inserts a tombstone (empty data). Old versions are never removed.
 - Pages are served at `GET /pages/<path>` — the latest version is returned. If the latest version is a tombstone (empty data), the page is treated as deleted (404).
 - `is_public` controls auth: false requires authentication, true is publicly accessible.
 - The LLM agent manages pages via the `manage_pages` tool (not `execute_sql`).
 - The `/pages/` prefix is whitelisted in `isPublicRoute` so the route is reachable without a session cookie, but the route handler enforces auth for non-public pages.
 - Named queries: pages can define SQL queries in the `queries` JSONB column, fetchable via `GET /api/pages/<path>/queries/<name>`.
+- Named mutations: pages can define SQL mutations in the `mutations` JSONB column, run via `POST /api/pages/<path>/mutations/<name>`. Mutation endpoints always require auth even for public pages, require a JSON content type (CSRF protection), allow any SQL verb but only a single statement, and are not run in a read-only transaction.
 
 ## General rules
 
@@ -281,9 +281,3 @@ changes.  This file is the plugin authoring guide used by the coder agent.
 - No emojis unless explicitly requested.
 - If unsure what to do, stop and ask for instructions rather than guessing.
 - When adding new features, present a plan and ask for confirmation before implementing.
-- When implementing a feature that involves an architectural decision made during
-  discussion with the user, record it in `DECISIONLOG.md` at the project root. Only
-  record decisions that come from user discussion, not decisions you make yourself. Update
-  this file whenever a new decision is implemented.
-- When finishing a feature, think whether any non-obvious decisions should be put in
-  DECISIONLOG.md or in comments in the code.

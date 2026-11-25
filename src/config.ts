@@ -7,6 +7,10 @@ const COMPACTION_PROMPT_PATH = "prompts/compaction-prompt.txt";
 const COMPACTION_BULLET_PROMPT_PATH = "prompts/compaction-bullet-prompt.txt";
 const AGENT_PROMPT_PATH = "prompts/agent-prompt.txt";
 
+export function getConfigPath(): string {
+  return process.env.CONFIG_PATH || "config.toml";
+}
+
 export interface PostgresConfig {
   host: string;
   port: number;
@@ -17,6 +21,9 @@ export interface PostgresConfig {
 
 export interface CoderConfig {
   model: string;
+  apiKey?: string;
+  baseUrl?: string;
+  oauthToken?: string;
 }
 
 export interface SignalConfig {
@@ -63,6 +70,7 @@ export interface Config {
   contextWindow?: number;
   maxTokens?: number;
   api?: string;
+  reasoning?: boolean;
   publicHostname: string;
   password?: string;
   baseSystemPrompt: string;
@@ -81,22 +89,8 @@ export interface Config {
   owner: OwnerConfig;
 }
 
-export function loadConfig(): Config {
-  const configPath = process.env.CONFIG_PATH || "config.toml";
-  const configContent = fs.readFileSync(configPath, "utf-8");
-  const config = TOML.parse(configContent) as unknown as Config;
-
-  log.info(`[solonbot] Loading base system prompt from ${SYSTEM_PROMPT_PATH}`);
-  config.baseSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_PATH, "utf-8").trimEnd();
-
-  log.info(`[solonbot] Loading compaction prompt from ${COMPACTION_PROMPT_PATH}`);
-  config.compactionPrompt = fs.readFileSync(COMPACTION_PROMPT_PATH, "utf-8").trimEnd();
-
-  log.info(`[solonbot] Loading compaction bullet prompt from ${COMPACTION_BULLET_PROMPT_PATH}`);
-  config.compactionBulletPrompt = fs.readFileSync(COMPACTION_BULLET_PROMPT_PATH, "utf-8").trimEnd();
-
-  log.info(`[solonbot] Loading agent prompt from ${AGENT_PROMPT_PATH}`);
-  config.baseAgentPrompt = fs.readFileSync(AGENT_PROMPT_PATH, "utf-8").trimEnd();
+export function parseConfig(content: string): Config {
+  const config = TOML.parse(content) as unknown as Config;
 
   if (config.apiKey === undefined && config.authFile === undefined) {
     throw new Error("Config must specify either apiKey or authFile.");
@@ -124,6 +118,10 @@ export function loadConfig(): Config {
         `Config api must be one of: ${supportedApis.join(", ")}. Got: "${config.api}".`,
       );
     }
+    if (config.reasoning !== undefined && typeof config.reasoning !== "boolean") {
+      throw new Error("Config reasoning must be a boolean when baseUrl is set.");
+    }
+    config.reasoning = config.reasoning ?? false;
   }
 
   if (config.publicHostname === undefined) {
@@ -145,6 +143,30 @@ export function loadConfig(): Config {
   if (typeof config.owner.name !== "string" || config.owner.name.trim() === "") {
     throw new Error("Config [owner] section must specify a non-empty name.");
   }
+
+  if (typeof config.password !== "string" || config.password.trim() === "") {
+    throw new Error("Config must specify a password.");
+  }
+
+  return config;
+}
+
+export function loadConfig(): Config {
+  const configPath = getConfigPath();
+  const configContent = fs.readFileSync(configPath, "utf-8");
+  const config = parseConfig(configContent);
+
+  log.info(`[solonbot] Loading base system prompt from ${SYSTEM_PROMPT_PATH}`);
+  config.baseSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_PATH, "utf-8").trimEnd();
+
+  log.info(`[solonbot] Loading compaction prompt from ${COMPACTION_PROMPT_PATH}`);
+  config.compactionPrompt = fs.readFileSync(COMPACTION_PROMPT_PATH, "utf-8").trimEnd();
+
+  log.info(`[solonbot] Loading compaction bullet prompt from ${COMPACTION_BULLET_PROMPT_PATH}`);
+  config.compactionBulletPrompt = fs.readFileSync(COMPACTION_BULLET_PROMPT_PATH, "utf-8").trimEnd();
+
+  log.info(`[solonbot] Loading agent prompt from ${AGENT_PROMPT_PATH}`);
+  config.baseAgentPrompt = fs.readFileSync(AGENT_PROMPT_PATH, "utf-8").trimEnd();
 
   return config;
 }

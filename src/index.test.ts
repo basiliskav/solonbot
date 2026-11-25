@@ -1,9 +1,11 @@
 import http from "http";
 import { Readable } from "stream";
 import { describe, it, expect, vi } from "vitest";
-import { handlePageQueryRequest, handleTelegramWebhookRequest, checkBasicAuth, readRequestBody, handleChatRequest } from "./index.js";
+import { handlePageQueryRequest, handlePageMutationRequest, checkBasicAuth, readRequestBody, handleChatRequest, isPublicRoute } from "./index.js";
 import type { Pool, QueryResult } from "pg";
-import type { TelegramConfig } from "./config.js";
+import { log } from "./log.js";
+import { enqueueMessage } from "./queue.js";
+import { saveAttachment } from "./uploads.js";
 
 // Mock queue and uploads so handleChatRequest tests don't need real infrastructure.
 vi.mock("./queue.js", () => ({
@@ -77,27 +79,16 @@ describe("handlePageQueryRequest auth enforcement", () => {
   const pathname = "/api/pages/mypage/queries/myquery";
   const password = "secret";
   const url = new URL("http://localhost/api/pages/mypage/queries/myquery");
+  const unauthorizedRequests: Array<{ label: string; headers: Record<string, string> }> = [
+    { label: "no auth header is provided", headers: {} },
+    {
+      label: "the wrong password is provided",
+      headers: { authorization: `Basic ${Buffer.from("user:wrongpassword").toString("base64")}` },
+    },
+  ];
 
-  it("returns 401 for a private page when no auth header is provided", async () => {
-    const request = makeMockRequest();
-    const response = makeMockResponse();
-    const pool = makeMockPool(false);
-
-    await handlePageQueryRequest(
-      request,
-      response as unknown as http.ServerResponse,
-      pathname,
-      password,
-      pool,
-      url,
-    );
-
-    expect(response.statusCode).toBe(401);
-  });
-
-  it("returns 401 for a private page when wrong password is provided", async () => {
-    const credentials = Buffer.from("user:wrongpassword").toString("base64");
-    const request = makeMockRequest({ authorization: `Basic ${credentials}` });
+  it.each(unauthorizedRequests)("returns 401 for a private page when $label", async ({ headers }) => {
+    const request = makeMockRequest(headers);
     const response = makeMockResponse();
     const pool = makeMockPool(false);
 
@@ -205,89 +196,171 @@ describe("handlePageQueryRequest transaction enforcement", () => {
   });
 });
 
-describe("checkBasicAuth", () => {
-  it("returns false when no authorization header is present", () => {
-    const request = makeMockRequest();
-    expect(checkBasicAuth(request, "secret")).toBe(false);
+// Builds a readable IncomingMessage carrying a JSON body for the mutation endpoint.
+function makeMutationRequest(
+  body: string,
+  headers: Record<string, string> = {},
+  pathname: string = "/api/pages/mypage/mutations/mymutation",
+): http.IncomingMessage {
+  const readable = Readable.from([Buffer.from(body)]);
+  return Object.assign(readable, {
+    headers: { "content-type": "application/json", ...headers },
+    method: "POST",
+    url: pathname,
+  }) as unknown as http.IncomingMessage;
+}
+
+interface MutationPoolOptions {
+  pageRows?: unknown[];
+  execResult?: QueryResult;
+}
+
+// Mock Pool for the mutation handler: the first query() call is the
+// getPageMutationByPath lookup (identified by "mutations->>"), the second is the
+// mutation execution.
+function makeMutationPool(options: MutationPoolOptions = {}): { pool: Pool; queryMock: ReturnType<typeof vi.fn> } {
+  const pageRows = options.pageRows ?? [{ mutation: "UPDATE widgets SET name = 'x'", data: Buffer.from("content") }];
+  const execResult = options.execResult ?? ({ rows: [{ id: 1 }], command: "UPDATE", rowCount: 1 } as unknown as QueryResult);
+  const queryMock = vi.fn().mockImplementation((sql: string) => {
+    if (typeof sql === "string" && sql.includes("mutations->>")) {
+      return Promise.resolve({ rows: pageRows, rowCount: pageRows.length } as unknown as QueryResult);
+    }
+    return Promise.resolve(execResult);
+  });
+  return { pool: { query: queryMock } as unknown as Pool, queryMock };
+}
+
+async function invokeMutation(
+  pool: Pool,
+  body: string = "{}",
+  headers: Record<string, string> = {},
+  pathname: string = "/api/pages/mypage/mutations/mymutation",
+): Promise<MockResponse> {
+  const request = makeMutationRequest(body, headers, pathname);
+  const response = makeMockResponse();
+  await handlePageMutationRequest(request, response as unknown as http.ServerResponse, pathname, pool);
+  return response;
+}
+
+describe("handlePageMutationRequest", () => {
+  it("runs the mutation and returns rowCount and rows", async () => {
+    const { pool, queryMock } = makeMutationPool({
+      execResult: { rows: [{ id: 7 }], command: "UPDATE", rowCount: 1 } as unknown as QueryResult,
+    });
+    const response = await invokeMutation(pool);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe(JSON.stringify({ rowCount: 1, rows: [{ id: 7 }] }));
+    // The execution query is the second pool.query() call (the first is the lookup).
+    expect(queryMock.mock.calls[1][0]).toContain("UPDATE widgets");
+    expect(queryMock.mock.calls[1][1]).toEqual([]);
   });
 
-  it("returns false when the password is wrong", () => {
-    const credentials = Buffer.from("user:wrong").toString("base64");
-    const request = makeMockRequest({ authorization: `Basic ${credentials}` });
-    expect(checkBasicAuth(request, "secret")).toBe(false);
+  it("binds $param:name values from the JSON body", async () => {
+    const { pool, queryMock } = makeMutationPool({
+      pageRows: [{ mutation: "INSERT INTO widgets (a, b) VALUES ($param:first, $param:second)", data: Buffer.from("content") }],
+    });
+    const response = await invokeMutation(pool, JSON.stringify({ first: "hello", second: 42 }));
+
+    expect(response.statusCode).toBe(200);
+    expect(queryMock.mock.calls[1][0]).toBe("INSERT INTO widgets (a, b) VALUES ($1, $2)");
+    expect(queryMock.mock.calls[1][1]).toEqual(["hello", 42]);
   });
 
-  it("returns true when the correct password is provided", () => {
-    const credentials = Buffer.from("user:secret").toString("base64");
-    const request = makeMockRequest({ authorization: `Basic ${credentials}` });
-    expect(checkBasicAuth(request, "secret")).toBe(true);
+  it("returns 400 when a $param:name key is missing from the body", async () => {
+    const { pool, queryMock } = makeMutationPool({
+      pageRows: [{ mutation: "UPDATE widgets SET name = $param:name", data: Buffer.from("content") }],
+    });
+    const response = await invokeMutation(pool, "{}");
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body ?? "{}").error).toContain("name");
+    // The execution query must not run.
+    expect(queryMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { label: "invalid JSON", body: "not json", errorPattern: /Invalid JSON/ },
+    { label: "a non-object JSON body", body: JSON.stringify([1, 2, 3]), errorPattern: /object/i },
+  ])("returns 400 for $label", async ({ body, errorPattern }) => {
+    const { pool } = makeMutationPool();
+    const response = await invokeMutation(pool, body);
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body ?? "{}").error).toMatch(errorPattern);
+  });
+
+  it.each([
+    { label: "is not JSON", contentType: "application/x-www-form-urlencoded" },
+    { label: "is empty", contentType: "" },
+  ])("returns 415 when the content type $label", async ({ contentType }) => {
+    const { pool, queryMock } = makeMutationPool();
+    const response = await invokeMutation(pool, "{}", { "content-type": contentType });
+
+    expect(response.statusCode).toBe(415);
+    // Only the lookup ran; the mutation execution did not.
+    expect(queryMock).toHaveBeenCalledOnce();
+  });
+
+  it("allows a JSON content type with parameters such as charset", async () => {
+    const { pool } = makeMutationPool();
+    const response = await invokeMutation(pool, "{}", { "content-type": "application/json; charset=utf-8" });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("returns 404 when the page or mutation is unknown", async () => {
+    const { pool } = makeMutationPool({ pageRows: [] });
+    const response = await invokeMutation(pool, "{}");
+
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("rejects multi-statement SQL", async () => {
+    const { pool, queryMock } = makeMutationPool({
+      pageRows: [{ mutation: "UPDATE widgets SET name = 'x'; DELETE FROM widgets", data: Buffer.from("content") }],
+    });
+    const response = await invokeMutation(pool, "{}");
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body ?? "{}").error).toMatch(/Multiple SQL statements/);
+    // Only the lookup query ran.
+    expect(queryMock).toHaveBeenCalledOnce();
   });
 });
 
-describe("handleTelegramWebhookRequest secret verification", () => {
-  const telegramConfig: TelegramConfig = {
-    botToken: "test-token",
-  };
-  const webhookSecret = "test-secret-uuid";
-
-  it("returns 403 when the secret header is missing", async () => {
-    const request = makeMockRequest();
-    const response = makeMockResponse();
-
-    await handleTelegramWebhookRequest(
-      request,
-      response as unknown as http.ServerResponse,
-      telegramConfig,
-      webhookSecret,
-    );
-
-    expect(response.statusCode).toBe(403);
+describe("isPublicRoute — page mutations", () => {
+  it("treats POST mutations as non-public even for public pages", () => {
+    expect(isPublicRoute("POST", "/api/pages/public-page/mutations/do_thing")).toBe(false);
   });
 
-  it("returns 403 when the secret header is wrong", async () => {
-    const request = makeMockRequest({ "x-telegram-bot-api-secret-token": "wrong-secret" });
-    const response = makeMockResponse();
-
-    await handleTelegramWebhookRequest(
-      request,
-      response as unknown as http.ServerResponse,
-      telegramConfig,
-      webhookSecret,
-    );
-
-    expect(response.statusCode).toBe(403);
+  it("still treats GET page queries as public with per-page auth", () => {
+    expect(isPublicRoute("GET", "/api/pages/public-page/queries/do_thing")).toBe(true);
   });
 
-  it("does not return 403 when the correct secret header is provided", async () => {
-    const request = {
-      headers: { "x-telegram-bot-api-secret-token": webhookSecret },
-      url: "/telegram/webhook",
-      [Symbol.asyncIterator]: async function* () { yield Buffer.from('{"message":{"chat":{"id":999},"text":"hi"}}'); },
-    } as unknown as http.IncomingMessage;
-    const response = makeMockResponse();
-
-    await handleTelegramWebhookRequest(
-      request,
-      response as unknown as http.ServerResponse,
-      telegramConfig,
-      webhookSecret,
-    );
-
-    expect(response.statusCode).not.toBe(403);
+  it("treats the Telegram webhook route as non-public now that polling is used", () => {
+    expect(isPublicRoute("POST", "/telegram/webhook")).toBe(false);
   });
+});
 
-  it("returns 404 when telegramConfig is undefined", async () => {
-    const request = makeMockRequest({ "x-telegram-bot-api-secret-token": webhookSecret });
-    const response = makeMockResponse();
+describe("checkBasicAuth", () => {
+  const cases: Array<{ label: string; headers: Record<string, string>; expected: boolean }> = [
+    { label: "no authorization header", headers: {}, expected: false },
+    {
+      label: "a wrong password",
+      headers: { authorization: `Basic ${Buffer.from("user:wrong").toString("base64")}` },
+      expected: false,
+    },
+    {
+      label: "the correct password",
+      headers: { authorization: `Basic ${Buffer.from("user:secret").toString("base64")}` },
+      expected: true,
+    },
+  ];
 
-    await handleTelegramWebhookRequest(
-      request,
-      response as unknown as http.ServerResponse,
-      undefined,
-      webhookSecret,
-    );
-
-    expect(response.statusCode).toBe(404);
+  it.each(cases)("returns $expected when given $label", ({ headers, expected }) => {
+    const request = makeMockRequest(headers);
+    expect(checkBasicAuth(request, "secret")).toBe(expected);
   });
 });
 
@@ -299,6 +372,22 @@ function makeBodyRequest(body: Buffer, headers: Record<string, string> = {}): ht
     method: "POST",
     url: "/chat",
   }) as unknown as http.IncomingMessage;
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolvePromise: (value: T) => void = () => {};
+  let rejectPromise: (reason?: unknown) => void = () => {};
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 describe("readRequestBody size limit", () => {
@@ -332,8 +421,7 @@ describe("handleChatRequest body size limit", () => {
 
 describe("handleChatRequest base64 file handling", () => {
   it("saves a small base64 file and returns 200", async () => {
-    const { saveAttachment: mockSaveAttachment } = await import("./uploads.js");
-    const saveMock = vi.mocked(mockSaveAttachment);
+    const saveMock = vi.mocked(saveAttachment);
     saveMock.mockClear();
 
     const smallBase64 = Buffer.from("hello world").toString("base64");
@@ -366,5 +454,224 @@ describe("handleChatRequest base64 file handling", () => {
     await handleChatRequest(request, response as unknown as http.ServerResponse);
 
     expect(response.statusCode).toBe(413);
+  });
+});
+
+describe("handleChatRequest participant, senderLabel, and addressedToBot parsing", () => {
+  it("passes a well-formed participant and senderLabel to enqueueMessage", async () => {
+    const mockEnqueue = vi.mocked(enqueueMessage);
+    mockEnqueue.mockClear();
+
+    const request = makeBodyRequest(Buffer.from(JSON.stringify({
+      message: "hello",
+      source: "telegram",
+      sender: "-100",
+      participant: { id: "42", name: "Alice" },
+      senderLabel: "Group chat",
+    })));
+    const response = makeMockResponse();
+
+    await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      "hello",
+      "telegram",
+      "-100",
+      undefined,
+      undefined,
+      { id: "42", name: "Alice" },
+      "Group chat",
+      undefined,
+    );
+  });
+
+  it("ignores malformed participant and senderLabel values", async () => {
+    const mockEnqueue = vi.mocked(enqueueMessage);
+    mockEnqueue.mockClear();
+
+    const request = makeBodyRequest(Buffer.from(JSON.stringify({
+      message: "hello",
+      participant: { id: 42, name: "Alice" },
+      senderLabel: 7,
+    })));
+    const response = makeMockResponse();
+
+    await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+    expect(mockEnqueue).toHaveBeenCalledWith("hello", undefined, undefined, undefined, undefined, undefined, undefined, undefined);
+  });
+
+  it("passes a literal true addressedToBot to enqueueMessage", async () => {
+    const mockEnqueue = vi.mocked(enqueueMessage);
+    mockEnqueue.mockClear();
+
+    const request = makeBodyRequest(Buffer.from(JSON.stringify({
+      message: "hey bot",
+      source: "signal",
+      sender: "group.abc123",
+      addressedToBot: true,
+    })));
+    const response = makeMockResponse();
+
+    await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      "hey bot",
+      "signal",
+      "group.abc123",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+  });
+
+  for (const { label, value } of [
+    { label: "false", value: false },
+    { label: "string", value: "true" },
+    { label: "number", value: 1 },
+    { label: "null", value: null },
+  ]) {
+    it(`treats a non-true addressedToBot as absent (${label})`, async () => {
+      const mockEnqueue = vi.mocked(enqueueMessage);
+      mockEnqueue.mockClear();
+
+      const request = makeBodyRequest(Buffer.from(JSON.stringify({
+        message: "hello",
+        addressedToBot: value,
+      })));
+      const response = makeMockResponse();
+
+      await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+      expect(mockEnqueue).toHaveBeenCalledWith("hello", undefined, undefined, undefined, undefined, undefined, undefined, undefined);
+    });
+  }
+});
+
+describe("handleChatRequest async acknowledgement", () => {
+  it("acknowledges a request while its queue processing remains pending", async () => {
+    const mockEnqueue = vi.mocked(enqueueMessage);
+    mockEnqueue.mockClear();
+    const deferred = createDeferred<string>();
+    mockEnqueue.mockReturnValueOnce(deferred.promise);
+
+    const request = makeBodyRequest(Buffer.from(JSON.stringify({
+      message: "test",
+      source: "signal",
+      sender: "+1234567890",
+      async: true,
+    })));
+    const response = makeMockResponse();
+
+    await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+    expect(response.statusCode).toBe(202);
+    expect(response.body).toBe(JSON.stringify({ accepted: true }));
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+    expect(mockEnqueue).toHaveBeenCalledWith("test", "signal", "+1234567890", undefined, undefined, undefined, undefined, undefined);
+
+    deferred.resolve("complete");
+  });
+
+  for (const { label, payload } of [
+    { label: "omitted", payload: { message: "test" } },
+    { label: "false", payload: { message: "test", async: false } },
+  ]) {
+    it(`waits for queue processing when async is ${label}`, async () => {
+      const mockEnqueue = vi.mocked(enqueueMessage);
+      mockEnqueue.mockClear();
+      const deferred = createDeferred<string>();
+      mockEnqueue.mockReturnValueOnce(deferred.promise);
+
+      const request = makeBodyRequest(Buffer.from(JSON.stringify(payload)));
+      const response = makeMockResponse();
+      const requestPromise = handleChatRequest(request, response as unknown as http.ServerResponse);
+
+      await vi.waitFor(() => {
+        expect(mockEnqueue).toHaveBeenCalledOnce();
+      });
+      expect(response.statusCode).toBeUndefined();
+
+      deferred.resolve("complete");
+      await requestPromise;
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(JSON.stringify({ response: "complete" }));
+    });
+  }
+
+  for (const { label, asyncValue } of [
+    { label: "string", asyncValue: "true" },
+    { label: "number", asyncValue: 1 },
+    { label: "null", asyncValue: null },
+    { label: "object", asyncValue: {} },
+    { label: "array", asyncValue: [] },
+  ]) {
+    it(`rejects a ${label} async value before file writes or enqueueing`, async () => {
+      const mockEnqueue = vi.mocked(enqueueMessage);
+      const mockSaveAttachment = vi.mocked(saveAttachment);
+      mockEnqueue.mockClear();
+      mockSaveAttachment.mockClear();
+
+      const request = makeBodyRequest(Buffer.from(JSON.stringify({
+        message: "test",
+        async: asyncValue,
+        files: [{ data: Buffer.from("file").toString("base64"), filename: "file.txt", mimeType: "text/plain" }],
+      })));
+      const response = makeMockResponse();
+
+      await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body ?? "{}").error).toMatch(/async.*boolean/i);
+      expect(mockSaveAttachment).not.toHaveBeenCalled();
+      expect(mockEnqueue).not.toHaveBeenCalled();
+    });
+  }
+
+  it("keeps required-content validation for async requests", async () => {
+    const mockEnqueue = vi.mocked(enqueueMessage);
+    mockEnqueue.mockClear();
+    const request = makeBodyRequest(Buffer.from(JSON.stringify({ async: true })));
+    const response = makeMockResponse();
+
+    await handleChatRequest(request, response as unknown as http.ServerResponse);
+
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toBe(JSON.stringify({ error: "At least one of 'message', 'attachments', or 'files' must be present" }));
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it("logs a detached enqueue rejection without sending another response", async () => {
+    const mockEnqueue = vi.mocked(enqueueMessage);
+    mockEnqueue.mockClear();
+    const deferred = createDeferred<string>();
+    mockEnqueue.mockReturnValueOnce(deferred.promise);
+    const error = new Error("queue failed");
+    const logErrorSpy = vi.spyOn(log, "error").mockImplementation(() => {});
+    const request = makeBodyRequest(Buffer.from(JSON.stringify({ message: "test", async: true })));
+    const response = makeMockResponse();
+    const writeHeadSpy = vi.spyOn(response, "writeHead");
+    const endSpy = vi.spyOn(response, "end");
+
+    try {
+      await handleChatRequest(request, response as unknown as http.ServerResponse);
+      deferred.reject(error);
+
+      await vi.waitFor(() => {
+        expect(logErrorSpy).toHaveBeenCalledWith("[solonbot] Error processing asynchronous chat request:", error);
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(response.body).toBe(JSON.stringify({ accepted: true }));
+      expect(writeHeadSpy).toHaveBeenCalledOnce();
+      expect(endSpy).toHaveBeenCalledOnce();
+    } finally {
+      logErrorSpy.mockRestore();
+    }
   });
 });

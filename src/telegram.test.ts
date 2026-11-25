@@ -1,90 +1,124 @@
-import { describe, it, expect } from "vitest";
-import { applyTelegramEntitiesToMarkdown } from "./telegram.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { applyTelegramEntitiesToMarkdown, buildReplyQuote, hasBotMention, startTelegramPolling, runTelegramPollingLoop, handleTelegramUpdate } from "./telegram.js";
+import type { TelegramBotInfo } from "./telegram.js";
+import { enqueueMessage } from "./queue.js";
+import { isInAllowlist, recordRejectedSender } from "./allowlist.js";
+import { log } from "./log.js";
+import type { TelegramConfig } from "./config.js";
+
+// Mock the queue and allowlist so polling tests can assert that updates reach the
+// handler without touching real infrastructure.
+vi.mock("./queue.js", () => ({
+  enqueueMessage: vi.fn().mockResolvedValue("ok"),
+  initializeQueue: vi.fn(),
+}));
+
+vi.mock("./allowlist.js", () => ({
+  isInAllowlist: vi.fn().mockReturnValue(true),
+  recordRejectedSender: vi.fn(),
+}));
+
+vi.mock("./uploads.js", () => ({
+  saveAttachment: vi.fn().mockResolvedValue({ storedPath: "/tmp/stored-attachment" }),
+}));
+
+function jsonResponse(payload: unknown): Response {
+  return { json: async () => payload } as unknown as Response;
+}
 
 describe("applyTelegramEntitiesToMarkdown", () => {
-  it("returns text unchanged when entities is undefined", () => {
-    expect(applyTelegramEntitiesToMarkdown("hello world", undefined)).toBe("hello world");
+  it.each([
+    {
+      label: "bold",
+      text: "hello world",
+      entities: [{ type: "bold", offset: 6, length: 5 }],
+      expected: "hello **world**",
+    },
+    {
+      label: "italic",
+      text: "hello world",
+      entities: [{ type: "italic", offset: 0, length: 5 }],
+      expected: "_hello_ world",
+    },
+    {
+      label: "strikethrough",
+      text: "hello world",
+      entities: [{ type: "strikethrough", offset: 0, length: 11 }],
+      expected: "~~hello world~~",
+    },
+    {
+      label: "inline code",
+      text: "run ls -la now",
+      entities: [{ type: "code", offset: 4, length: 6 }],
+      expected: "run `ls -la` now",
+    },
+    {
+      label: "pre without language",
+      text: "code block",
+      entities: [{ type: "pre", offset: 0, length: 10 }],
+      expected: "```\ncode block\n```",
+    },
+    {
+      label: "pre with language",
+      text: "const x = 1",
+      entities: [{ type: "pre", offset: 0, length: 11, language: "javascript" }],
+      expected: "```javascript\nconst x = 1\n```",
+    },
+    {
+      label: "text_link",
+      text: "click here for more",
+      entities: [{ type: "text_link", offset: 6, length: 4, url: "https://example.com" }],
+      expected: "click [here](https://example.com) for more",
+    },
+    {
+      label: "spoiler",
+      text: "secret text here",
+      entities: [{ type: "spoiler", offset: 0, length: 11 }],
+      expected: "<spoiler>secret text</spoiler> here",
+    },
+    {
+      label: "an entity spanning the entire text",
+      text: "all bold",
+      entities: [{ type: "bold", offset: 0, length: 8 }],
+      expected: "**all bold**",
+    },
+  ])("applies $label formatting", ({ text, entities, expected }) => {
+    expect(applyTelegramEntitiesToMarkdown(text, entities)).toBe(expected);
   });
 
-  it("returns text unchanged when entities is empty", () => {
-    expect(applyTelegramEntitiesToMarkdown("hello world", [])).toBe("hello world");
-  });
-
-  it("applies bold formatting", () => {
-    const result = applyTelegramEntitiesToMarkdown("hello world", [
-      { type: "bold", offset: 6, length: 5 },
-    ]);
-    expect(result).toBe("hello **world**");
-  });
-
-  it("applies italic formatting", () => {
-    const result = applyTelegramEntitiesToMarkdown("hello world", [
-      { type: "italic", offset: 0, length: 5 },
-    ]);
-    expect(result).toBe("_hello_ world");
-  });
-
-  it("applies strikethrough formatting", () => {
-    const result = applyTelegramEntitiesToMarkdown("hello world", [
-      { type: "strikethrough", offset: 0, length: 11 },
-    ]);
-    expect(result).toBe("~~hello world~~");
-  });
-
-  it("applies inline code formatting", () => {
-    const result = applyTelegramEntitiesToMarkdown("run ls -la now", [
-      { type: "code", offset: 4, length: 6 },
-    ]);
-    expect(result).toBe("run `ls -la` now");
-  });
-
-  it("applies pre formatting without language", () => {
-    const result = applyTelegramEntitiesToMarkdown("code block", [
-      { type: "pre", offset: 0, length: 10 },
-    ]);
-    expect(result).toBe("```\ncode block\n```");
-  });
-
-  it("applies pre formatting with language", () => {
-    const result = applyTelegramEntitiesToMarkdown("const x = 1", [
-      { type: "pre", offset: 0, length: 11, language: "javascript" },
-    ]);
-    expect(result).toBe("```javascript\nconst x = 1\n```");
-  });
-
-  it("applies text_link formatting", () => {
-    const result = applyTelegramEntitiesToMarkdown("click here for more", [
-      { type: "text_link", offset: 6, length: 4, url: "https://example.com" },
-    ]);
-    expect(result).toBe("click [here](https://example.com) for more");
-  });
-
-  it("skips text_link when url is missing", () => {
-    const result = applyTelegramEntitiesToMarkdown("click here", [
-      { type: "text_link", offset: 6, length: 4 },
-    ]);
-    expect(result).toBe("click here");
-  });
-
-  it("applies spoiler formatting", () => {
-    const result = applyTelegramEntitiesToMarkdown("secret text here", [
-      { type: "spoiler", offset: 0, length: 11 },
-    ]);
-    expect(result).toBe("<spoiler>secret text</spoiler> here");
-  });
-
-  it("ignores unknown entity types", () => {
-    const result = applyTelegramEntitiesToMarkdown("@username hello", [
-      { type: "mention", offset: 0, length: 9 },
-    ]);
-    expect(result).toBe("@username hello");
-  });
-
-  it("ignores url entity type", () => {
-    const result = applyTelegramEntitiesToMarkdown("visit https://example.com now", [
-      { type: "url", offset: 6, length: 19 },
-    ]);
-    expect(result).toBe("visit https://example.com now");
+  it.each([
+    { label: "entities is undefined", text: "hello world", entities: undefined, expected: "hello world" },
+    { label: "entities is empty", text: "hello world", entities: [], expected: "hello world" },
+    {
+      label: "an entity type is unknown",
+      text: "@username hello",
+      entities: [{ type: "mention", offset: 0, length: 9 }],
+      expected: "@username hello",
+    },
+    {
+      label: "the entity type is url",
+      text: "visit https://example.com now",
+      entities: [{ type: "url", offset: 6, length: 19 }],
+      expected: "visit https://example.com now",
+    },
+    {
+      label: "all entities are of ignored types",
+      text: "@user #tag /cmd",
+      entities: [
+        { type: "mention", offset: 0, length: 5 },
+        { type: "hashtag", offset: 6, length: 4 },
+        { type: "bot_command", offset: 11, length: 4 },
+      ],
+      expected: "@user #tag /cmd",
+    },
+    {
+      label: "a text_link entity has no url",
+      text: "click here",
+      entities: [{ type: "text_link", offset: 6, length: 4 }],
+      expected: "click here",
+    },
+  ])("returns text unchanged when $label", ({ text, entities, expected }) => {
+    expect(applyTelegramEntitiesToMarkdown(text, entities)).toBe(expected);
   });
 
   it("handles multiple non-overlapping entities", () => {
@@ -136,20 +170,554 @@ describe("applyTelegramEntitiesToMarkdown", () => {
     ]);
     expect(result).toBe("\u{1F600} **hello**");
   });
+});
 
-  it("handles entity spanning the entire text", () => {
-    const result = applyTelegramEntitiesToMarkdown("all bold", [
-      { type: "bold", offset: 0, length: 8 },
-    ]);
-    expect(result).toBe("**all bold**");
+describe("handleTelegramUpdate participant and sender label", () => {
+  const config: TelegramConfig = { botToken: "test-token" };
+  const bot: TelegramBotInfo = { id: 999, username: "TestBot" };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it("returns text unchanged when all entities are of ignored types", () => {
-    const result = applyTelegramEntitiesToMarkdown("@user #tag /cmd", [
-      { type: "mention", offset: 0, length: 5 },
-      { type: "hashtag", offset: 6, length: 4 },
-      { type: "bot_command", offset: 11, length: 4 },
-    ]);
-    expect(result).toBe("@user #tag /cmd");
+  it("passes a participant and the chat title for group messages", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada", last_name: "Lovelace" },
+          text: "hello group",
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "hello group",
+      "telegram",
+      "-100123",
+      undefined,
+      undefined,
+      { id: "42", name: "Ada Lovelace" },
+      "The Group",
+      false,
+    );
+  });
+
+  it("does not pass a participant for private messages and labels them with the sender name", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: 12345, type: "private" },
+          from: { id: 12345, first_name: "Owner" },
+          text: "hello privately",
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "hello privately",
+      "telegram",
+      "12345",
+      undefined,
+      undefined,
+      undefined,
+      "Owner",
+      false,
+    );
+  });
+
+  it("falls back to the username, then the id, when building a participant name", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100456, type: "group", title: "Second Group" },
+          from: { id: 7, username: "user_name" },
+          text: "one",
+        },
+      },
+      config,
+      bot,
+    );
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100456, type: "group", title: "Second Group" },
+          from: { id: 8 },
+          text: "two",
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenNthCalledWith(
+      1,
+      "one",
+      "telegram",
+      "-100456",
+      undefined,
+      undefined,
+      { id: "7", name: "user_name" },
+      "Second Group",
+      false,
+    );
+    expect(enqueueMessage).toHaveBeenNthCalledWith(
+      2,
+      "two",
+      "telegram",
+      "-100456",
+      undefined,
+      undefined,
+      { id: "8", name: "8" },
+      "Second Group",
+      false,
+    );
+  });
+
+  it("records a rejected group chat and does not enqueue when the allowlist blocks it", async () => {
+    vi.mocked(isInAllowlist).mockReturnValueOnce(false);
+
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100789, type: "supergroup", title: "Rejected Group" },
+          from: { id: 42, first_name: "Ada" },
+          text: "hello",
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(recordRejectedSender).toHaveBeenCalledWith("telegram", "-100789", "Rejected Group");
+    expect(enqueueMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleTelegramUpdate addressing and reply quotes", () => {
+  const config: TelegramConfig = { botToken: "test-token" };
+  const bot: TelegramBotInfo = { id: 999, username: "TestBot" };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("flags a private message that mentions the bot by username, case-insensitively", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: 12345, type: "private" },
+          from: { id: 12345, first_name: "Owner" },
+          text: "hey @TestBot there",
+          entities: [{ type: "mention", offset: 4, length: 8 }],
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "hey @TestBot there",
+      "telegram",
+      "12345",
+      undefined,
+      undefined,
+      undefined,
+      "Owner",
+      true,
+    );
+  });
+
+  it("does not flag a mention of another user", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada" },
+          text: "hey @Someone there",
+          entities: [{ type: "mention", offset: 4, length: 8 }],
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "hey @Someone there",
+      "telegram",
+      "-100123",
+      undefined,
+      undefined,
+      { id: "42", name: "Ada" },
+      "The Group",
+      false,
+    );
+  });
+
+  it("quotes a reply to another user and does not flag it as addressing the bot", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada" },
+          text: "actual text",
+          reply_to_message: {
+            from: { id: 7, first_name: "Grace" },
+            text: "quoted\nline",
+          },
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "[In reply to Grace: \"quoted line\"]\nactual text",
+      "telegram",
+      "-100123",
+      undefined,
+      undefined,
+      { id: "42", name: "Ada" },
+      "The Group",
+      false,
+    );
+  });
+
+  it("flags a reply to the bot and names the quoted author as you", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada" },
+          text: "thanks",
+          reply_to_message: {
+            from: { id: 999, username: "TestBot" },
+            text: "earlier reply",
+          },
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "[In reply to you: \"earlier reply\"]\nthanks",
+      "telegram",
+      "-100123",
+      undefined,
+      undefined,
+      { id: "42", name: "Ada" },
+      "The Group",
+      true,
+    );
+  });
+
+  it("ignores the forum topic service message Telegram attaches as reply_to_message", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada" },
+          text: "hello topic",
+          reply_to_message: {
+            from: { id: 999, username: "TestBot" },
+            forum_topic_created: { name: "A topic" },
+          },
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "hello topic",
+      "telegram",
+      "-100123",
+      undefined,
+      undefined,
+      { id: "42", name: "Ada" },
+      "The Group",
+      false,
+    );
+  });
+
+  it("does not prepend a quote to a reply whose own text is a command", async () => {
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada" },
+          text: "/stop",
+          reply_to_message: {
+            from: { id: 7, first_name: "Grace" },
+            text: "earlier message",
+          },
+        },
+      },
+      config,
+      bot,
+    );
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      "/stop",
+      "telegram",
+      "-100123",
+      undefined,
+      undefined,
+      { id: "42", name: "Ada" },
+      "The Group",
+      false,
+    );
+  });
+
+  it("keeps an attachment-only reply textless instead of synthesising a quote", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string): Promise<Response> => {
+      if (url.includes("/getFile")) {
+        return jsonResponse({ ok: true, result: { file_path: "files/report.pdf" } });
+      }
+      return { arrayBuffer: async () => new ArrayBuffer(4) } as unknown as Response;
+    }));
+
+    await handleTelegramUpdate(
+      {
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "The Group" },
+          from: { id: 42, first_name: "Ada" },
+          document: { file_id: "file-1" },
+          reply_to_message: {
+            from: { id: 7, first_name: "Grace" },
+            text: "earlier message",
+          },
+        },
+      },
+      config,
+      bot,
+    );
+
+    await vi.waitFor(() => {
+      expect(enqueueMessage).toHaveBeenCalled();
+    });
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      undefined,
+      "telegram",
+      "-100123",
+      expect.any(Array),
+      undefined,
+      { id: "42", name: "Ada" },
+      "The Group",
+      false,
+    );
+  });
+});
+
+describe("buildReplyQuote", () => {
+  it("truncates at 300 code points and keeps a surrogate pair intact", () => {
+    const quote = buildReplyQuote(
+      { from: { id: 7, first_name: "Grace" }, text: `${"a".repeat(299)}\u{1F600}tail` },
+      999,
+    );
+
+    expect(quote).toBe(`[In reply to Grace: "${"a".repeat(299)}\u{1F600}…"]`);
+  });
+
+  it("returns undefined when the replied-to message has neither text nor caption", () => {
+    expect(buildReplyQuote({ from: { id: 7, first_name: "Grace" } }, 999)).toBeUndefined();
+  });
+});
+
+describe("hasBotMention", () => {
+  it("matches a mention entity whose text is the bot's username", () => {
+    expect(
+      hasBotMention("look @TestBot", [{ type: "mention", offset: 5, length: 8 }], "TestBot"),
+    ).toBe(true);
+  });
+
+  it("does not match a prefix of a longer mention", () => {
+    expect(
+      hasBotMention("hi @TestBotExtra", [{ type: "mention", offset: 3, length: 13 }], "TestBot"),
+    ).toBe(false);
+  });
+});
+
+describe("Telegram long polling", () => {
+  const config: TelegramConfig = { botToken: "test-token" };
+  const bot: TelegramBotInfo = { id: 999, username: "TestBot" };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("hands updates to the handler and advances the offset to last update_id + 1", async () => {
+    interface RecordedCall {
+      url: string;
+      body: Record<string, unknown>;
+    }
+    const calls: RecordedCall[] = [];
+    const fetchFunction = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+      calls.push({ url, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+      if (calls.length === 1) {
+        return jsonResponse({
+          ok: true,
+          result: [
+            { update_id: 100, message: { chat: { id: 1, type: "private" }, from: { id: 1, first_name: "Alice" }, text: "first" } },
+            { update_id: 101, message: { chat: { id: 1, type: "private" }, from: { id: 1, first_name: "Alice" }, text: "second" } },
+          ],
+        });
+      }
+      return jsonResponse({ ok: false, error_code: 500, description: "boom" });
+    });
+    const sleepFunction = vi.fn(async (): Promise<void> => {
+      throw new Error("stop");
+    });
+
+    await expect(runTelegramPollingLoop(config, bot, fetchFunction, sleepFunction)).rejects.toThrow("stop");
+
+    expect(enqueueMessage).toHaveBeenCalledTimes(2);
+    expect(enqueueMessage).toHaveBeenNthCalledWith(1, "first", "telegram", "1", undefined, undefined, undefined, "Alice", false);
+    expect(enqueueMessage).toHaveBeenNthCalledWith(2, "second", "telegram", "1", undefined, undefined, undefined, "Alice", false);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].body.offset).toBe(102);
+    expect(calls[1].body.timeout).toBe(30);
+    expect(calls[1].body.allowed_updates).toEqual(["message"]);
+    expect(sleepFunction).toHaveBeenCalledWith(5000);
+  });
+
+  it("retries after a thrown error without losing the offset", async () => {
+    const offsets: unknown[] = [];
+    let callCount = 0;
+    const fetchFunction = vi.fn(async (_url: string, init?: RequestInit): Promise<Response> => {
+      callCount += 1;
+      offsets.push(JSON.parse(String(init?.body)).offset);
+      if (callCount === 1) {
+        throw new Error("network down");
+      }
+      if (callCount === 2) {
+        return jsonResponse({ ok: true, result: [{ update_id: 7, message: { chat: { id: 1, type: "private" }, from: { id: 1, first_name: "Alice" }, text: "hi" } }] });
+      }
+      return jsonResponse({ ok: false, error_code: 500, description: "boom" });
+    });
+    // The first sleep lets the loop retry; the second stops it.
+    let sleepCount = 0;
+    const sleepFunction = vi.fn(async (): Promise<void> => {
+      sleepCount += 1;
+      if (sleepCount >= 2) {
+        throw new Error("stop");
+      }
+    });
+
+    await expect(runTelegramPollingLoop(config, bot, fetchFunction, sleepFunction)).rejects.toThrow("stop");
+
+    expect(fetchFunction).toHaveBeenCalledTimes(3);
+    expect(offsets).toEqual([undefined, undefined, 8]);
+    expect(sleepFunction).toHaveBeenCalledWith(5000);
+  });
+
+  it("advances the offset per update when a later handler in the batch throws", async () => {
+    const enqueueMock = vi.mocked(enqueueMessage);
+    enqueueMock.mockImplementationOnce(async () => "ok");
+    // A synchronous throw becomes a rejection of handleTelegramUpdate's promise.
+    enqueueMock.mockImplementationOnce((): never => {
+      throw new Error("handler boom");
+    });
+
+    const offsets: unknown[] = [];
+    let callCount = 0;
+    const fetchFunction = vi.fn(async (_url: string, init?: RequestInit): Promise<Response> => {
+      callCount += 1;
+      offsets.push(JSON.parse(String(init?.body)).offset);
+      if (callCount === 1) {
+        return jsonResponse({
+          ok: true,
+          result: [
+            { update_id: 10, message: { chat: { id: 1, type: "private" }, from: { id: 1, first_name: "Alice" }, text: "first" } },
+            { update_id: 11, message: { chat: { id: 1, type: "private" }, from: { id: 1, first_name: "Alice" }, text: "second" } },
+          ],
+        });
+      }
+      // Reached only if the loop kept going after the second handler threw.
+      throw new Error("stop");
+    });
+    // The first sleep lets the loop retry after the handler throws; the second stops it.
+    let sleepCount = 0;
+    const sleepFunction = vi.fn(async (): Promise<void> => {
+      sleepCount += 1;
+      if (sleepCount >= 2) {
+        throw new Error("stop-loop");
+      }
+    });
+
+    await expect(runTelegramPollingLoop(config, bot, fetchFunction, sleepFunction)).rejects.toThrow("stop-loop");
+
+    expect(enqueueMock).toHaveBeenCalledTimes(2);
+    expect(fetchFunction).toHaveBeenCalledTimes(2);
+    expect(offsets).toEqual([undefined, 11]);
+  });
+
+  it("logs a clear conflict message when error_code is 409", async () => {
+    const errorSpy = vi.spyOn(log, "error").mockImplementation((): void => {});
+    const fetchFunction = vi.fn(async (): Promise<Response> =>
+      jsonResponse({ ok: false, error_code: 409, description: "Conflict: terminated by other getUpdates request" })
+    );
+    const sleepFunction = vi.fn(async (): Promise<void> => {
+      throw new Error("stop");
+    });
+
+    await expect(runTelegramPollingLoop(config, bot, fetchFunction, sleepFunction)).rejects.toThrow("stop");
+
+    const loggedMessage = String(errorSpy.mock.calls[0][0]);
+    expect(loggedMessage).toMatch(/409/);
+    expect(loggedMessage).toMatch(/another instance/i);
+    errorSpy.mockRestore();
+  });
+
+  it("throws when deleteWebhook fails", async () => {
+    const fetchFunction = vi.fn(async (): Promise<Response> =>
+      jsonResponse({ ok: false, description: "nope" })
+    );
+
+    await expect(startTelegramPolling(config, fetchFunction)).rejects.toThrow(/delete Telegram webhook/);
+  });
+
+  it("throws when getMe fails", async () => {
+    const fetchFunction = vi.fn(async (url: string): Promise<Response> => {
+      if (url.endsWith("/deleteWebhook")) {
+        return jsonResponse({ ok: true, result: true });
+      }
+      return jsonResponse({ ok: false, description: "unauthorized" });
+    });
+
+    await expect(startTelegramPolling(config, fetchFunction)).rejects.toThrow(/bot identity/);
+  });
+
+  it("awaits deleteWebhook and getMe before the first getUpdates", async () => {
+    const order: string[] = [];
+    const fetchFunction = vi.fn(async (url: string): Promise<Response> => {
+      if (url.endsWith("/deleteWebhook")) {
+        order.push("deleteWebhook");
+        return jsonResponse({ ok: true, result: true });
+      }
+      if (url.endsWith("/getMe")) {
+        order.push("getMe");
+        return jsonResponse({ ok: true, result: { id: 999, username: "TestBot" } });
+      }
+      order.push("getUpdates");
+      // Never resolve so the background loop parks without timers.
+      return new Promise<Response>(() => {});
+    });
+
+    await startTelegramPolling(config, fetchFunction);
+
+    await vi.waitFor(() => {
+      expect(order).toContain("getUpdates");
+    });
+    expect(order).toEqual(["deleteWebhook", "getMe", "getUpdates"]);
   });
 });

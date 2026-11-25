@@ -1,6 +1,6 @@
 import fs from "fs";
 import pg from "pg";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { loadPostgresConfig, OWNER_CHANNELS } from "./config.js";
 import { encodeToToon } from "./toon.js";
 import type { OwnerConfig } from "./config.js";
@@ -62,6 +62,12 @@ export async function seedOwner(pool: pg.Pool, ownerConfig: OwnerConfig): Promis
   );
   const seededMainAgentId = agentResult.rows[0].id;
   log.info(`[solonbot] Main agent seeded: id=${seededMainAgentId}`);
+
+  // Explicit ids do not advance the SERIAL sequence, so without this the first
+  // subagent insert would draw id 1 from the sequence and fail with a duplicate key.
+  await pool.query(
+    "SELECT setval(pg_get_serial_sequence('agents', 'id'), (SELECT MAX(id) FROM agents))",
+  );
 
   // Backfill existing messages and compactions that predate the agents system.
   const messagesResult = await pool.query(
@@ -247,8 +253,11 @@ export interface Memory {
   updatedAt: Date;
 }
 
-export async function loadAllMemories(pool: pg.Pool): Promise<Memory[]> {
-  const result = await pool.query("SELECT id, content, created_at, updated_at FROM memories ORDER BY created_at");
+export async function loadAllMemories(pool: pg.Pool, agentId: number): Promise<Memory[]> {
+  const result = await pool.query(
+    "SELECT id, content, created_at, updated_at FROM memories WHERE agent_id = $1 ORDER BY created_at",
+    [agentId],
+  );
   return result.rows.map((row) => ({
     id: row.id as number,
     content: row.content as string,
@@ -257,24 +266,24 @@ export async function loadAllMemories(pool: pg.Pool): Promise<Memory[]> {
   }));
 }
 
-export async function upsertMemory(pool: pg.Pool, id: number | undefined, content: string): Promise<{ id: number; rowCount: number }> {
+export async function upsertMemory(pool: pg.Pool, agentId: number, id: number | undefined, content: string): Promise<{ id: number; rowCount: number }> {
   if (id === undefined) {
     const result = await pool.query(
-      "INSERT INTO memories (content) VALUES ($1) RETURNING id",
-      [content]
+      "INSERT INTO memories (agent_id, content) VALUES ($1, $2) RETURNING id",
+      [agentId, content]
     );
     return { id: result.rows[0].id as number, rowCount: 1 };
   } else {
     const result = await pool.query(
-      "UPDATE memories SET content = $1, updated_at = NOW() WHERE id = $2",
-      [content, id]
+      "UPDATE memories SET content = $1, updated_at = NOW() WHERE id = $2 AND agent_id = $3",
+      [content, id, agentId]
     );
     return { id, rowCount: result.rowCount ?? 0 };
   }
 }
 
-export async function deleteMemory(pool: pg.Pool, id: number): Promise<number> {
-  const result = await pool.query("DELETE FROM memories WHERE id = $1", [id]);
+export async function deleteMemory(pool: pg.Pool, agentId: number, id: number): Promise<number> {
+  const result = await pool.query("DELETE FROM memories WHERE id = $1 AND agent_id = $2", [id, agentId]);
   return result.rowCount ?? 0;
 }
 
@@ -290,6 +299,7 @@ export interface InterlocutorInfo {
   agentId: number;
   isOwner: boolean;
   displayName: string;
+  mentionsOnly: boolean;
 }
 
 export async function resolveInterlocutorByName(
@@ -350,9 +360,10 @@ export async function resolveInterlocutor(
       agent_id: number | null;
       display_name: string;
       identifier: string;
+      mentions_only: boolean;
     }>(
       `SELECT i.id AS interlocutor_id, ii.id AS identity_id, i.agent_id,
-              i.display_name, ii.identifier
+              i.display_name, ii.identifier, i.mentions_only
        FROM interlocutor_identities ii
        JOIN interlocutors i ON i.id = ii.interlocutor_id
        WHERE ii.service = 'email' AND i.enabled = true
@@ -373,6 +384,7 @@ export async function resolveInterlocutor(
       agentId: matchedRow.agent_id,
       isOwner: matchedRow.interlocutor_id === getOwnerInterlocutorId(),
       displayName: matchedRow.display_name,
+      mentionsOnly: matchedRow.mentions_only,
     };
   }
 
@@ -381,8 +393,10 @@ export async function resolveInterlocutor(
     identity_id: number;
     agent_id: number | null;
     display_name: string;
+    mentions_only: boolean;
   }>(
-    `SELECT i.id AS interlocutor_id, ii.id AS identity_id, i.agent_id, i.display_name
+    `SELECT i.id AS interlocutor_id, ii.id AS identity_id, i.agent_id, i.display_name,
+            i.mentions_only
      FROM interlocutor_identities ii
      JOIN interlocutors i ON i.id = ii.interlocutor_id
      WHERE ii.service = $1 AND ii.identifier = $2 AND i.enabled = true`,
@@ -402,6 +416,7 @@ export async function resolveInterlocutor(
     agentId: row.agent_id,
     isOwner: row.interlocutor_id === getOwnerInterlocutorId(),
     displayName: row.display_name,
+    mentionsOnly: row.mentions_only,
   };
 }
 
@@ -422,10 +437,29 @@ export async function loadLatestCompaction(pool: pg.Pool, agentId: number): Prom
 }
 
 export async function saveCompaction(pool: pg.Pool, summary: string, upToMessageId: number, agentId: number): Promise<void> {
-  await pool.query(
-    "INSERT INTO compactions (summary, up_to_message_id, agent_id) VALUES ($1, $2, $3)",
-    [summary, upToMessageId, agentId],
-  );
+  if (summary.trim().length === 0) {
+    throw new Error("saveCompaction: summary must not be empty or whitespace-only");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query<{ id: number }>(
+      "INSERT INTO compactions (summary, up_to_message_id, agent_id) VALUES ($1, $2, $3) RETURNING id",
+      [summary, upToMessageId, agentId],
+    );
+    // Only the latest compaction per agent is ever read, so drop older rows for
+    // this agent in the same transaction. Rows for other agents are untouched.
+    await client.query(
+      "DELETE FROM compactions WHERE agent_id = $1 AND id <> $2",
+      [agentId, result.rows[0].id],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function loadMessages(pool: pg.Pool, agentId: number): Promise<AgentMessage[]> {
@@ -627,11 +661,12 @@ export interface Page {
   data: Buffer;
   isPublic: boolean;
   queries: Record<string, string> | null;
+  mutations: Record<string, string> | null;
 }
 
 export async function getPageByPath(pool: pg.Pool, path: string): Promise<Page | null> {
   const result = await pool.query(
-    "SELECT mimetype, data, is_public, queries FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
+    "SELECT mimetype, data, is_public, queries, mutations FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
     [path],
   );
   if (result.rows.length === 0) {
@@ -648,6 +683,7 @@ export async function getPageByPath(pool: pg.Pool, path: string): Promise<Page |
     data,
     isPublic: row.is_public as boolean,
     queries: row.queries as Record<string, string> | null,
+    mutations: row.mutations as Record<string, string> | null,
   };
 }
 
@@ -679,6 +715,31 @@ export async function getPageQueryByPath(
   };
 }
 
+export async function getPageMutationByPath(
+  pool: pg.Pool,
+  pagePath: string,
+  mutationName: string,
+): Promise<{ mutation: string } | null> {
+  const result = await pool.query(
+    "SELECT mutations->>$2 AS mutation, data FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
+    [pagePath, mutationName],
+  );
+  if (result.rows.length === 0) {
+    return null;
+  }
+  const row = result.rows[0];
+  const data = row.data as Buffer;
+  // An empty data buffer is a tombstone left by deletePage(); treat it as not found.
+  if (data.length === 0) {
+    return null;
+  }
+  const mutation = row.mutation as string | null;
+  if (mutation === null) {
+    return null;
+  }
+  return { mutation };
+}
+
 export async function upsertPage(
   pool: pg.Pool,
   path: string,
@@ -686,6 +747,7 @@ export async function upsertPage(
   content?: string,
   isPublic?: boolean,
   queries?: Record<string, string>,
+  mutations?: Record<string, string>,
 ): Promise<string> {
   // Fetch the latest existing version (if any) to carry forward unchanged fields
   // and to compute the next version number.
@@ -695,8 +757,9 @@ export async function upsertPage(
     data: Buffer;
     is_public: boolean;
     queries: Record<string, string> | null;
+    mutations: Record<string, string> | null;
   }>(
-    "SELECT version, mimetype, data, is_public, queries FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
+    "SELECT version, mimetype, data, is_public, queries, mutations FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
     [path],
   );
 
@@ -706,9 +769,9 @@ export async function upsertPage(
       return "Error: content and mimetype are required when creating a new page.";
     }
     await pool.query(
-      `INSERT INTO pages (path, mimetype, data, is_public, queries, version)
-       VALUES ($1, $2, convert_to($3, 'UTF8'), $4, $5, 1)`,
-      [path, mimetype, content, isPublic ?? false, queries !== undefined ? JSON.stringify(queries) : null],
+      `INSERT INTO pages (path, mimetype, data, is_public, queries, mutations, version)
+       VALUES ($1, $2, convert_to($3, 'UTF8'), $4, $5, $6, 1)`,
+      [path, mimetype, content, isPublic ?? false, queries !== undefined ? JSON.stringify(queries) : null, mutations !== undefined ? JSON.stringify(mutations) : null],
     );
     return `Page created at /pages/${path}`;
   }
@@ -716,27 +779,28 @@ export async function upsertPage(
   const latest = existing.rows[0];
 
   // For updates, at least one field must be provided.
-  if (mimetype === undefined && content === undefined && isPublic === undefined && queries === undefined) {
-    return "Error: no fields to update. Provide at least one of mimetype, content, is_public, or queries.";
+  if (mimetype === undefined && content === undefined && isPublic === undefined && queries === undefined && mutations === undefined) {
+    return "Error: no fields to update. Provide at least one of mimetype, content, is_public, queries, or mutations.";
   }
 
   const nextVersion = latest.version + 1;
   const newMimetype = mimetype ?? latest.mimetype;
   const newIsPublic = isPublic ?? latest.is_public;
   const newQueries = queries !== undefined ? JSON.stringify(queries) : (latest.queries !== null ? JSON.stringify(latest.queries) : null);
+  const newMutations = mutations !== undefined ? JSON.stringify(mutations) : (latest.mutations !== null ? JSON.stringify(latest.mutations) : null);
 
   if (content !== undefined) {
     await pool.query(
-      `INSERT INTO pages (path, mimetype, data, is_public, queries, version)
-       VALUES ($1, $2, convert_to($3, 'UTF8'), $4, $5, $6)`,
-      [path, newMimetype, content, newIsPublic, newQueries, nextVersion],
+      `INSERT INTO pages (path, mimetype, data, is_public, queries, mutations, version)
+       VALUES ($1, $2, convert_to($3, 'UTF8'), $4, $5, $6, $7)`,
+      [path, newMimetype, content, newIsPublic, newQueries, newMutations, nextVersion],
     );
   } else {
     // Carry forward the existing data unchanged.
     await pool.query(
-      `INSERT INTO pages (path, mimetype, data, is_public, queries, version)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [path, newMimetype, latest.data, newIsPublic, newQueries, nextVersion],
+      `INSERT INTO pages (path, mimetype, data, is_public, queries, mutations, version)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [path, newMimetype, latest.data, newIsPublic, newQueries, newMutations, nextVersion],
     );
   }
 
@@ -751,8 +815,9 @@ export async function deletePage(pool: pg.Pool, path: string): Promise<boolean> 
     data: Buffer;
     is_public: boolean;
     queries: Record<string, string> | null;
+    mutations: Record<string, string> | null;
   }>(
-    "SELECT version, mimetype, data, is_public, queries FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
+    "SELECT version, mimetype, data, is_public, queries, mutations FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
     [path],
   );
 
@@ -769,9 +834,9 @@ export async function deletePage(pool: pg.Pool, path: string): Promise<boolean> 
 
   const nextVersion = latest.version + 1;
   await pool.query(
-    `INSERT INTO pages (path, mimetype, data, is_public, queries, version)
-     VALUES ($1, $2, convert_to('', 'UTF8'), $3, $4, $5)`,
-    [path, latest.mimetype, latest.is_public, latest.queries !== null ? JSON.stringify(latest.queries) : null, nextVersion],
+    `INSERT INTO pages (path, mimetype, data, is_public, queries, mutations, version)
+     VALUES ($1, $2, convert_to('', 'UTF8'), $3, $4, $5, $6)`,
+    [path, latest.mimetype, latest.is_public, latest.queries !== null ? JSON.stringify(latest.queries) : null, latest.mutations !== null ? JSON.stringify(latest.mutations) : null, nextVersion],
   );
   return true;
 }
@@ -783,6 +848,7 @@ export interface PageVersion {
   data: string;
   isPublic: boolean;
   queries: Record<string, string> | null;
+  mutations: Record<string, string> | null;
   createdAt: Date;
 }
 
@@ -796,9 +862,10 @@ export async function readPage(pool: pg.Pool, path: string, version?: number): P
       data: string;
       is_public: boolean;
       queries: Record<string, string> | null;
+      mutations: Record<string, string> | null;
       created_at: Date;
     }>(
-      "SELECT path, version, mimetype, convert_from(data, 'UTF8') AS data, is_public, queries, created_at FROM pages WHERE path = $1 AND version = $2",
+      "SELECT path, version, mimetype, convert_from(data, 'UTF8') AS data, is_public, queries, mutations, created_at FROM pages WHERE path = $1 AND version = $2",
       [path, version],
     );
   } else {
@@ -809,9 +876,10 @@ export async function readPage(pool: pg.Pool, path: string, version?: number): P
       data: string;
       is_public: boolean;
       queries: Record<string, string> | null;
+      mutations: Record<string, string> | null;
       created_at: Date;
     }>(
-      "SELECT path, version, mimetype, convert_from(data, 'UTF8') AS data, is_public, queries, created_at FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
+      "SELECT path, version, mimetype, convert_from(data, 'UTF8') AS data, is_public, queries, mutations, created_at FROM pages WHERE path = $1 ORDER BY version DESC LIMIT 1",
       [path],
     );
   }
@@ -826,6 +894,7 @@ export async function readPage(pool: pg.Pool, path: string, version?: number): P
     data: row.data,
     isPublic: row.is_public,
     queries: row.queries,
+    mutations: row.mutations,
     createdAt: row.created_at,
   };
 }
@@ -858,8 +927,9 @@ export async function restorePageVersion(pool: pg.Pool, path: string, version: n
     data: Buffer;
     is_public: boolean;
     queries: Record<string, string> | null;
+    mutations: Record<string, string> | null;
   }>(
-    "SELECT mimetype, data, is_public, queries FROM pages WHERE path = $1 AND version = $2",
+    "SELECT mimetype, data, is_public, queries, mutations FROM pages WHERE path = $1 AND version = $2",
     [path, version],
   );
   if (sourceResult.rows.length === 0) {
@@ -874,9 +944,9 @@ export async function restorePageVersion(pool: pg.Pool, path: string, version: n
   const nextVersion = (maxResult.rows[0].max_version ?? 0) + 1;
 
   await pool.query(
-    `INSERT INTO pages (path, mimetype, data, is_public, queries, version)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [path, source.mimetype, source.data, source.is_public, source.queries !== null ? JSON.stringify(source.queries) : null, nextVersion],
+    `INSERT INTO pages (path, mimetype, data, is_public, queries, mutations, version)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [path, source.mimetype, source.data, source.is_public, source.queries !== null ? JSON.stringify(source.queries) : null, source.mutations !== null ? JSON.stringify(source.mutations) : null, nextVersion],
   );
 
   return `Page '${path}' restored from version ${version} as version ${nextVersion}.`;
@@ -893,10 +963,10 @@ export interface ScratchpadEntry {
   body: string;
 }
 
-export async function readScratchpad(pool: pg.Pool, id: number): Promise<ScratchpadEntry | null> {
+export async function readScratchpad(pool: pg.Pool, agentId: number, id: number): Promise<ScratchpadEntry | null> {
   const result = await pool.query<{ id: number; title: string; body: string }>(
-    "SELECT id, title, body FROM scratchpad WHERE id = $1",
-    [id],
+    "SELECT id, title, body FROM scratchpad WHERE id = $1 AND agent_id = $2",
+    [id, agentId],
   );
   if (result.rows.length === 0) {
     return null;
@@ -909,32 +979,35 @@ export async function readScratchpad(pool: pg.Pool, id: number): Promise<Scratch
   };
 }
 
-export async function loadAllScratchpadTitles(pool: pg.Pool): Promise<ScratchpadTitle[]> {
-  const result = await pool.query("SELECT id, title FROM scratchpad ORDER BY created_at");
+export async function loadAllScratchpadTitles(pool: pg.Pool, agentId: number): Promise<ScratchpadTitle[]> {
+  const result = await pool.query(
+    "SELECT id, title FROM scratchpad WHERE agent_id = $1 ORDER BY created_at",
+    [agentId],
+  );
   return result.rows.map((row) => ({
     id: row.id as number,
     title: row.title as string,
   }));
 }
 
-export async function upsertScratchpad(pool: pg.Pool, id: number | undefined, title: string, body: string): Promise<{ id: number; rowCount: number }> {
+export async function upsertScratchpad(pool: pg.Pool, agentId: number, id: number | undefined, title: string, body: string): Promise<{ id: number; rowCount: number }> {
   if (id === undefined) {
     const result = await pool.query(
-      "INSERT INTO scratchpad (title, body) VALUES ($1, $2) RETURNING id",
-      [title, body],
+      "INSERT INTO scratchpad (agent_id, title, body) VALUES ($1, $2, $3) RETURNING id",
+      [agentId, title, body],
     );
     return { id: result.rows[0].id as number, rowCount: 1 };
   } else {
     const result = await pool.query(
-      "UPDATE scratchpad SET title = $1, body = $2, updated_at = NOW() WHERE id = $3",
-      [title, body, id],
+      "UPDATE scratchpad SET title = $1, body = $2, updated_at = NOW() WHERE id = $3 AND agent_id = $4",
+      [title, body, id, agentId],
     );
     return { id, rowCount: result.rowCount ?? 0 };
   }
 }
 
-export async function deleteScratchpad(pool: pg.Pool, id: number): Promise<number> {
-  const result = await pool.query("DELETE FROM scratchpad WHERE id = $1", [id]);
+export async function deleteScratchpad(pool: pg.Pool, agentId: number, id: number): Promise<number> {
+  const result = await pool.query("DELETE FROM scratchpad WHERE id = $1 AND agent_id = $2", [id, agentId]);
   return result.rowCount ?? 0;
 }
 

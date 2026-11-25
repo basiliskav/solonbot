@@ -1,7 +1,7 @@
 # Architecture
 
 Stavrobot is a single-user LLM-powered assistant (Anthropic Claude by default) exposed
-as an HTTP server. It wraps the `@mariozechner/pi-agent-core` Agent class, persists
+as an HTTP server. It wraps the `@earendil-works/pi-agent-core` Agent class, persists
 conversation history in PostgreSQL, and extends the agent with a plugin system that runs
 arbitrary scripts in isolated Unix user accounts.
 
@@ -19,32 +19,95 @@ arbitrary scripts in isolated Unix user accounts.
 | `pg-backup` | `pgvector/pgvector:pg17` | — | Hourly pg_dump to `./data/db-backups` |
 | `signal-bridge` | `./signal-bridge` | internal:8081 | Signal protocol bridge (optional profile) |
 
-All containers share `./data/main` (read-only) for `config.toml`. The `plugin-runner`
-and `coder` containers share `./data/plugins` and `./cache/plugins`.
+The app mounts `./data/main` read-write at `/app/config` so its configuration editor can
+update `config.toml`. `plugin-runner`, `coder`, `signal-bridge`, and `python-runner`
+mount it read-only and load it only when they start. The `plugin-runner` and `coder`
+containers share `./data/plugins` and `./cache/plugins`.
 
 ---
 
 ## Message flow
 
 ```
-External caller (Telegram / Signal / WhatsApp / email / CLI)
+External caller (Telegram / Signal / WhatsApp / email / Pebble Index / CLI)
   → POST /chat  (or webhook endpoint)
-  → handleChatRequest  (src/index.ts)
+  → request handler  (src/index.ts)
   → enqueueMessage  (src/queue.ts)
   → processQueue  (single-threaded, serialises all turns)
-  → resolveTargetAgent  (allowlist + interlocutor lookup)
-  → handlePrompt  (src/agent.ts)
-  → Agent.prompt  (@mariozechner/pi-agent-core)
+  → resolveTargetAgent  (allowlist + interlocutor lookup + mentions-only gate)
+  → handlePrompt  (src/agent/index.ts)
+  → Agent.prompt  (@earendil-works/pi-agent-core)
   → tool callbacks (execute_sql, manage_plugins, run_plugin_tool, …)
-  → response string returned to caller
+  → response string returned to synchronous callers
 ```
+
+Webhook handlers acknowledge the request before their queued message is processed.
+
+`POST /chat` also accepts an optional boolean `async` field. With `async: true`, the
+handler validates the request and submits it through `enqueueMessage` once, then returns
+`202 {"accepted":true}` without awaiting the turn. When the field is omitted or `false`,
+the caller waits for the normal response string. The async path does not bypass the
+queue, so its serialization, routing, owner-only `/stop`, and owner-steering behavior
+remain the same. A present non-boolean `async` value is rejected before raw file
+attachments are written.
+
+`POST /chat` also accepts two optional fields that channels may supply:
+`participant` (`{ id, name }`, the individual who sent a group message) and
+`senderLabel` (a human-readable platform label for the sender). Malformed values are
+ignored. The participant is threaded through the queue into `formatUserMessage`, which
+adds a `Participant: <name> (<id>)` line between Sender and Text and appends ` [owner]`
+when the participant id matches an owner identity. `senderLabel` is used only to annotate
+rejected senders in the buffer below; it never overrides the Sender line, which is the
+owner-controlled interlocutor display name.
+
+`POST /chat` also accepts an optional boolean `addressedToBot`, which a channel sets when
+the message mentions the bot or replies to one of its messages. Only a literal `true`
+counts; absent or any other value means the message does not address the bot. It feeds
+the mentions-only gate described below. The Telegram channel sets it when a message
+mentions the bot by username or replies to one of the bot's messages.
+
+On Telegram, a message that replies to another gets a one-line
+`[In reply to <author>: "<quoted text>"]` prefix added to its text before it reaches the
+agent, except when the message has no text of its own or its text starts with `/`.
+Attachment-only replies stay textless so the attachment survives steering, and commands
+must keep their exact text. The quoted text has whitespace runs collapsed to one space
+and is truncated at 300 code points; the author reads `you` when the bot wrote the
+replied-to message and `unknown` when it cannot be resolved. A forum topic's
+topic-creation service message is not treated as a reply.
+
+Group messages are routed by the group's channel ID, carried in `sender`: a Telegram group
+uses its negative chat ID and a Signal group uses its group ID. The allowlist and the
+interlocutor lookup match against that ID, so a group is a first-class interlocutor rather
+than a collection of its members. The `Participant` line names the individual member who
+sent the message within the group.
+
+An interlocutor with `mentions_only` set drops messages that do not address the bot. The
+gate runs in `resolveTargetAgent` after the interlocutor lookup and only applies to
+`signal` and `telegram`, the channels that can report a mention; on every other source
+the flag has no effect, because those channels cannot detect a mention and the flag would
+drop everything. Dropped messages are not recorded as rejected senders and log a single
+text-free info line instead of the warn-level unresolved-target line. Owner direct chats
+return earlier in `resolveTargetAgent`, so the flag does not affect them.
 
 Owner messages arriving while a turn is in progress are **steered** into the running
 turn via `Agent.steer()` rather than queued. Non-owner messages are always queued.
 
 The queue is a plain in-memory array (`queue: QueueEntry[]`) with a single `processing`
 boolean flag. It is strictly single-threaded — only one `handlePrompt` call runs at a
-time. Retries: up to 3 attempts with a 30-second delay between them.
+time. `handlePrompt` additionally enforces this with a module-level `handlePromptInProgress`
+flag that throws if re-entered, turning any future queue re-entrancy bug into a loud
+failure instead of silent state corruption.
+
+Retries: up to 3 attempts with a 30-second delay between them. A turn that fails *before*
+any message beyond the initial user row is persisted is retried normally. A turn that
+fails *after* the subscribe callback has persisted an assistant or toolResult message
+throws `TurnProgressPersistedError` from `handlePrompt`; the queue treats this as
+terminal (no retry) because reloading the persisted messages would replay every tool
+side effect that already ran (duplicate outbound messages, duplicate external calls).
+The same applies to other non-retryable failures: `AbortError`, `AuthError`, and
+HTTP 400/401 provider errors bypass the retry loop and resolve with a user-facing
+message. Only 400 and 401 are special-cased; other 4xx errors (e.g. 429 rate
+limits, 403 forbidden) follow the normal retry path.
 
 ---
 
@@ -75,13 +138,22 @@ is sent before the init script runs. The source is `plugin:<plugin>/init`.
 All three callback paths re-enter the queue via `POST /chat` with Basic Auth using the
 app password. The `source` field routes them to the main agent's conversation.
 
+Each callback path (`postCallback` in the plugin-runner, `post_result` in the coder)
+retries the POST with growing backoff (5s, 15s, 30s, 60s, 120s between attempts) on
+network errors and non-2xx responses, so a brief app restart does not silently lose an
+async result. There is no persistent outbox: if every retry fails, the result is logged
+as an error and discarded.
+
 ---
 
 ## Agent setup (src/agent/index.ts)
 
 The single `Agent` instance is created in `createAgent()` and shared across all
-conversations. Per-turn, `handlePrompt()` swaps the conversation history via
-`agent.replaceMessages()` and sets the system prompt via `agent.setSystemPrompt()`.
+conversations. Per-turn, `handlePrompt()` swaps the conversation history and system
+prompt by assigning `agent.state.messages` directly, with the rebuilt system prompt as
+the leading `system` message. Since Pi 0.86 the transcript owns the prompt and
+`agent.state.systemPrompt` is read-only. System messages are never persisted to the
+`messages` table; only user, assistant, and toolResult rows are saved.
 
 ### Main agent identity
 
@@ -90,15 +162,22 @@ The main agent is seeded at startup by `seedOwner()` in `src/database.ts` with a
 database ID is always `1` — this is an invariant of the seed INSERT and must not change.
 After seeding, the ID is cached in a module-level variable and exposed via
 `getMainAgentId()` (also in `src/database.ts`). All routing, permission checks, and
-user-facing strings use `getMainAgentId()` rather than the literal `1`. The only place
-the literal `1` appears is the seed INSERT itself (`src/database.ts`).
+user-facing strings use `getMainAgentId()` rather than the literal `1`. The only places
+the literal `1` appears are the seed INSERT itself (`src/database.ts`) and the baseline
+migration's `memories`/`scratchpad` `agent_id` backfill, which runs before `seedOwner()`
+and therefore cannot call `getMainAgentId()`. Because that migration may run on a database
+that has memory or scratchpad rows but no agents yet, it inserts the same main agent row
+first (`ON CONFLICT (id) DO NOTHING`) so the backfill satisfies the foreign key; the
+`seedOwner()` upsert still sets the final values. Because explicit IDs do not advance the
+`agents.id` sequence, `seedOwner()` then calls `setval` to move the sequence to
+`MAX(id)`, so the first subagent insert does not collide with the main agent.
 
 ### System prompt assembly (per turn)
 - **Main agent**: `baseSystemPrompt` + optional `customPrompt` + timezone/hostname suffix
   + injected memories (full text) + scratchpad titles + plugin list.
 - **Subagent**: `baseAgentPrompt` + timezone/hostname suffix + filtered plugin list
   (only plugins the subagent has access to, with tool-level detail) + subagent's own
-  `system_prompt` from the DB.
+  `system_prompt` from the DB + its own memories (full text) + its own scratchpad titles.
 
 ### Tool filtering for subagents
 Subagents have `allowed_tools TEXT[]` and `allowed_plugins TEXT[]` in the DB.
@@ -106,12 +185,45 @@ Subagents have `allowed_tools TEXT[]` and `allowed_plugins TEXT[]` in the DB.
 restrictions (e.g. `"manage_interlocutors.list"` allows only the `list` action).
 `run_plugin_tool` is controlled exclusively by `allowed_plugins`, not `allowed_tools`.
 The main agent (id=1) always has `allowed_tools = '{*}'` and `allowed_plugins = '{*}'`.
+Subagents never get `send_agent_message`, even if `allowed_tools` lists it. They report
+to the main agent through their final text response (see "Subagent reports" below).
+`manage_knowledge` is always granted to every subagent in full, regardless of
+`allowed_tools`, so each agent can keep private memories and a scratchpad.
+
+### Subagent reports
+When a subagent turn ends successfully, `processQueue` (`src/queue.ts`) forwards the
+final text to the main agent as an agent message (source `"agent"`, sender = the
+subagent's ID). This happens for every trigger: an inbound interlocutor message, a
+message from the main agent, or anything else. A final that is empty or exactly
+`NOTHING_TO_REPORT` (trimmed, case-insensitive) is not forwarded. Failed and aborted
+turns are not forwarded. The forward is enqueued without being awaited, because the
+main agent's turn runs behind the current one in the same queue.
+
+A subagent turn triggered by an inbound chat message (source `signal`, `telegram`, or
+`whatsapp`) is nudged when it ends without any call to `send_signal_message`,
+`send_telegram_message`, `send_whatsapp_message`, or `send_email`, but only if its final
+text is one the queue would forward to the main agent (non-empty and not
+`NOTHING_TO_REPORT`). That catches a reply that was written in the final text by
+mistake. An empty or `NOTHING_TO_REPORT` final is a deliberate silence and is not
+nudged, so a reply is not required. Any send-tool call counts, even if its result is an
+error. The nudge is a system-notice user message prompted once more within the same turn
+(persisted like a steered message). At most one nudge is sent; if the nudged turn still
+makes no send call, the turn is accepted and its last text is returned. Turns triggered
+by `agent`, email, CLI, cron, or any other non-chat source, and all main agent turns, are
+never nudged.
 
 ### Context compaction
-After every turn where `messages.length > 40`, a background task (non-blocking) runs
-`complete()` with the compaction prompt to summarise the oldest messages. The summary is
-stored in `compactions` and prepended as a synthetic user message on the next load.
-A `compactionInProgress` boolean prevents concurrent compaction runs.
+After every turn whose history exceeds the compaction threshold (60% of the effective
+context budget), a background task (non-blocking) runs `escalatingSummarize()` on the
+oldest messages. The summarizer input is first truncated to the compaction threshold, so
+an oversized summary from a previous run cannot grow the compaction row. The summarizer
+tries the compaction prompt; if the result is empty or not shorter than the input it
+retries with a bullet-point prompt, and if that also fails it falls back to deterministic
+truncation capped at 10% of the effective context, keeping the newest material. The summary
+is stored in `compactions` and prepended as a synthetic user message on the next load.
+Each save inserts the new row and deletes that agent's older rows in the same transaction,
+so only the latest compaction per agent is kept. A `compactionInProgress` boolean prevents
+concurrent compaction runs.
 
 ### Context truncation
 `truncateContext()` trims the largest text blocks first (by character count) to fit
@@ -120,7 +232,7 @@ every `Agent.prompt()` call.
 
 ---
 
-## Built-in tools (src/agent.ts)
+## Built-in tools (src/agent/index.ts)
 
 | Tool name | Always present | Conditional |
 |---|---|---|
@@ -134,7 +246,7 @@ every `Agent.prompt()` call.
 | `manage_files` | ✓ | |
 | `manage_interlocutors` | ✓ | |
 | `manage_agents` | ✓ | |
-| `send_agent_message` | ✓ | |
+| `send_agent_message` | ✓ (main agent only) | |
 | `manage_plugins` | ✓ | |
 | `run_plugin_tool` | ✓ | |
 | `request_coding_task` | | `config.coder` present |
@@ -148,13 +260,22 @@ params, and truncated result at `info` level.
 
 ### db_search tool (src/search.ts)
 - Tool name: `db_search`.
-- Searches all public tables with text-like columns via PostgreSQL full-text search
-  (`to_tsvector` / `plainto_tsquery`). Excludes `messages` and `compactions` tables
-  from the table scan.
+- Searches as the agent currently running the turn (`currentAgentId`). Messages and
+  the compaction boundary are scoped to that agent, so no agent ever sees another
+  agent's conversation history.
+- `memories` and `scratchpad` results are always filtered to
+  `agent_id = <searching agent>`, for both the main agent and subagents.
+- The main agent searches all public tables with text-like columns via PostgreSQL
+  full-text search (`to_tsvector` / `plainto_tsquery`). Excludes `messages` and
+  `compactions` tables from the table scan.
+- Subagents skip the generic table scan entirely and search only their own messages,
+  memories, and scratchpad entries.
 - Searches `messages` separately with a JSONB-aware text extraction query.
 - If `config.embeddings` is present (OpenAI API key), also runs a semantic vector
   search on `message_embeddings` and merges results via Reciprocal Rank Fusion (RRF,
   k=60).
+- The automatic pre-turn search in `src/agent/index.ts` calls `runSearch` with the
+  main agent id, so it only returns main-agent knowledge rows.
 - Default limit: 10 rows per table; max: 20.
 
 ---
@@ -171,7 +292,91 @@ Plugins live in `/plugins/<name>/` (shared volume between `plugin-runner` and `c
   <tool-name>/
     manifest.json        # tool manifest (name, description, entrypoint, parameters, async?)
     <entrypoint>         # executable script (any language, run via shebang)
+
+/plugins/.git-installed/<name>   # empty marker file; presence means git-installed (non-editable)
 ```
+
+### Git-installed vs editable plugins
+- A plugin is **editable** unless `plugin-runner` installed it from git. The coder
+  edits editable plugins, so this flag determines whether `manage_plugins update` and
+  the coder may operate on a plugin.
+- Editability is recorded by a marker file at `/plugins/.git-installed/<name>` (the
+  directory is root-owned and not writable by plugin users). `isEditable(name)` is
+  simply "marker does not exist" — the old check for a `.git` directory was wrong,
+  because the coder may run `git init` in an editable plugin.
+- `install` writes the marker once the clone is moved into place and removes it again
+  if a later install step fails and the plugin directory is removed, so the marker
+  only exists while its plugin does. `remove` deletes the marker (force, since editable
+  plugins have none).
+- On startup, if `/plugins/.git-installed/` does not exist it is created and a marker
+  is written for every plugin directory that currently has a `.git` directory (one-time
+  migration for plugins installed before markers existed). Markers are staged in a
+  temporary dot-prefixed directory that is renamed into place once the scan completes,
+  so a crash cannot leave a partial marker directory behind. If the directory already
+  exists, startup does nothing, so a later `git init` does not reclassify a plugin.
+- Directory scans (`loadBundles`, `migrateExistingPlugins`) skip all dot-prefixed
+  entries (`.git-installed`, its temp directory, `.tmp-install-*`); valid plugin names
+  never start with a dot.
+
+### Updating git-installed plugins
+- `update` records `git rev-parse HEAD`, fetches, runs
+  `git remote set-head origin --auto` (so clones without an `origin/HEAD` ref and
+  remotes whose default branch was renamed both resolve), then resets hard to
+  `origin/HEAD` and records HEAD again. It chowns the checkout after the reset on every
+  update, because the reset runs as root and can restore modified or deleted tracked
+  files.
+- If HEAD did not change, `update` returns with `changed: false`. It skips the init
+  script (sync and async), config defaults, and the instructions relay.
+- If HEAD changed, it computes a bounded changelog (`git log --oneline -n 21
+  old..origin/HEAD`, truncated to 20 lines with a note) before the reset, runs the init
+  script (sync or async), applies config defaults, and returns `changed: true` with the
+  short `from` and `to` hashes. It includes the `instructions` field only when the
+  manifest's `instructions` value differs from the pre-update manifest, along with the
+  relay-instructions line.
+- `manage_plugins` appends the `instructions` text to the tool result (under "Setup
+  instructions:"), so the agent can relay instructions from both install and update
+  responses.
+- If the sync init fails, `update` resets the checkout back to the pre-update commit
+  (and re-chowns it) before returning 500, so the next update still sees a change and
+  retries the init. Async init failures are reported through the callback and do not
+  roll back the checkout.
+
+### MCP plugins
+- A plugin can wrap an MCP (Model Context Protocol) server instead of scripts: its
+  `manifest.json` declares `"type": "mcp"`, and its tools come from the live server, not
+  from tool directories. The plugin directory holds `manifest.json` and `config.json`
+  (`permissions`, plus the server spec under the single `server` key), and may also hold
+  files a server needs, such as copied credentials.
+- Supported spec shapes (an object or a JSON string is accepted; a Claude Desktop
+  `"type": "stdio" | "http"` key is accepted and ignored, `command` vs `url` selects the
+  transport, and unknown fields and non-http(s) URLs are rejected):
+  - stdio: `{ "command": string, "args"?: string[], "env"?: Record<string, string> }`
+  - streamable HTTP: `{ "url": string, "headers"?: Record<string, string> }`
+- The spec usually contains secrets, so it can be written but is never returned to the
+  agent. `configure` with `server` replaces the spec and disconnects the current
+  connection, so the next use reconnects with the new spec.
+- Stdio servers run as the plugin's user: the transport starts
+  `setpriv --reuid=<uid> --regid=<gid> --clear-groups -- /usr/bin/env -- <spec env> <command> <args>`,
+  with `cwd` and `HOME` set to the plugin directory. The spec's `env` is applied only
+  after the privilege drop, so it cannot influence the launcher.
+- Connections are on demand: the first tool call or detail request opens the transport,
+  runs `listTools`, and caches the tools in memory; `add_mcp` and `update` also connect
+  explicitly. `GET /bundles` (the listing) never connects and reports cached tools only;
+  `GET /bundles/<name>` connects when needed and returns an `error` field if the server is
+  unreachable. Connecting is bounded by the 30-second tool timeout. `update` disconnects
+  and reconnects, refreshing the tool list; `remove` disconnects too.
+- Permissions are checked before connecting, so a disabled or non-permitted tool never
+  starts a server. A call that finishes within 30 seconds returns normally; a longer one
+  returns `202` and its result or failure is posted back with `postCallback()` under
+  `plugin:<name>/<tool>`. The whole call is capped at 5 minutes. MCP tool manifests are
+  always marked async, so `run_plugin_tool` refuses to batch them.
+- MCP plugins are never editable, so the coder refuses to work on them. `add_mcp` (app
+  route `POST /api/settings/plugins/add-mcp`, proxied to plugin-runner `POST /add-mcp`)
+  creates the plugin even if the first connection fails, and warns that the spec needs
+  fixing; `update` retries.
+- Dependency: `@modelcontextprotocol/client` (pinned `2.3.1`), plugin-runner's only
+  runtime dependency; the stdio transport comes from its `/stdio` subpath.
+- Non-goals: MCP resources, prompts, OAuth, and the deprecated HTTP+SSE transport.
 
 ### Security isolation
 - Each plugin gets a dedicated system user `plug_<name>` (UID/GID created by
@@ -181,16 +386,41 @@ Plugins live in `/plugins/<name>/` (shared volume between `plugin-runner` and `c
 - Scripts are spawned with `spawn(entrypoint, [], { uid, gid })` — never as root.
 - `config.json` is never returned to the LLM agent; only key presence/absence is
   reported. The `permissions` key in `config.json` is set via the web UI only.
+- The app's plugin config proxy (`GET /api/settings/plugins/<name>/config`) likewise
+  never returns config values to the browser: it rewrites the plugin-runner response to
+  `{ schema, set }`, where `schema` holds only each key's description/required flag
+  (manifest defaults are stripped) and `set` is a boolean per key. Saving still goes
+  through `POST /configure`, which accepts values and merges them server-side.
 - The Docker socket is never mounted into any container.
 
 ### Tool execution (sync)
 - `plugin-runner` receives `POST /bundles/<plugin>/tools/<tool>/run` with JSON body.
+- `run_plugin_tool` accepts either a single parameter object or a JSON array of them.
+  An array runs the tool once per item, sequentially, and returns one result with each
+  call numbered (1-based). A failed call does not stop the rest of the batch.
+  File-type parameters are resolved per item. Arrays are rejected for async tools; empty
+  arrays return an error.
+- Each run gets a fresh `/tmp/stavrobot-run-<uuid>/` directory, owned by the plugin
+  user and mode 700, so overlapping runs of the same plugin cannot interfere.
 - Parameters of type `"file"` are base64-decoded from the request and materialised into
-  `/tmp/<plugin>/` before the script runs.
+  that run directory before the script runs. Its path is passed to the script as
+  `STAVROBOT_TEMP_DIR`.
 - The script receives all parameters as JSON on stdin.
 - stdout is captured and returned as `{ success: true, output: … }`.
-- Files written to `/tmp/<plugin>/` by the script are base64-encoded and returned in
+- Files written to the run directory by the script are base64-encoded and returned in
   `{ files: [{ filename, data }] }`.
+- The run directory is deleted after the run, including on every early-return and error
+  path. Leftover `/tmp/stavrobot-run-*` directories from a crashed process are removed
+  at plugin-runner startup.
+- Older runner versions used a shared `/tmp/<plugin>/` directory. After each run, if
+  that legacy directory contains files, the runner logs a warning and deletes it
+  without transporting those files.
+- On the main app side, files returned by a run are written to a fresh
+  `/tmp/stavrobot-temp/output-<uuid>/` directory (one per call; in a batch, one per item,
+  and only when the call returned files). Nothing is cleared at call start, so files from
+  earlier calls stay usable and parallel calls cannot delete each other's files. `run_python`
+  uses the same scheme. The scheduler deletes `output-*` directories (recursively), and
+  `upload-*` files, older than 3 days.
 - Timeout: 30 seconds.
 
 ### Tool execution (async)
@@ -214,13 +444,13 @@ Plugins live in `/plugins/<name>/` (shared volume between `plugin-runner` and `c
 | Table | Purpose |
 |---|---|
 | `messages` | Per-agent conversation history (role, content JSONB, sender_identity_id, sender_agent_id) |
-| `memories` | Always-injected knowledge (short facts, full text in system prompt every turn) |
-| `compactions` | Summarised history snapshots (up_to_message_id boundary) |
-| `scratchpad` | On-demand knowledge (title injected, body fetched on read via manage_knowledge) |
+| `memories` | Per-agent always-injected knowledge (agent_id FK; short facts, full text in system prompt every turn) |
+| `compactions` | Summarised history snapshots (up_to_message_id boundary); only the latest row per agent is retained |
+| `scratchpad` | Per-agent on-demand knowledge (agent_id FK; title injected, body fetched on read via manage_knowledge) |
 | `cron_entries` | Scheduled entries (cron expression or one-shot fire_at) |
-| `pages` | LLM-authored pages (path, mimetype, data BYTEA, is_public, queries JSONB, version INTEGER); append-only versioning — each update inserts a new row; empty `data` is a tombstone |
+| `pages` | LLM-authored pages (path, mimetype, data BYTEA, is_public, queries JSONB, mutations JSONB, version INTEGER); append-only versioning — each update inserts a new row; empty `data` is a tombstone |
 | `agents` | Subagent definitions (name, system_prompt, allowed_tools TEXT[], allowed_plugins TEXT[]) |
-| `interlocutors` | Contact records (display_name, owner bool, enabled bool, agent_id FK) |
+| `interlocutors` | Contact records (display_name, owner bool, enabled bool, mentions_only bool, agent_id FK) |
 | `interlocutor_identities` | Per-channel identifiers (service, identifier; nullable for soft-delete) |
 | `message_embeddings` | OpenAI vector embeddings for semantic search (vector(1536)) |
 
@@ -233,24 +463,84 @@ Migrations are additive `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements.
 
 - All endpoints require HTTP Basic Auth (password from `config.toml`).
 - Public exceptions whitelisted in `isPublicRoute()` (`src/index.ts`):
-  - `POST /telegram/webhook`
   - `POST /email/webhook`
   - `GET /pages/*` (per-row `is_public` check inside the handler)
   - `GET /api/pages/*/queries/*` (per-page `is_public` check inside the handler)
+- `POST /api/pages/*/mutations/*` is deliberately not public. It always requires Basic
+  Auth, regardless of the page's `is_public` flag, and also requires a JSON content type
+  as CSRF protection.
+- `POST /pebble-index/webhook` requires Basic Auth. It accepts a multipart Pebble Index
+  ring recording and queues it directly for the main agent.
 - `plugin-runner` and `coder` also enforce Basic Auth on all endpoints.
 - Outbound callbacks from `plugin-runner` and `coder` to `app:3000/chat` use the same
   password, read from `config.toml` at startup.
+
+## Web UI
+
+- `GET /settings/config` serves the configuration editor. It loads the raw file through
+  `GET /api/settings/config`, which returns `{ content }` from `CONFIG_PATH`.
+- `PUT /api/settings/config` accepts `{ content: string }`, validates it with
+  `parseConfig`, copies the current file to `<CONFIG_PATH>.bak`, and writes the raw
+  submitted content. It responds before exiting after 500ms; Docker Compose restarts the
+  app through its `restart: unless-stopped` policy.
+- Saving interrupts any in-progress agent turn. `plugin-runner`, `coder`,
+  `signal-bridge`, and `python-runner` do not reload `config.toml`, so changes affecting
+  them require manually restarting those containers.
+
+The configuration editor endpoints use the default Basic Auth policy and are never
+public.
+
+### Pages
+
+- `GET /` is the Overview (chat) page. `GET /settings` is the Settings screen, which
+  links to Config, provider login, and the Signal captcha; the desktop sidebar reaches
+  the same destinations directly.
+- `GET /settings/allowlist`, `GET /settings/plugins`, `GET /settings/config`,
+  `GET /login`, `GET /explorer`, and `GET /signal/captcha` serve the remaining pages.
+  `GET /plugins` redirects to `/settings/plugins`.
+- Every page renders its content into the shared shell, except `/login` and
+  `/signal/captcha`, which use the centered no-nav variant.
+- The database explorer reads the schema from `GET /api/explorer/tables/<table>`, where
+  each column carries `name`, `type`, `nullable`, and `primaryKey`.
+
+### Shared UI assets and shell
+
+- `GET /assets/sb.css` serves the shared admin stylesheet (kept as the TypeScript string
+  module `src/sb-css.ts`, adapted from `design/sb.css`). Light is the default; dark is
+  applied via `prefers-color-scheme`.
+- `GET /assets/fonts/<file>.woff2` serves the self-hosted IBM Plex Sans (400/500/600) and
+  IBM Plex Mono (400/500) latin subsets. The files are read from the `@fontsource`
+  packages at startup; only a fixed allow-list of filenames is served.
+- Both asset routes require Basic Auth (they are not in `isPublicRoute`), and the CSP
+  includes `font-src 'self'`.
+- `src/shell.ts` renders the shared page chrome: desktop sidebar with nav and an
+  online/model/uptime footer, a mobile header and a five-tab bottom bar, or a centered
+  card for no-nav pages (login, captcha). Pages render their own content into it.
+- `src/uptime.ts` owns the process start time and uptime formatting so every page shell
+  can display it.
 
 ---
 
 ## Allowlist (src/allowlist.ts)
 
 - Stored in `allowlist.json` (path overridable via `ALLOWLIST_PATH` env var).
-- Per-service arrays: `signal` (strings), `telegram` (numbers or `"*"`), `whatsapp`
-  (strings), `email` (strings, supports `*` glob wildcard before `@`).
+- Per-service arrays: `signal` (strings; E.164 phone numbers, UUIDs, or group IDs),
+  `telegram` (numbers or `"*"`), `whatsapp` (strings), `email` (strings, supports `*`
+  glob wildcard before `@`).
 - Owner identities are auto-seeded into the allowlist from `config.toml` on startup.
-- The allowlist is a **hard gate** in the queue: messages from senders not in the list
-  are silently dropped before reaching the agent.
+- The allowlist is a **hard gate**: messages from senders not in the list are dropped
+  before reaching the agent. The channel handlers for Telegram, email, and WhatsApp
+  check the allowlist themselves and return before enqueuing, so they call
+  `recordRejectedSender` at that early gate; the queue calls it for external sources
+  that do not pre-check (the Signal bridge posts straight to `/chat`). Each rejection is
+  therefore counted exactly once.
+- Senders dropped by the hard gate are kept in an in-memory `recordRejectedSender` /
+  `getRejectedSenders` buffer (last 50, newest first, deduplicated by
+  `service` + `identifier`, each with `label`, `lastSeen`, and `count`). Soft-gate drops
+  (unknown interlocutor) are not recorded. `GET /api/settings/allowlist` returns the
+  buffer as `rejected`, and the settings page lists it under "Recently rejected" with an
+  Add button that inserts the identifier into the matching allowlist. The buffer is
+  in-memory only and is cleared on restart.
 - A **soft gate** follows: the sender must also exist in `interlocutor_identities` for
   an enabled interlocutor with an assigned agent.
 - Outbound send tools (`send_signal_message`, `send_telegram_message`, etc.) also check
@@ -264,48 +554,64 @@ The provider and model are set at the top level of `config.toml`:
 
 ```toml
 provider = "anthropic"          # any KnownProvider string from pi-ai
-model    = "claude-sonnet-4-20250514"
+model    = "claude-opus-5-5"
 ```
 
-`getModel(provider, model)` from `@mariozechner/pi-ai` looks up the model in a static
-registry (`models.generated.js`). The registry maps `(provider, modelId)` to a `Model`
-object that carries `api`, `baseUrl`, `contextWindow`, `maxTokens`, and optional `compat`
-overrides.
+`getBuiltinModel(provider, model)` from `@earendil-works/pi-ai/providers/all` looks up
+the model in a static registry (`models.generated.js`). The registry maps `(provider,
+modelId)` to a `Model` object that carries `api`, `baseUrl`, `contextWindow`,
+`maxTokens`, and optional `compat` overrides.
 
-### Supported providers (from pi-ai v0.60.0 `KnownProvider` type)
+### Supported providers (from pi-ai `KnownProvider` type)
 
-`amazon-bedrock`, `anthropic`, `google`, `google-gemini-cli`, `google-antigravity`,
-`google-vertex`, `openai`, `azure-openai-responses`, `openai-codex`, `github-copilot`,
-`xai`, `groq`, `cerebras`, `openrouter`, `vercel-ai-gateway`, `zai`, `mistral`,
-`minimax`, `minimax-cn`, `huggingface`, `opencode`, `opencode-go`, `kimi-coding`.
+`amazon-bedrock`, `ant-ling`, `anthropic`, `google`, `google-vertex`, `openai`,
+`azure-openai-responses`, `openai-codex`, `radius`, `nvidia`, `deepseek`,
+`github-copilot`, `xai`, `groq`, `cerebras`, `openrouter`, `vercel-ai-gateway`,
+`zai`, `zai-coding-cn`, `mistral`, `minimax`, `minimax-cn`, `moonshotai`,
+`moonshotai-cn`, `huggingface`, `fireworks`, `together`, `baseten`, `opencode`,
+`opencode-go`, `kimi-coding`, `cloudflare-workers-ai`, `cloudflare-ai-gateway`,
+`qwen-token-plan`, `qwen-token-plan-cn`, `qwen-token-plan-individual`, `xiaomi`,
+`xiaomi-token-plan-cn`, `xiaomi-token-plan-ams`, `xiaomi-token-plan-sgp`.
 
 ### API backends (from pi-ai `KnownApi` type)
 
-| API string | Used by |
-|---|---|
-| `anthropic-messages` | `anthropic`, `amazon-bedrock` (Anthropic models) |
-| `openai-completions` | `openai`, `groq`, `cerebras`, `xai`, `openrouter`, `opencode`, `zai`, and any OpenAI-compatible endpoint |
-| `openai-responses` | `openai` (Responses API), `github-copilot` |
-| `openai-codex-responses` | `openai-codex` |
-| `azure-openai-responses` | `azure-openai-responses` |
-| `google-generative-ai` | `google`, `google-antigravity` |
-| `google-gemini-cli` | `google-gemini-cli` |
-| `google-vertex` | `google-vertex` |
-| `mistral-conversations` | `mistral` |
-| `bedrock-converse-stream` | `amazon-bedrock` |
+| API string |
+|---|
+| `openai-completions` |
+| `mistral-conversations` |
+| `openai-responses` |
+| `azure-openai-responses` |
+| `openai-codex-responses` |
+| `anthropic-messages` |
+| `bedrock-converse-stream` |
+| `google-generative-ai` |
+| `google-vertex` |
+| `pi-messages` |
 
 ### Authentication
 
 Exactly one of these must be set in `config.toml`:
 - `apiKey = "..."` — static API key, passed directly to the provider.
 - `authFile = "/path/to/auth.json"` — OAuth credentials file (for Claude Pro/Max
-  subscriptions). The file is read and refreshed by `src/auth.ts` using
-  `getOAuthProvider(config.provider)` from `@mariozechner/pi-ai/oauth`.
+  subscriptions). `src/auth.ts` locates the provider with `builtinProviders()` from
+  `@earendil-works/pi-ai/providers/all` and uses its `auth.oauth` implementation.
+  Existing untagged OAuth records are normalized in memory; an expired credential is
+  refreshed with `oauth.refresh(credential, AbortSignal.timeout(30_000))` and written
+  back with its `"oauth"` type tag. `oauth.toAuth(credential)` derives the API key.
+
+When the library's `oauth.login()` asks which login method to use (a `select` prompt),
+`src/login.ts` prefers the headless methods in the order `copy_code`, `device_code`,
+`device-code`, then `browser`, falling back to the first option. The browser flow's
+loopback callback port (53692) is never reachable from the user's browser, so the
+copy-code and device-code flows are the only usable ones. With Anthropic's `copy_code`,
+the provider shows a code after authorization that the user pastes into the Stavrobot
+login page. Device-code flows go the other way: Stavrobot shows the code and the user
+enters it on the provider's site.
 
 The `getApiKey(config)` function in `src/auth.ts` resolves whichever is configured and
-returns a plain string. This string is passed to the `Agent` constructor as
-`getApiKey: () => getApiKey(config)`. The Agent forwards it to the provider stream
-function as `options.apiKey`.
+returns a plain string. The `Agent` receives it through `getApiKey: () => getApiKey(config)`
+and explicitly uses `streamFn: streamSimple` from `@earendil-works/pi-ai/compat`, which
+forwards the key to the provider stream function as `options.apiKey`.
 
 ### OpenAI-compatible endpoints
 
@@ -320,7 +626,10 @@ When `baseUrl` is set in `config.toml`, `src/agent/index.ts` constructs a `Model
 manually instead of calling `getModel()`. `contextWindow` and `maxTokens` are required.
 `api` defaults to `"openai-completions"` if omitted; the only accepted values are
 `"openai-completions"` and `"anthropic-messages"`. `authFile` is forbidden (only `apiKey`
-is supported with a custom endpoint).
+is supported with a custom endpoint). `reasoning` is opt-in and defaults to false; when set
+to true it sets `reasoning: true` on the constructed `Model`, so Pi sends `thinkingLevel`
+to the endpoint (as `reasoning_effort` for `openai-completions`). It is ignored when
+`baseUrl` is not set.
 
 ---
 
@@ -333,7 +642,7 @@ is supported with a custom endpoint).
 - Log level: `STAVROBOT_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`; default `info`).
 - Feature gates in `config.toml` (presence of section enables the feature):
   - `[coder]` — enables `request_coding_task` tool and `manage_plugins create` action (also requires the `coder` Docker Compose profile).
-  - `[telegram]` — enables Telegram webhook + `send_telegram_message` tool.
+  - `[telegram]` — enables Telegram long polling + `send_telegram_message` tool.
   - `[whatsapp]` — enables WhatsApp (Baileys) + `send_whatsapp_message` tool.
   - `[email]` with `smtpHost` — enables `send_email` tool and SMTP transport.
   - `[embeddings]` — enables OpenAI vector embeddings worker and semantic search in `db_search`.
@@ -346,19 +655,54 @@ is supported with a custom endpoint).
 | Source string | Origin |
 |---|---|
 | `undefined` | Direct HTTP call (no source header) |
-| `"signal"` | Signal bridge webhook |
-| `"telegram"` | Telegram webhook |
+| `"signal"` | Signal bridge |
+| `"telegram"` | Telegram long polling |
 | `"whatsapp"` | WhatsApp (Baileys) |
 | `"email"` | Email webhook |
+| `"pebble-index"` | Pebble Index ring webhook |
 | `"cron"` | Scheduler |
 | `"coder"` | Coder agent callback |
 | `"plugin:<name>/<tool>"` | Async plugin tool callback |
-| `"agent"` | Subagent-to-agent message |
+| `"agent"` | Main agent to subagent message, or a forwarded subagent final response |
 | `"upload"` | File upload trigger |
 
 Internal sources (`cli`, `cron`, `coder`, `plugin:*`, `upload`) always route to the
 main agent. External sources (`signal`, `telegram`, `whatsapp`, `email`) go through
-allowlist + interlocutor lookup to determine the target agent.
+allowlist + interlocutor lookup to determine the target agent. The Basic-authenticated
+`pebble-index` source routes directly to the main agent without those gates.
+
+---
+
+## Signal bridge (signal-bridge/bridge.py)
+
+The `signal-bridge` container runs `signal-cli` in JSON-RPC daemon mode. It exposes an
+HTTP server on port 8081 (the app calls it to send) and, for each inbound message, POSTs
+to `app:3000/chat` with `source: "signal"` (it never replies on Signal directly).
+
+Inbound: the bridge extracts text and attachments from each signal-cli envelope. A
+message that carries `groupInfo` is routed by the group ID, with `participant` set to the
+individual sender (`{ id, name }`) and `senderLabel` set to the group name. Outside a
+group, the sender is the individual's phone number or, when no phone number is present
+(e.g. phone number privacy is enabled), their UUID; `senderLabel` is the profile name.
+Messages with neither text nor attachments are skipped.
+
+The bridge sets `addressedToBot` when a mention or the quoted author matches the event's
+`account`, which is the bot's own number. Each mention placeholder (`U+FFFC`) in the text
+is replaced with `@<name>`, using the mention's name, number, or UUID in that order, and
+the bot's own mention becomes `@you`. When `dataMessage.quote.text` is non-empty, one line
+`[In reply to <author>: "<quoted text>"]` is prepended to the message text, with each run
+of whitespace collapsed to one space, the result trimmed, and the quote cut at 300 code
+points with an ellipsis; `<author>` is `you` when the bot wrote the quoted message and
+`unknown` when no author field is present. The line is not added to a message with no text
+of its own, because the queue would steer the synthesized text and drop the attachment,
+nor to a message whose own text starts with `/`, so commands still match. Message text and
+the agent response are logged by length only.
+
+Outbound: `POST /send` accepts `{ recipient, message?, attachment?, attachmentFilename? }`.
+A recipient that is an E.164 phone number (`+` followed by digits) or a UUID is addressed
+with signal-cli's `recipient` list; anything else is treated as a base64 group ID and
+addressed with the `groupId` parameter. `POST /challenge` supplies a captcha token when
+Signal rate-limits the account.
 
 ---
 
@@ -367,6 +711,7 @@ allowlist + interlocutor lookup to determine the target agent.
 | File | Role |
 |---|---|
 | `src/index.ts` | HTTP server, routing, auth middleware, all endpoint handlers |
+| `src/pebble-index.ts` | Pebble Index multipart ring webhook handler |
 | `src/agent/index.ts` | Agent setup, all built-in tool definitions, `handlePrompt`, compaction, truncation |
 | `src/queue.ts` | Single-threaded message queue, routing, steering logic, retry |
 | `src/database.ts` | All SQL queries, schema init, migrations |
@@ -377,11 +722,17 @@ allowlist + interlocutor lookup to determine the target agent.
 | `src/scheduler.ts` | Cron scheduler |
 | `src/embeddings.ts` | OpenAI embeddings worker (background polling loop) |
 | `src/log.ts` | Levelled logger (`log.info`, `log.debug`, etc.) controlled by `STAVROBOT_LOG_LEVEL` |
+| `src/assets.ts` | Shared stylesheet and self-hosted font HTTP handlers |
+| `src/sb-css.ts` | Shared admin stylesheet as a TypeScript string, adapted from `design/sb.css` |
+| `src/shell.ts` | Shared page shell (sidebar, mobile header and tab bar, centered no-nav layout) |
+| `src/uptime.ts` | Process start time and uptime formatting |
 | `prompts/system-prompt.txt` | Base system prompt for the main agent |
 | `prompts/agent-prompt.txt` | Base system prompt for subagents |
 | `prompts/compaction-prompt.txt` | Prompt used by the background compaction summariser |
 | `plugin-runner/src/index.ts` | Plugin HTTP server (all logic in one file) |
+| `plugin-runner/src/mcp-client.ts` | MCP client: spec validation, connections, cached tool list, call translation |
 | `coder/server.py` | Coder HTTP server, `claude -p` subprocess management |
+| `signal-bridge/bridge.py` | Signal bridge: signal-cli event handling, `/send`, `/challenge` |
 
 ---
 
@@ -396,6 +747,12 @@ The `coder` container wraps the `claude` headless CLI binary. It:
    the plugin user with `HOME` set to the plugin directory.
 6. Copies refreshed credentials back and cleans up.
 7. Posts the result to `app:3000/chat` with `source: "coder"`.
+
+Authentication is selected from the `[coder]` section only. With no `[coder].apiKey`/`[coder].baseUrl` the coder uses the subscription OAuth credentials described above. When both are set, it passes them to `claude` as `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` and skips the credentials copy. Setting only one of the two is a startup error, and the top-level `apiKey`/`baseUrl` never affect the coder. When `[coder].oauthToken` is set (a long-lived token from `claude setup-token`), it passes it as `CLAUDE_CODE_OAUTH_TOKEN` and also skips the credentials copy. Setting both `oauthToken` and `apiKey`/`baseUrl` is a startup error.
+
+A background thread runs `claude update` as the coder user (uid/gid 9999) at startup
+and every 24 hours, keeping the CLI current; the native installer swaps versions
+atomically, so in-flight tasks are unaffected.
 
 The LLM process cannot read `config.toml` because the entrypoint (running as root)
 extracts only the needed values before exec-ing the server.

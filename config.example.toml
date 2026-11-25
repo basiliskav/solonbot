@@ -1,23 +1,26 @@
-# Valid providers: amazon-bedrock, anthropic, azure-openai-responses, cerebras,
-# github-copilot, google, google-antigravity, google-gemini-cli, google-vertex,
-# groq, huggingface, kimi-coding, minimax, minimax-cn, mistral, openai,
-# openai-codex, opencode, opencode-go, openrouter, vercel-ai-gateway, xai, zai.
+# Valid providers: amazon-bedrock, ant-ling, anthropic, azure, baseten,
+# cerebras, cloudflare-ai-gateway, cloudflare-workers-ai, deepseek, fireworks,
+# github-copilot, google, google-vertex, groq, huggingface, kimi-coding, meta,
+# minimax, minimax-cn, mistral, moonshotai, moonshotai-cn, nvidia, openai,
+# openai-codex, opencode, opencode-go, openrouter, qwen-token-plan,
+# qwen-token-plan-cn, qwen-token-plan-individual, radius, together, typesafe,
+# vercel-ai-gateway, xai, xiaomi, xiaomi-token-plan-ams, xiaomi-token-plan-cn,
+# xiaomi-token-plan-sgp, zai, zai-coding-cn.
 provider = "anthropic"
-model = "claude-sonnet-4-20250514"
+model = "claude-opus-5-5"
 
-# Thinking level for the main agent. Known values: "off", "low", "medium", "high", "xhigh".
-# Defaults to "low" when omitted.
-# thinkingLevel = "low"
+# Thinking level for the main agent. Known values: "low", "medium", "high", "xhigh".
+# Defaults to "high" when omitted.
+# thinkingLevel = "high"
 
 # Password for HTTP Basic Auth. All endpoints except webhooks require this.
-# Change this to something secure. If removed or commented out, all endpoints
-# are open to the world.
+# Change this to something secure. Required: the app refuses to start without it.
 password = "change-me"
 
 # Authentication: use exactly one of apiKey or authFile.
 # apiKey: a static Anthropic API key.
 # authFile: path to an auth.json with OAuth credentials (for Claude Pro/Max
-#   subscriptions). Generate it by running `npx @mariozechner/pi-coding-agent`,
+#   subscriptions). Generate it by running `npx @earendil-works/pi-coding-agent`,
 #   then using the /login command and choosing "Anthropic".
 # apiKey = "your-api-key-here"
 authFile = "/app/data/auth.json"
@@ -28,6 +31,10 @@ authFile = "/app/data/auth.json"
 # contextWindow and maxTokens are also required. api defaults to
 # "openai-completions" if omitted.
 #
+# reasoning is opt-in and defaults to false. Set it to true only for models that
+# support thinking, which is what makes thinkingLevel apply on a custom endpoint.
+# Leave it off for non-thinking models, since some servers reject reasoning_effort.
+#
 # Example: Ollama running locally
 # provider = "openai"
 # model = "llama3.2"
@@ -37,9 +44,20 @@ authFile = "/app/data/auth.json"
 # maxTokens = 8192
 # api = "openai-completions"
 #
+# Example: Ollama Cloud. Available model names are listed at
+# https://ollama.com/api/tags.
+# provider = "openai"
+# model = "gpt-oss:120b"
+# apiKey = "your-ollama-api-key"
+# baseUrl = "https://ollama.com/v1"
+# contextWindow = 128000
+# maxTokens = 8192
+# api = "openai-completions"
+# reasoning = true
+#
 # Example: Anthropic-compatible proxy
 # provider = "anthropic"
-# model = "claude-sonnet-4-20250514"
+# model = "claude-opus-5-5"
 # apiKey = "your-proxy-key"
 # baseUrl = "https://proxy.example.com"
 # contextWindow = 200000
@@ -50,9 +68,10 @@ authFile = "/app/data/auth.json"
 # The public HTTPS URL where this server is reachable (no trailing slash).
 publicHostname = "https://example.com"
 
-# Maximum context size in thousands of tokens. Defaults to the model's full context
-# window. Average token usage is roughly half this value due to the compaction sawtooth.
-# Reduce to lower API costs; increase (up to the model limit) to keep more history.
+# Maximum context size in thousands of tokens. Defaults to 50 (50k tokens), capped at
+# the model's full context window. Average token usage is roughly half this value due
+# to the compaction sawtooth. Reduce to lower API costs; increase (up to the model
+# limit) to keep more history.
 # contextTokensK = 100
 
 # Optional additional instructions appended to the base system prompt.
@@ -69,7 +88,10 @@ too formal.
 # own numbers). Include whichever channels the owner uses.
 [owner]
 name = "Stavros"
+# signal accepts a phone number or a UUID. Use the UUID if phone number privacy is
+# enabled on your Signal account, since signal-cli then reports your number as a UUID.
 # signal = "+1234567890"
+# signal = "01234567-89ab-cdef-0123-456789abcdef"
 # telegram = "123456789"
 # whatsapp = "+1234567890"
 # email = "owner@example.com"          # specific address
@@ -85,8 +107,9 @@ account = "+1234567890"
 
 # Telegram integration. Create a bot via @BotFather on Telegram to get a token.
 # To find your chat ID, message @userinfobot on Telegram.
-# The webhook is registered at <publicHostname>/telegram/webhook on startup.
-# publicHostname (top-level) must be set when using Telegram.
+# Solonbot long-polls Telegram for updates on startup, so Telegram needs no
+# publicly reachable endpoint or webhook. The top-level publicHostname setting is
+# still required for links the bot sends (login, pages).
 # The allowlist of chat IDs permitted to message the agent is managed via the
 # /settings web UI and stored in allowlist.json (not in this file).
 [telegram]
@@ -151,12 +174,21 @@ botToken = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 # smtpPassword = "your-smtp-password"
 # fromAddress = "bot@example.com"
 
-# Enables the self-programming coder agent. Uses Claude Code headless, which
-# requires subscription auth (see README). The model must be a Claude Code
-# alias: "sonnet", "opus", or "haiku". This section also requires enabling the
-# "coder" Docker Compose profile (see README for details).
+# Enables the self-programming coder agent. Uses Claude Code headless. The model
+# must be a Claude Code alias: "sonnet", "opus", or "haiku". This section also
+# requires enabling the "coder" Docker Compose profile (see README for details).
+# By default the coder uses the subscription OAuth login (see README). To use an
+# Anthropic-compatible API endpoint instead, set both keys below; they are passed
+# to Claude Code as ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL. Setting only one of
+# the two is a startup error. The top-level apiKey/baseUrl never affect the coder.
+# The interactive OAuth login expires and must then be repeated by hand. To avoid
+# that, run `claude setup-token` and put the token in oauthToken; it is passed to
+# Claude Code as CLAUDE_CODE_OAUTH_TOKEN. It can't be combined with apiKey/baseUrl.
 [coder]
-model = "sonnet"
+model = "opus"
+# apiKey = "your-anthropic-api-key-here"
+# baseUrl = "https://api.anthropic.com"
+# oauthToken = "your-claude-setup-token-here"
 
 # Optional OpenAI embeddings support. When present, the bot generates vector
 # embeddings for semantic search. This improves recall (finding relevant

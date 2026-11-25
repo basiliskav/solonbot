@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "crypto";
 import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -6,14 +7,13 @@ import { loadConfig } from "./config.js";
 import { loadAllowlist } from "./allowlist.js";
 import { initInternalFetch } from "./internal-fetch.js";
 import { startBackgroundTokenRefresh } from "./auth.js";
-import { connectDatabase, seedCronEntries, seedOwner, getPageByPath, getPageQueryByPath } from "./database.js";
+import { connectDatabase, seedCronEntries, seedOwner, getPageByPath, getPageQueryByPath, getPageMutationByPath } from "./database.js";
 import { runMigrations } from "./migrations.js";
 import { createAgent } from "./agent/index.js";
-import { initializeQueue, enqueueMessage } from "./queue.js";
+import { initializeQueue, enqueueMessage, type Participant } from "./queue.js";
 import { initializeScheduler } from "./scheduler.js";
 import { initializeEmbeddingsWorker } from "./embeddings.js";
-import type { TelegramConfig } from "./config.js";
-import { registerTelegramWebhook, handleTelegramWebhook } from "./telegram.js";
+import { startTelegramPolling } from "./telegram.js";
 import { serveLoginPage, handleLoginEvents, handleLoginRespond } from "./login.js";
 import {
   serveExplorerPage,
@@ -30,6 +30,7 @@ import {
   handlePluginDetailRequest,
   handlePluginConfigRequest,
   handlePluginInstallRequest,
+  handlePluginAddMcpRequest,
   handlePluginUpdateRequest,
   handlePluginRemoveRequest,
   handlePluginConfigureRequest,
@@ -40,10 +41,17 @@ import {
   handleGetAllowlistRequest,
   handlePutAllowlistRequest,
 } from "./settings.js";
+import {
+  serveConfigSettingsPage,
+  handleGetConfigRequest,
+  handlePutConfigRequest,
+} from "./config-settings.js";
 import { serveSignalCaptchaPage, handleSignalCaptchaSubmit } from "./signal-captcha.js";
 import { initializeWhatsApp } from "./whatsapp.js";
 import { serveHomePage } from "./home.js";
+import { serveSharedStylesheet, serveFontFile } from "./assets.js";
 import { handleEmailWebhookRequest } from "./email.js";
+import { handlePebbleIndexWebhookRequest } from "./pebble-index.js";
 import { initializeEmailTransport } from "./email-api.js";
 import { log } from "./log.js";
 
@@ -51,13 +59,11 @@ const CSP_HEADER_VALUE =
   "default-src 'self'; " +
   "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; " +
   "style-src 'self' 'unsafe-inline'; " +
+  "font-src 'self'; " +
   "img-src 'self' data:; " +
   "connect-src 'self'";
 
-function isPublicRoute(method: string, pathname: string): boolean {
-  if (method === "POST" && pathname === "/telegram/webhook") {
-    return true;
-  }
+export function isPublicRoute(method: string, pathname: string): boolean {
   if (method === "POST" && pathname === "/email/webhook") {
     return true;
   }
@@ -69,6 +75,8 @@ function isPublicRoute(method: string, pathname: string): boolean {
   if (method === "GET" && pathname.startsWith("/api/pages/") && pathname.includes("/queries/")) {
     return true;
   }
+  // Page mutations are deliberately not public: they always require Basic Auth,
+  // regardless of the page's is_public flag. The global auth check in main() covers them.
   return false;
 }
 
@@ -82,7 +90,12 @@ export function checkBasicAuth(request: http.IncomingMessage, password: string):
   // The Basic auth format is "username:password". We ignore the username.
   const colonIndex = decoded.indexOf(":");
   const providedPassword = colonIndex === -1 ? decoded : decoded.slice(colonIndex + 1);
-  return providedPassword === password;
+  // Compare sha256 digests rather than the raw passwords so the lengths passed to
+  // timingSafeEqual are always equal (it throws on length mismatch) and the
+  // comparison runs in constant time to avoid timing-based password recovery.
+  const providedDigest = createHash("sha256").update(providedPassword).digest();
+  const expectedDigest = createHash("sha256").update(password).digest();
+  return timingSafeEqual(providedDigest, expectedDigest);
 }
 
 export async function readRequestBody(
@@ -124,6 +137,16 @@ export async function handleChatRequest(
       return;
     }
 
+    let asyncRequested = false;
+    if ("async" in parsedBody) {
+      if (typeof parsedBody.async !== "boolean") {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: "'async' must be a boolean" }));
+        return;
+      }
+      asyncRequested = parsedBody.async;
+    }
+
     const message = "message" in parsedBody && typeof parsedBody.message === "string" ? parsedBody.message : undefined;
 
     let attachments: FileAttachment[] | undefined;
@@ -155,6 +178,19 @@ export async function handleChatRequest(
 
     const source = "source" in parsedBody && typeof parsedBody.source === "string" ? parsedBody.source : undefined;
     const sender = "sender" in parsedBody && typeof parsedBody.sender === "string" ? parsedBody.sender : undefined;
+
+    let participant: Participant | undefined;
+    if ("participant" in parsedBody && typeof parsedBody.participant === "object" && parsedBody.participant !== null) {
+      const candidate = parsedBody.participant as Record<string, unknown>;
+      if (typeof candidate.id === "string" && typeof candidate.name === "string") {
+        participant = { id: candidate.id, name: candidate.name };
+      }
+    }
+    const senderLabel = "senderLabel" in parsedBody && typeof parsedBody.senderLabel === "string" ? parsedBody.senderLabel : undefined;
+    // Only a literal true counts, because channels that cannot detect a mention
+    // omit the field entirely and a false or malformed value must not be read as
+    // one.
+    const addressedToBot = "addressedToBot" in parsedBody && parsedBody.addressedToBot === true ? true : undefined;
 
     // Parse raw file data sent by external callers (e.g. the Signal bridge) that
     // cannot write to the app container's filesystem directly.
@@ -202,7 +238,18 @@ export async function handleChatRequest(
       return;
     }
 
-    const assistantResponse = await enqueueMessage(message, source, sender, combinedAttachments);
+    const enqueuePromise = enqueueMessage(message, source, sender, combinedAttachments, undefined, participant, senderLabel, addressedToBot);
+    if (asyncRequested) {
+      // Keep async calls on the same queue so ordering and owner steering still apply.
+      void enqueuePromise.catch((error: unknown) => {
+        log.error("[solonbot] Error processing asynchronous chat request:", error);
+      });
+      response.writeHead(202, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ accepted: true }));
+      return;
+    }
+
+    const assistantResponse = await enqueuePromise;
 
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ response: assistantResponse }));
@@ -219,73 +266,14 @@ export async function handleChatRequest(
   }
 }
 
-export async function handleTelegramWebhookRequest(
-  request: http.IncomingMessage,
-  response: http.ServerResponse,
-  telegramConfig: TelegramConfig | undefined,
-  webhookSecret: string | undefined
-): Promise<void> {
-  if (telegramConfig === undefined) {
-    response.writeHead(404, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ error: "Not found" }));
-    return;
+// Returns an error message string if the SQL contains more than one statement, or null if it is valid.
+function validateSingleStatement(sql: string): string | null {
+  // Strip one optional trailing semicolon, then reject if any remain — this
+  // blocks multi-statement injection like "SELECT 1; DELETE FROM users".
+  if (sql.replace(/;$/, "").includes(";")) {
+    return "Multiple SQL statements are not allowed";
   }
-
-  if (webhookSecret !== undefined) {
-    const providedSecret = request.headers["x-telegram-bot-api-secret-token"];
-    if (providedSecret !== webhookSecret) {
-      let reason = "unknown";
-      if (providedSecret === undefined) {
-        reason = "missing_header";
-      } else if (Array.isArray(providedSecret)) {
-        reason = "multiple_header_values";
-      } else if (typeof providedSecret !== "string") {
-        reason = "non_string_header";
-      } else {
-        reason = "wrong_secret";
-      }
-      log.info(`[solonbot] Telegram webhook rejected: ${reason}`);
-      const providedFingerprint = typeof providedSecret === "string" ? providedSecret.slice(0, 8) : String(providedSecret);
-      log.debug(`[solonbot] [debug] Secret mismatch: reason=${reason}, provided=${providedFingerprint}...`);
-      log.debug(`[solonbot] [debug] Request metadata: remoteAddress=${request.socket?.remoteAddress}, x-forwarded-for=${request.headers["x-forwarded-for"]}, user-agent=${request.headers["user-agent"]}, content-length=${request.headers["content-length"]}`);
-      response.writeHead(403, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: "Forbidden" }));
-      return;
-    }
-  }
-
-  try {
-    const body = await readRequestBody(request);
-    let parsedBody: unknown;
-
-    try {
-      parsedBody = JSON.parse(body);
-    } catch {
-      response.writeHead(400, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: "Invalid JSON" }));
-      return;
-    }
-
-    // Respond 200 immediately before processing — Telegram requires a fast response.
-    response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ ok: true }));
-
-    void handleTelegramWebhook(parsedBody, telegramConfig);
-  } catch (error) {
-    if (error instanceof Error && error.message === "Request body too large") {
-      if (!response.headersSent) {
-        response.writeHead(413, { "Content-Type": "application/json" });
-        response.end(JSON.stringify({ error: "Request body too large" }));
-      }
-      return;
-    }
-    log.error("[solonbot] Error handling Telegram webhook request:", error);
-    if (!response.headersSent) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      response.writeHead(500, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: errorMessage }));
-    }
-  }
+  return null;
 }
 
 // Returns an error message string if the SQL is not a valid read-only query, or null if it is valid.
@@ -293,12 +281,32 @@ function validateReadOnlySql(sql: string): string | null {
   if (!sql.match(/^(SELECT|WITH)\b/i)) {
     return "Only SELECT queries are allowed";
   }
-  // Strip one optional trailing semicolon, then reject if any remain — this
-  // blocks multi-statement injection like "SELECT 1; DELETE FROM users".
-  if (sql.replace(/;$/, "").includes(";")) {
-    return "Multiple SQL statements are not allowed";
+  return validateSingleStatement(sql);
+}
+
+// Rewrites $param:name placeholders to positional $1, $2, ... placeholders and
+// returns the names in first-seen order. Shared by page queries and page mutations.
+function parseParamPlaceholders(sql: string): { parameterizedSql: string; paramNames: string[] } {
+  const paramRegex = /\$param:(\w+)/g;
+  const paramNames: string[] = [];
+  const seenParams = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = paramRegex.exec(sql)) !== null) {
+    const name = match[1];
+    if (!seenParams.has(name)) {
+      seenParams.add(name);
+      paramNames.push(name);
+    }
   }
-  return null;
+
+  // Replace each unique $param:name with its positional placeholder $1, $2, etc.
+  let paramIndex = 0;
+  const paramMap = new Map<string, string>();
+  for (const name of paramNames) {
+    paramMap.set(name, `$${++paramIndex}`);
+  }
+  const parameterizedSql = sql.replace(/\$param:(\w+)/g, (_full, name: string) => paramMap.get(name) ?? "");
+  return { parameterizedSql, paramNames };
 }
 
 export async function handlePageQueryRequest(
@@ -352,17 +360,7 @@ export async function handlePageQueryRequest(
 
     // Parse $param:name placeholders and replace them with positional $1, $2, etc.
     // Parameters are read from query string values.
-    const paramRegex = /\$param:(\w+)/g;
-    const paramNames: string[] = [];
-    const seenParams = new Set<string>();
-    let match: RegExpExecArray | null;
-    while ((match = paramRegex.exec(sql)) !== null) {
-      const name = match[1];
-      if (!seenParams.has(name)) {
-        seenParams.add(name);
-        paramNames.push(name);
-      }
-    }
+    const { parameterizedSql, paramNames } = parseParamPlaceholders(sql);
 
     const paramValues: string[] = [];
     for (const name of paramNames) {
@@ -374,14 +372,6 @@ export async function handlePageQueryRequest(
       }
       paramValues.push(value);
     }
-
-    // Replace each unique $param:name with its positional placeholder $1, $2, etc.
-    let paramIndex = 0;
-    const paramMap = new Map<string, string>();
-    for (const name of paramNames) {
-      paramMap.set(name, `$${++paramIndex}`);
-    }
-    const parameterizedSql = sql.replace(/\$param:(\w+)/g, (_full, name: string) => paramMap.get(name) ?? "");
 
     log.info(`[solonbot] Page query: ${pagePath}/${queryName}`, parameterizedSql);
     const client = await pool.connect();
@@ -401,6 +391,98 @@ export async function handlePageQueryRequest(
     response.end(JSON.stringify(result.rows));
   } catch (error) {
     log.error("[solonbot] Error handling page query request:", error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    response.writeHead(500, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: errorMessage }));
+  }
+}
+
+export async function handlePageMutationRequest(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  pathname: string,
+  pool: Pool,
+): Promise<void> {
+  try {
+    // The path format is /api/pages/<pagePath>/mutations/<mutationName>.
+    // The mutation name is always the last segment after the last "/mutations/".
+    // Everything between "/api/pages/" and the last "/mutations/" is the page path.
+    const mutationsMarker = "/mutations/";
+    const lastMutationsIndex = pathname.lastIndexOf(mutationsMarker);
+    const pagePath = pathname.slice("/api/pages/".length, lastMutationsIndex);
+    const mutationName = pathname.slice(lastMutationsIndex + mutationsMarker.length);
+
+    if (pagePath === "" || mutationName === "") {
+      response.writeHead(404, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+
+    const pageMutation = await getPageMutationByPath(pool, pagePath, mutationName);
+    if (pageMutation === null) {
+      response.writeHead(404, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+
+    // Require a JSON content type. This is CSRF protection: cross-site HTML forms
+    // cannot send this content type without triggering a CORS preflight, which we
+    // never answer. Parameters such as "; charset=utf-8" are allowed.
+    const contentType = request.headers["content-type"];
+    const mediaType = typeof contentType === "string" ? contentType.split(";")[0].trim().toLowerCase() : "";
+    if (mediaType !== "application/json") {
+      response.writeHead(415, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "Content-Type must be application/json" }));
+      return;
+    }
+
+    const body = await readRequestBody(request);
+    let parsedBody: unknown;
+    try {
+      parsedBody = JSON.parse(body);
+    } catch {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "Invalid JSON" }));
+      return;
+    }
+
+    if (typeof parsedBody !== "object" || parsedBody === null || Array.isArray(parsedBody)) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "Request body must be a JSON object" }));
+      return;
+    }
+    const bodyObject = parsedBody as Record<string, unknown>;
+
+    const sql = pageMutation.mutation.trim();
+    const validationError = validateSingleStatement(sql);
+    if (validationError !== null) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: validationError }));
+      return;
+    }
+
+    // Parse $param:name placeholders and replace them with positional $1, $2, etc.
+    // Parameters are read from the top-level keys of the JSON body. Values are
+    // passed to pg unchanged as bound parameters.
+    const { parameterizedSql, paramNames } = parseParamPlaceholders(sql);
+    const paramValues: unknown[] = [];
+    for (const name of paramNames) {
+      if (!Object.prototype.hasOwnProperty.call(bodyObject, name)) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: `Missing mutation parameter: ${name}` }));
+        return;
+      }
+      paramValues.push(bodyObject[name]);
+    }
+
+    // Mutations are not run in a READ ONLY transaction — they are allowed to write.
+    log.info(`[solonbot] Page mutation: ${pagePath}/${mutationName}`, parameterizedSql);
+    const result = await pool.query(parameterizedSql, paramValues);
+
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ rowCount: result.rowCount, rows: result.rows }));
+  } catch (error) {
+    log.error("[solonbot] Error handling page mutation request:", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     response.writeHead(500, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: errorMessage }));
@@ -468,13 +550,8 @@ async function main(): Promise<void> {
   await initializeScheduler(pool);
   initializeEmbeddingsWorker(pool, config);
 
-  let telegramWebhookSecret: string | undefined;
   if (config.telegram !== undefined) {
-    if (config.publicHostname === undefined) {
-      throw new Error("Config must specify publicHostname when telegram is configured.");
-    }
-    telegramWebhookSecret = await registerTelegramWebhook(config.telegram, config.publicHostname);
-    log.debug(`[solonbot] [debug] Telegram webhook secret loaded: fingerprint=${telegramWebhookSecret.slice(0, 8)}..., bootTime=${new Date().toISOString()}`);
+    await startTelegramPolling(config.telegram);
   }
 
   if (config.whatsapp !== undefined) {
@@ -505,12 +582,14 @@ async function main(): Promise<void> {
 
     if (request.method === "GET" && pathname === "/") {
       void serveHomePage(response, config, pool);
+    } else if (request.method === "GET" && pathname === "/assets/sb.css") {
+      serveSharedStylesheet(response);
+    } else if (request.method === "GET" && pathname.startsWith("/assets/fonts/")) {
+      serveFontFile(response, pathname.slice("/assets/fonts/".length));
     } else if (request.method === "POST" && pathname === "/api/upload") {
       void handleUploadRequest(request, response);
     } else if (request.method === "POST" && pathname === "/chat") {
       handleChatRequest(request, response);
-    } else if (request.method === "POST" && pathname === "/telegram/webhook") {
-      handleTelegramWebhookRequest(request, response, config.telegram, telegramWebhookSecret);
     } else if (request.method === "POST" && pathname === "/email/webhook") {
       if (config.email !== undefined) {
         handleEmailWebhookRequest(request, response, config.email);
@@ -518,6 +597,8 @@ async function main(): Promise<void> {
         response.writeHead(404, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: "Not found" }));
       }
+    } else if (request.method === "POST" && pathname === "/pebble-index/webhook") {
+      handlePebbleIndexWebhookRequest(request, response);
     } else if (request.method === "GET" && pathname === "/login") {
       serveLoginPage(response, config);
     } else if (request.method === "GET" && pathname === "/login/events") {
@@ -525,7 +606,7 @@ async function main(): Promise<void> {
     } else if (request.method === "POST" && pathname === "/login/respond") {
       void handleLoginRespond(request, response);
     } else if (request.method === "GET" && pathname === "/explorer") {
-      serveExplorerPage(response);
+      serveExplorerPage(response, config);
     } else if (request.method === "GET" && pathname === "/api/explorer/tables") {
       void handleTablesRequest(response, pool);
     } else if (request.method === "GET" && pathname.startsWith("/api/explorer/tables/")) {
@@ -543,7 +624,7 @@ async function main(): Promise<void> {
       response.writeHead(302, { "Location": "/settings/plugins" });
       response.end();
     } else if (request.method === "GET" && pathname === "/settings/plugins") {
-      servePluginsPage(response);
+      servePluginsPage(response, config);
     } else if (request.method === "GET" && pathname === "/api/settings/plugins/list") {
       void handlePluginsListRequest(response);
     } else if (request.method === "GET" && pathname.startsWith("/api/settings/plugins/") && pathname.endsWith("/detail")) {
@@ -554,26 +635,36 @@ async function main(): Promise<void> {
       void handlePluginConfigRequest(response, name, config.password);
     } else if (request.method === "POST" && pathname === "/api/settings/plugins/install") {
       void handlePluginInstallRequest(request, response);
+    } else if (request.method === "POST" && pathname === "/api/settings/plugins/add-mcp") {
+      void handlePluginAddMcpRequest(request, response);
     } else if (request.method === "POST" && pathname === "/api/settings/plugins/update") {
       void handlePluginUpdateRequest(request, response);
     } else if (request.method === "POST" && pathname === "/api/settings/plugins/remove") {
       void handlePluginRemoveRequest(request, response);
     } else if (request.method === "POST" && pathname === "/api/settings/plugins/configure") {
       void handlePluginConfigureRequest(request, response);
+    } else if (request.method === "GET" && pathname === "/settings/config") {
+      serveConfigSettingsPage(response, config);
     } else if (request.method === "GET" && pathname === "/settings/allowlist") {
-      serveAllowlistPage(response);
+      serveAllowlistPage(response, config);
     } else if (request.method === "GET" && pathname === "/settings") {
-      serveSettingsHubPage(response);
+      serveSettingsHubPage(response, config);
     } else if (request.method === "GET" && pathname === "/api/settings/allowlist") {
       handleGetAllowlistRequest(response, config);
     } else if (request.method === "PUT" && pathname === "/api/settings/allowlist") {
       void handlePutAllowlistRequest(request, response, config);
+    } else if (request.method === "GET" && pathname === "/api/settings/config") {
+      handleGetConfigRequest(response);
+    } else if (request.method === "PUT" && pathname === "/api/settings/config") {
+      void handlePutConfigRequest(request, response);
     } else if (request.method === "GET" && pathname === "/signal/captcha") {
       serveSignalCaptchaPage(response);
     } else if (request.method === "POST" && pathname === "/signal/captcha") {
       void handleSignalCaptchaSubmit(request, response);
     } else if (request.method === "GET" && pathname.startsWith("/api/pages/") && pathname.includes("/queries/")) {
       void handlePageQueryRequest(request, response, pathname, config.password, pool, url);
+    } else if (request.method === "POST" && pathname.startsWith("/api/pages/") && pathname.includes("/mutations/")) {
+      void handlePageMutationRequest(request, response, pathname, pool);
     } else if (request.method === "GET" && pathname.startsWith("/pages/")) {
       void handlePageRequest(request, response, pathname, config.password, pool);
     } else {

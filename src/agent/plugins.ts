@@ -1,4 +1,4 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { internalFetch } from "../internal-fetch.js";
 import { log } from "../log.js";
 import { toolError } from "../tool-result.js";
@@ -7,7 +7,11 @@ const PLUGIN_RUNNER_BASE_URL = "http://plugin-runner:3003";
 
 /**
  * Parses an allowed_tools list and returns the filtered (and possibly wrapped)
- * tool list for a subagent. `send_agent_message` is always included.
+ * tool list for a subagent. `send_agent_message` is always excluded, even if
+ * `allowedTools` lists it: a subagent's final text response is delivered to the
+ * main agent automatically, so the tool would only produce duplicate reports.
+ * `manage_knowledge` is always included unscoped, because every agent needs
+ * private memory and a scratchpad.
  *
  * Entries without a dot grant full access to that tool. Entries with a dot
  * (e.g. "manage_interlocutors.list") restrict the tool to only the named
@@ -20,8 +24,7 @@ const PLUGIN_RUNNER_BASE_URL = "http://plugin-runner:3003";
  * `run_plugin_tool` is included with its execute wrapped to enforce access.
  */
 export function filterToolsForSubagent(tools: AgentTool[], allowedTools: string[], allowedPlugins: string[]): AgentTool[] {
-  // Always include send_agent_message regardless of the whitelist.
-  const fullyAllowed = new Set<string>(["send_agent_message"]);
+  const fullyAllowed = new Set<string>();
   const actionMap = new Map<string, Set<string>>();
 
   for (const entry of allowedTools) {
@@ -44,6 +47,18 @@ export function filterToolsForSubagent(tools: AgentTool[], allowedTools: string[
   const result: AgentTool[] = [];
 
   for (const tool of tools) {
+    if (tool.name === "send_agent_message") {
+      // Subagents never get send_agent_message, even if allowedTools lists it.
+      continue;
+    }
+
+    if (tool.name === "manage_knowledge") {
+      // Every agent needs private memory and a scratchpad, so this tool is
+      // always granted in full, regardless of allowedTools.
+      result.push(tool);
+      continue;
+    }
+
     if (tool.name === "run_plugin_tool") {
       // run_plugin_tool is handled separately based on allowedPlugins.
       if (allowedPlugins.length === 0) {

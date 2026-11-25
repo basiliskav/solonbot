@@ -8,11 +8,11 @@ RUN apt-get update && \
     python3 \
     python3-pip \
     qrencode && \
-    pip3 install --break-system-packages mistune && \
+    pip3 install --break-system-packages mistune==3.4.0 && \
     rm -rf /var/lib/apt/lists/*
 
 # Download and install signal-cli native build.
-ARG SIGNAL_CLI_VERSION=0.14.1
+ARG SIGNAL_CLI_VERSION=0.14.5
 RUN curl -L "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" -o /tmp/signal-cli.tar.gz && \
     tar -xzf /tmp/signal-cli.tar.gz -C /usr/local/bin && \
     chmod +x /usr/local/bin/signal-cli && \

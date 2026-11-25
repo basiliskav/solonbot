@@ -1,13 +1,16 @@
 """HTTP server that receives coding task requests and spawns claude -p as a subprocess."""
 
 import base64
+import hmac
 import http.server
 import json
 import os
 import re
 import shutil
 import subprocess
+import time
 import tomllib
+import urllib.error
 import urllib.request
 from threading import Thread
 from http import HTTPStatus
@@ -19,12 +22,26 @@ SYSTEM_PROMPT_PATH = "/app/system-prompt.txt"
 PLUGINS_DIR = "/plugins/"
 TASK_TIMEOUT_SECONDS = 600
 MAX_USERNAME_LENGTH = 32
+CODER_UID = 9999
+CODER_GID = 9999
+CODER_USERNAME = "coder"
+CODER_HOME = "/home/coder"
+CODER_BIN_DIR = "/home/coder/.local/bin"
 CODER_CREDENTIALS_PATH = "/home/coder/.claude/.credentials.json"
+CLAUDE_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
+CLAUDE_UPDATE_TIMEOUT_SECONDS = 600
 PLUGIN_NAME_RE = re.compile(r"^[a-z0-9-]+$")
 
+# Delays before each retry of post_result, in seconds. The initial attempt is
+# immediate and each entry here is one additional retry, so the whole array is
+# consumed. The app may be briefly unreachable during a restart and there is no
+# persistent outbox, so without these retries a coding task result would be
+# silently lost forever.
+CALLBACK_RETRY_DELAYS_SECONDS = [5, 15, 30, 60, 120]
 
-def load_config() -> tuple[str, str, str | None, str | None]:
-    """Read config.toml and return (password, model, api_key, coder_base_url).
+
+def load_config() -> tuple[str, str, str | None, str | None, str | None]:
+    """Read config.toml and return (password, model, api_key, coder_base_url, oauth_token).
 
     Raises SystemExit if the password is missing, since the server must not
     start without authentication configured.
@@ -40,15 +57,23 @@ def load_config() -> tuple[str, str, str | None, str | None]:
     coder_section = config.get("coder", {})
     model = coder_section["model"]
 
-    api_key: str | None = config.get("apiKey") or None
-    base_url: str | None = config.get("baseUrl") or None
+    api_key: str | None = coder_section.get("apiKey") or None
+    base_url: str | None = coder_section.get("baseUrl") or None
+    if (api_key is None) != (base_url is None):
+        print("[solonbot-coder] Fatal: [coder] must set both 'apiKey' and 'baseUrl', or neither")
+        raise SystemExit(1)
     if base_url is not None and base_url.endswith("/v1"):
         base_url = base_url[:-3]
 
-    return password, model, api_key, base_url
+    oauth_token: str | None = coder_section.get("oauthToken") or None
+    if oauth_token is not None and api_key is not None:
+        print("[solonbot-coder] Fatal: [coder] must set either 'oauthToken' or 'apiKey'/'baseUrl', not both")
+        raise SystemExit(1)
+
+    return password, model, api_key, base_url, oauth_token
 
 
-PASSWORD, MODEL, API_KEY, BASE_URL = load_config()
+PASSWORD, MODEL, API_KEY, BASE_URL, OAUTH_TOKEN = load_config()
 
 
 def ensure_plugin_user(plugin_name: str, uid: int, gid: int) -> None:
@@ -136,7 +161,13 @@ def make_auth_header() -> str:
 
 
 def post_result(message: str) -> None:
-    """Post the coding task result back to the main app's internal /chat endpoint."""
+    """Post the coding task result back to the main app's internal /chat endpoint.
+
+    Retries on network errors and non-2xx responses with growing backoff. The
+    caller (run_coding_task) runs in a daemon thread and its outer except would
+    swallow any URLError that escaped here, so retries must live inside this
+    function for the result to actually be delivered.
+    """
     body = json.dumps({
         "message": message,
         "source": "coder",
@@ -148,14 +179,32 @@ def post_result(message: str) -> None:
         "Authorization": make_auth_header(),
     }
 
-    request = urllib.request.Request(
-        APP_CHAT_URL,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(request) as response:
-        print(f"[solonbot-coder] Result posted, HTTP {response.status}")
+    attempt = 0
+    while True:
+        attempt += 1
+        request = urllib.request.Request(
+            APP_CHAT_URL,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                status = response.status
+            print(f"[solonbot-coder] Result posted (attempt {attempt}), HTTP {status}")
+            return
+        except urllib.error.HTTPError as error:
+            print(f"[solonbot-coder] Result got HTTP {error.code} on attempt {attempt}: {error.reason}")
+        except urllib.error.URLError as error:
+            print(f"[solonbot-coder] Result post failed on attempt {attempt}: {error.reason}")
+
+        delay_index = attempt - 1
+        if delay_index >= len(CALLBACK_RETRY_DELAYS_SECONDS):
+            print(f"[solonbot-coder] Giving up on result post after {attempt} attempts")
+            return
+        delay = CALLBACK_RETRY_DELAYS_SECONDS[delay_index]
+        print(f"[solonbot-coder] Retrying result post in {delay}s")
+        time.sleep(delay)
 
 
 def run_coding_task(task_id: str, message: str, plugin: str) -> None:
@@ -183,6 +232,8 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
 
         if use_api_key_auth:
             print(f"[solonbot-coder] Using API key auth for task {task_id}")
+        elif OAUTH_TOKEN is not None:
+            print(f"[solonbot-coder] Using OAuth token auth for task {task_id}")
         else:
             # Copy credentials into the plugin directory so claude can authenticate when
             # running as the plugin user. HOME is set to the plugin directory so claude
@@ -215,6 +266,8 @@ def run_coding_task(task_id: str, message: str, plugin: str) -> None:
             assert API_KEY is not None and BASE_URL is not None
             subprocess_env["ANTHROPIC_API_KEY"] = API_KEY
             subprocess_env["ANTHROPIC_BASE_URL"] = BASE_URL
+        elif OAUTH_TOKEN is not None:
+            subprocess_env["CLAUDE_CODE_OAUTH_TOKEN"] = OAUTH_TOKEN
 
         print(f"[solonbot-coder] Running as uid={uid} gid={gid} in {cwd}")
 
@@ -291,7 +344,9 @@ def check_auth(auth_header: str | None) -> bool:
         return False
     # The format is ":password" (empty username).
     _, _, provided_password = decoded.partition(":")
-    return provided_password == PASSWORD
+    # compare_digest raises TypeError on non-ASCII str values, so compare the
+    # UTF-8 encoded bytes directly.
+    return hmac.compare_digest(provided_password.encode("utf-8"), PASSWORD.encode("utf-8"))
 
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
@@ -356,10 +411,57 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def run_claude_update() -> None:
+    """Run 'claude update' as the coder user to keep the CLI current.
+
+    This is the only process allowed to write under /home/coder/.local; plugin
+    users only read and execute the installed binary. The native installer
+    stages the new version and atomically renames it and the launcher symlink
+    into place, so a concurrently running claude task keeps using the version
+    it started with. Any failure is logged and swallowed: the caller retries at
+    the next interval and the server must keep serving tasks.
+    """
+    update_env = {
+        "HOME": CODER_HOME,
+        "PATH": f"{CODER_BIN_DIR}:/usr/local/bin:/usr/bin:/bin",
+        "USER": CODER_USERNAME,
+        "LOGNAME": CODER_USERNAME,
+        "SHELL": "/bin/bash",
+    }
+    try:
+        result = subprocess.run(
+            ["claude", "update"],
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_UPDATE_TIMEOUT_SECONDS,
+            user=CODER_UID,
+            group=CODER_GID,
+            env=update_env,
+        )
+        print(f"[solonbot-coder] claude update exited with code {result.returncode}")
+        if result.stdout.strip():
+            print(f"[solonbot-coder] claude update stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            print(f"[solonbot-coder] claude update stderr: {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        print(f"[solonbot-coder] claude update timed out after {CLAUDE_UPDATE_TIMEOUT_SECONDS}s")
+    except Exception as error:
+        print(f"[solonbot-coder] claude update raised an exception: {error}")
+
+
+def claude_update_loop() -> None:
+    """Update claude at startup and then every CLAUDE_UPDATE_INTERVAL_SECONDS."""
+    while True:
+        run_claude_update()
+        time.sleep(CLAUDE_UPDATE_INTERVAL_SECONDS)
+
+
 def main() -> None:
     """Start the HTTP server."""
     port = int(os.environ.get("PORT", "3002"))
     server = http.server.ThreadingHTTPServer(("", port), RequestHandler)
+    update_thread = Thread(target=claude_update_loop, daemon=True)
+    update_thread.start()
     print(f"[solonbot-coder] Listening on port {port}")
     server.serve_forever()
 

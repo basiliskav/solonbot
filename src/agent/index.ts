@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import pg from "pg";
-import { Type, getModel, type Model, type Api, type TextContent, type ImageContent, type AssistantMessage, type ToolCall } from "@mariozechner/pi-ai";
-import { Agent, type AgentTool, type AgentToolResult, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
+import { Type, type Model, type Api, type TextContent, type ImageContent, type AssistantMessage, type ToolCall } from "@earendil-works/pi-ai";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+import { Agent, type AgentTool, type AgentToolResult, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Config } from "../config.js";
 import type { FileAttachment } from "../uploads.js";
-import { getApiKey } from "../auth.js";
-import { executeSql, loadMessages, saveMessage, saveCompaction, loadLatestCompaction, loadAllMemories, upsertMemory, deleteMemory, upsertScratchpad, deleteScratchpad, readScratchpad, createCronEntry, updateCronEntry, deleteCronEntry, listCronEntries, loadAllScratchpadTitles, getMainAgentId, loadAgent, type Memory, type Agent as AgentRow } from "../database.js";
-import type { RoutingResult } from "../queue.js";
+import { getApiKey, AuthError } from "../auth.js";
+import { executeSql, loadMessages, saveMessage, saveCompaction, loadLatestCompaction, loadAllMemories, upsertMemory, deleteMemory, upsertScratchpad, deleteScratchpad, readScratchpad, createCronEntry, updateCronEntry, deleteCronEntry, listCronEntries, loadAllScratchpadTitles, getMainAgentId, isOwnerIdentity, loadAgent, type Memory, type Agent as AgentRow } from "../database.js";
+import type { Participant, RoutingResult } from "../queue.js";
 import { reloadScheduler } from "../scheduler.js";
 import { createManagePluginsTool, createRunPluginToolTool, createRequestCodingTaskTool } from "../plugin-tools.js";
 import { createRunPythonTool } from "../python.js";
@@ -19,11 +21,12 @@ import { createSearchTool, runSearch } from "../search.js";
 import { createManageUploadsTool } from "../upload-tools.js";
 import { encodeToToon } from "../toon.js";
 import { log } from "../log.js";
-import { AbortError } from "../errors.js";
+import { AbortError, TurnProgressPersistedError } from "../errors.js";
 import { toolError, toolSuccess } from "../tool-result.js";
 import { createSendSignalMessageTool, createSendTelegramMessageTool, createSendWhatsappMessageTool, createSendEmailTool } from "../send-tools.js";
 import { currentAgentId, setCurrentAgentId } from "../agent-context.js";
 export { currentAgentId } from "../agent-context.js";
+import { shouldForwardSubagentFinalText } from "../subagent-report.js";
 import {
   buildPromptSuffix,
   AUTO_SEARCH_MIN_LENGTH,
@@ -50,7 +53,7 @@ import {
   type PluginEntry,
 } from "./plugins.js";
 export { TEMP_ATTACHMENTS_DIR } from "../temp-dir.js";
-export { AbortError } from "../errors.js";
+export { AbortError, TurnProgressPersistedError } from "../errors.js";
 export { createSendSignalMessageTool, createSendTelegramMessageTool, createSendWhatsappMessageTool, createSendEmailTool } from "../send-tools.js";
 
 // Re-export everything from the extracted modules so external importers that
@@ -74,6 +77,7 @@ export {
   TRUNCATION_BUDGET_FRACTION,
   COMPACTION_THRESHOLD_FRACTION,
   COMPACTION_KEEP_FRACTION,
+  LEVEL3_MAX_OUTPUT_FRACTION,
 } from "./compaction.js";
 export {
   filterToolsForSubagent,
@@ -92,6 +96,21 @@ const agentCompactionThresholds = new WeakMap<Agent, number>();
 // is already in progress when another request triggers the threshold, we skip
 // rather than queue, because queuing would compact already-compacted messages.
 let compactionInProgress = false;
+
+// Re-entrancy guard for handlePrompt. The single shared Agent instance is only
+// safe to drive one turn at a time; the queue serialises turns, but if that
+// invariant ever breaks we want a loud failure rather than two interleaved
+// turns corrupting agent.state. Set on entry, cleared in a finally block.
+let handlePromptInProgress = false;
+
+// Inbound chat sources whose subagents are nudged when they end a turn without
+// a send tool call but left text that the queue would forward to the main
+// agent. Other sources (agent, email, cli, cron, etc.) are not nudged.
+const CHAT_TRIGGER_SOURCES = ["signal", "telegram", "whatsapp"];
+
+const SEND_TOOL_NAMES = ["send_signal_message", "send_telegram_message", "send_whatsapp_message", "send_email"];
+
+const NO_SEND_NUDGE_TEXT = "[System notice] You finished your turn without sending anything to the person or group who messaged you. They do not see your final response; only the main agent does. If any part of it was meant for them, send it now with the send tool for this channel. If you chose not to reply, do not send anything. Then give your final response for the main agent again, or exactly NOTHING_TO_REPORT if you have nothing for it.";
 
 // Set to the agent ID whose compaction just finished. The next handlePrompt
 // call for that agent checks this and reloads messages from the DB. Stored as
@@ -134,11 +153,11 @@ Constraints:
 - Memory entries are injected in full every turn; keep them concise.
 - Scratchpad bodies are not injected automatically; use the read action to retrieve them.`;
 
-export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
+export function createManageKnowledgeTool(pool: pg.Pool, getCurrentAgentId: () => number): AgentTool {
   return {
     name: "manage_knowledge",
     label: "Manage knowledge",
-    description: "Upsert or delete entries in the two-tier knowledge store (memory and scratchpad). Use the 'help' action for details.",
+    description: "Upsert, delete, or read entries in the two-tier knowledge store (memory and scratchpad). Use the 'help' action for details.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("upsert"),
@@ -150,7 +169,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
         Type.Literal("memory"),
         Type.Literal("scratchpad"),
       ], { description: "Which store to operate on: memory or scratchpad." })),
-      id: Type.Optional(Type.Number({ description: "Entry id. Omit to create a new entry (upsert); required for delete." })),
+      id: Type.Optional(Type.Number({ description: "Entry id. Omit to create a new entry (upsert); required for delete and read." })),
       content: Type.Optional(Type.String({ description: "Memory content. Required when upserting a memory entry." })),
       title: Type.Optional(Type.String({ description: "Scratchpad title. Required when upserting a scratchpad entry." })),
       body: Type.Optional(Type.String({ description: "Scratchpad body. Required when upserting a scratchpad entry." })),
@@ -169,6 +188,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
       };
 
       const { action, store } = raw;
+      const agentId = getCurrentAgentId();
 
       if (action === "help") {
         return toolSuccess(MANAGE_KNOWLEDGE_HELP_TEXT);
@@ -183,7 +203,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
           if (raw.content === undefined || raw.content.trim() === "") {
             return toolError("Error: content is required when upserting a memory entry.");
           }
-          const memoryResult = await upsertMemory(pool, raw.id, raw.content);
+          const memoryResult = await upsertMemory(pool, agentId, raw.id, raw.content);
           if (raw.id !== undefined && memoryResult.rowCount === 0) {
             return toolError(`Error: memory ${raw.id} not found.`);
           }
@@ -199,7 +219,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
           if (raw.body === undefined || raw.body.trim() === "") {
             return toolError("Error: body is required when upserting a scratchpad entry.");
           }
-          const scratchpadResult = await upsertScratchpad(pool, raw.id, raw.title, raw.body);
+          const scratchpadResult = await upsertScratchpad(pool, agentId, raw.id, raw.title, raw.body);
           if (raw.id !== undefined && scratchpadResult.rowCount === 0) {
             return toolError(`Error: scratchpad entry ${raw.id} not found.`);
           }
@@ -221,7 +241,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
         }
 
         if (store === "memory") {
-          const rowCount = await deleteMemory(pool, raw.id);
+          const rowCount = await deleteMemory(pool, agentId, raw.id);
           if (rowCount === 0) {
             return toolError(`Error: memory ${raw.id} not found.`);
           }
@@ -231,7 +251,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
         }
 
         if (store === "scratchpad") {
-          const rowCount = await deleteScratchpad(pool, raw.id);
+          const rowCount = await deleteScratchpad(pool, agentId, raw.id);
           if (rowCount === 0) {
             return toolError(`Error: scratchpad entry ${raw.id} not found.`);
           }
@@ -252,7 +272,7 @@ export function createManageKnowledgeTool(pool: pg.Pool): AgentTool {
           return toolError("Error: id is required for read.");
         }
 
-        const entry = await readScratchpad(pool, raw.id);
+        const entry = await readScratchpad(pool, agentId, raw.id);
         if (entry === null) {
           return toolError(`Error: scratchpad entry ${raw.id} not found.`);
         }
@@ -272,9 +292,9 @@ const MANAGE_CRON_HELP_TEXT = `manage_cron: create, update, delete, or list sche
 
 Actions:
 - create: create a new cron entry. Parameters: note (required), schedule or fire_at (exactly one required).
-- update: update an existing entry. Parameters: id (required), note (optional), schedule or fire_at (optional, mutually exclusive).
+- update: update an existing entry. Parameters: id (required), plus at least one of note, schedule, or fire_at (schedule and fire_at are mutually exclusive).
 - delete: remove an entry. Parameters: id (required).
-- list: list all cron entries. Returns a JSON array of entries.
+- list: list all cron entries.
 - help: show this help text.
 
 Constraints:
@@ -344,6 +364,9 @@ export function createManageCronTool(pool: pg.Pool): AgentTool {
         if (raw.schedule !== undefined && raw.fire_at !== undefined) {
           return toolError("Error: schedule and fire_at are mutually exclusive.");
         }
+        if (raw.schedule === undefined && raw.fire_at === undefined && raw.note === undefined) {
+          return toolError("Error: provide at least one of note, schedule, or fire_at for update.");
+        }
         const fields: { cronExpression?: string | null; fireAt?: Date | null; note?: string } = {};
         if (raw.schedule !== undefined) {
           fields.cronExpression = raw.schedule;
@@ -408,7 +431,7 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
   const DEFAULT_CONTEXT_WINDOW = 200000;
   const DEFAULT_MAX_TOKENS = 8192;
   const knownModel = config.baseUrl === undefined
-    ? getModel(config.provider as any, config.model as any)
+    ? getBuiltinModel(config.provider as any, config.model as any)
     : undefined;
   const model: Model<Api> = config.baseUrl !== undefined
     ? {
@@ -417,7 +440,7 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
         api: config.api as Api,
         provider: config.provider,
         baseUrl: config.baseUrl,
-        reasoning: false,
+        reasoning: config.reasoning ?? false,
         input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: config.contextWindow!,
@@ -436,9 +459,9 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
         maxTokens: DEFAULT_MAX_TOKENS,
       };
   if (knownModel === undefined && config.baseUrl === undefined) {
-    log.warn(`[stavrobot] Model "${config.model}" not found in provider "${config.provider}" model registry, using fallback (contextWindow=${DEFAULT_CONTEXT_WINDOW}, maxTokens=${DEFAULT_MAX_TOKENS}).`);
+    log.warn(`[solonbot] Model "${config.model}" not found in provider "${config.provider}" model registry, using fallback (contextWindow=${DEFAULT_CONTEXT_WINDOW}, maxTokens=${DEFAULT_MAX_TOKENS}).`);
   }
-  const tools = [createExecuteSqlTool(pool), createManageKnowledgeTool(pool), createManageCronTool(pool), createRunPythonTool(), createManagePagesTool(pool), createManageUploadsTool(), createSearchTool(pool, config.embeddings), createManageFilesTool(), createManageInterlocutorsTool(pool), createManageAgentsTool(pool), createSendAgentMessageTool(pool, () => currentAgentId)];
+  const tools = [createExecuteSqlTool(pool), createManageKnowledgeTool(pool, () => currentAgentId), createManageCronTool(pool), createRunPythonTool(), createManagePagesTool(pool), createManageUploadsTool(), createSearchTool(pool, () => currentAgentId, config.embeddings), createManageFilesTool(), createManageInterlocutorsTool(pool), createManageAgentsTool(pool), createSendAgentMessageTool(pool, () => currentAgentId)];
   tools.push(
     createManagePluginsTool({ coderEnabled: config.coder !== undefined }),
     createRunPluginToolTool(),
@@ -466,15 +489,16 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
     : config.baseSystemPrompt) + buildPromptSuffix(config.publicHostname);
 
   const MIN_CONTEXT_TOKENS = 10000;
+  const DEFAULT_CONTEXT_TOKENS = 50000;
   const rawEffectiveContext = config.contextTokensK !== undefined
     ? Math.min(config.contextTokensK * 1000, model.contextWindow)
-    : model.contextWindow;
+    : Math.min(DEFAULT_CONTEXT_TOKENS, model.contextWindow);
   const effectiveContext = Math.max(rawEffectiveContext, MIN_CONTEXT_TOKENS);
   const tokenBudget = Math.floor(effectiveContext * TRUNCATION_BUDGET_FRACTION);
   const compactionThreshold = Math.floor(effectiveContext * COMPACTION_THRESHOLD_FRACTION);
   const keepBudget = Math.floor(compactionThreshold * COMPACTION_KEEP_FRACTION);
 
-  log.info(`[stavrobot] Context budget: effectiveContext=${effectiveContext / 1000}k, truncationBudget=${tokenBudget / 1000}k, compactionThreshold=${compactionThreshold / 1000}k, keepBudget=${keepBudget / 1000}k`);
+  log.info(`[solonbot] Context budget: effectiveContext=${effectiveContext / 1000}k, truncationBudget=${tokenBudget / 1000}k, compactionThreshold=${compactionThreshold / 1000}k, keepBudget=${keepBudget / 1000}k`);
 
   // Declare agent as Agent | undefined so the transformContext closure can
   // safely guard against the (theoretical) case where it fires before the
@@ -487,10 +511,11 @@ export async function createAgent(config: Config, pool: pg.Pool): Promise<Agent>
     initialState: {
       systemPrompt: effectiveBasePrompt,
       model,
-      thinkingLevel: (config.thinkingLevel ?? "low") as ThinkingLevel,
+      thinkingLevel: (config.thinkingLevel ?? "high") as ThinkingLevel,
       tools: tools.map(wrapToolWithLogging),
       messages: [],
     },
+    streamFn: streamSimple,
     getApiKey: () => getApiKey(config),
     transformContext: async (messages) => {
       const truncated = truncateContext(messages, tokenBudget);
@@ -516,11 +541,48 @@ function formatDate(date: Date): string {
   return `${day} ${year}-${month}-${dayOfMonth} ${hours}:${minutes}:${seconds}`;
 }
 
-export function formatUserMessage(userMessage: string, source?: string, sender?: string): string {
+export function formatUserMessage(userMessage: string, source?: string, sender?: string, participant?: Participant): string {
   const time = formatDate(new Date());
   const resolvedSource = source ?? "cli";
   const resolvedSender = sender ?? "unknown";
-  return `Time: ${time}\nSource: ${resolvedSource}\nSender: ${resolvedSender}\nText: ${userMessage}`;
+  let formatted = `Time: ${time}\nSource: ${resolvedSource}\nSender: ${resolvedSender}`;
+  if (participant !== undefined) {
+    const ownerMarker = isOwnerIdentity(resolvedSource, participant.id) ? " [owner]" : "";
+    formatted += `\nParticipant: ${participant.name} (${participant.id})${ownerMarker}`;
+  }
+  return `${formatted}\nText: ${userMessage}`;
+}
+
+function appendKnowledgeToSystemPrompt(systemPrompt: string, memories: Memory[], scratchpadTitles: { id: number; title: string }[]): string {
+  let result = systemPrompt;
+
+  if (memories.length > 0) {
+    const memoryLines: string[] = ["Your memories:", ""];
+
+    for (const memory of memories) {
+      const created = memory.createdAt.toISOString();
+      const updated = memory.updatedAt.toISOString();
+      const timestamp = created === updated
+        ? `created ${created}`
+        : `created ${created}, updated ${updated}`;
+      memoryLines.push(`[Memory ${memory.id}] (${timestamp})`);
+      memoryLines.push(memory.content);
+      memoryLines.push("");
+    }
+
+    result = `${result}\n\n${memoryLines.join("\n")}`;
+  }
+
+  if (scratchpadTitles.length > 0) {
+    const scratchpadLines = ["Your scratchpad entries:", ""];
+    for (const entry of scratchpadTitles) {
+      scratchpadLines.push(`[Scratchpad ${entry.id}] ${entry.title}`);
+    }
+    log.debug(`[solonbot] Injecting ${scratchpadTitles.length} scratchpad title(s) into system prompt`);
+    result = `${result}\n\n${scratchpadLines.join("\n")}`;
+  }
+
+  return result;
 }
 
 function buildMainAgentSystemPrompt(config: Config, allPlugins: PluginEntry[] | undefined, memories: Memory[], scratchpadTitles: { id: number; title: string }[]): string {
@@ -536,43 +598,10 @@ function buildMainAgentSystemPrompt(config: Config, allPlugins: PluginEntry[] | 
     ? `${effectiveBasePrompt}\n\n${pluginListSection}`
     : effectiveBasePrompt;
 
-  let systemPrompt = promptWithPlugins;
-
-  if (memories.length > 0) {
-    const memoryLines: string[] = [
-      "These are your memories, they are things you stored yourself. Use the `manage_knowledge` tool (store: \"memory\") to upsert or delete memories. You should add anything that seems important to the user, anything that might have bearing on the future, or anything that will be important to recall later. Keep memories concise — they are injected in full every turn, so avoid storing large amounts of text here. Use the scratchpad for less frequent or longer-form knowledge.",
-      "",
-      "Here are your memories:",
-      "",
-    ];
-
-    for (const memory of memories) {
-      const created = memory.createdAt.toISOString();
-      const updated = memory.updatedAt.toISOString();
-      const timestamp = created === updated
-        ? `created ${created}`
-        : `created ${created}, updated ${updated}`;
-      memoryLines.push(`[Memory ${memory.id}] (${timestamp})`);
-      memoryLines.push(memory.content);
-      memoryLines.push("");
-    }
-
-    systemPrompt = `${systemPrompt}\n\n${memoryLines.join("\n")}`;
-  }
-
-  if (scratchpadTitles.length > 0) {
-    const scratchpadLines = ["Your scratchpad (use manage_knowledge with store: \"scratchpad\" to upsert, delete, or read entries; use the read action to retrieve a body by id):", ""];
-    for (const entry of scratchpadTitles) {
-      scratchpadLines.push(`[Scratchpad ${entry.id}] ${entry.title}`);
-    }
-    log.debug(`[solonbot] Injecting ${scratchpadTitles.length} scratchpad title(s) into system prompt`);
-    systemPrompt = `${systemPrompt}\n\n${scratchpadLines.join("\n")}`;
-  }
-
-  return systemPrompt;
+  return appendKnowledgeToSystemPrompt(promptWithPlugins, memories, scratchpadTitles);
 }
 
-async function buildSubagentSystemPrompt(config: Config, subagentRow: AgentRow | null, allPlugins: PluginEntry[] | undefined): Promise<string> {
+async function buildSubagentSystemPrompt(config: Config, subagentRow: AgentRow | null, allPlugins: PluginEntry[] | undefined, memories: Memory[], scratchpadTitles: { id: number; title: string }[]): Promise<string> {
   const agentSystemPrompt = subagentRow?.systemPrompt ?? "";
   const subagentAllowedPlugins = subagentRow?.allowedPlugins ?? [];
 
@@ -608,9 +637,11 @@ async function buildSubagentSystemPrompt(config: Config, subagentRow: AgentRow |
     ? `${basePrompt}\n\n${pluginListSection}`
     : basePrompt;
 
-  return agentSystemPrompt.trim() !== ""
+  const promptWithAgentInstructions = agentSystemPrompt.trim() !== ""
     ? `${promptWithPlugins}\n\n${agentSystemPrompt}`
     : promptWithPlugins;
+
+  return appendKnowledgeToSystemPrompt(promptWithAgentInstructions, memories, scratchpadTitles);
 }
 
 async function processAttachments(attachments: FileAttachment[]): Promise<{ resolvedMessage: string | undefined; imageContents: ImageContent[] }> {
@@ -639,9 +670,9 @@ async function processAttachments(attachments: FileAttachment[]): Promise<{ reso
   return { resolvedMessage, imageContents };
 }
 
-function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number, config: Config, compactionThreshold: number): void {
+export function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number, config: Config, compactionThreshold: number): Promise<void> {
   if (estimateTokens(agent.state.messages) <= compactionThreshold || compactionInProgress) {
-    return;
+    return Promise.resolve();
   }
 
   compactionInProgress = true;
@@ -651,7 +682,7 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
 
   log.debug(`[solonbot] [debug] Compaction triggered: ${currentMessages.length} messages, ~${Math.round(estimateTokens(currentMessages))} estimated tokens`);
 
-  void (async () => {
+  return (async () => {
     try {
       const cutIndexOrNull = selectCompactionCutIndex(currentMessages, compactionThreshold);
       if (cutIndexOrNull === null) {
@@ -660,7 +691,10 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
       }
       const cutIndex = cutIndexOrNull;
 
-      const messagesToCompact = currentMessages.slice(0, cutIndex);
+      // Cap the summarizer input at the compaction threshold. This bounds the
+      // serialized transcript and also trims an oversized summary message left
+      // by a previous failed compaction, so the row self-heals on the next run.
+      const messagesToCompact = truncateContext(currentMessages.slice(0, cutIndex), compactionThreshold);
       const messagesToKeep = currentMessages.slice(cutIndex);
 
       log.debug(`[solonbot] [debug] Cut point: index=${cutIndex}, compacting=${messagesToCompact.length}, keeping=${messagesToKeep.length}`);
@@ -683,7 +717,7 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
       const snapshotMaxId = maxIdResult.rows[0].max_id;
 
       const apiKey = await getApiKey(config);
-      const summaryText = await escalatingSummarize(serializedMessages, config, agent.state.model, apiKey);
+      const summaryText = await escalatingSummarize(serializedMessages, config, agent.state.model, apiKey, compactionThreshold);
 
       const previousCompaction = await loadLatestCompaction(pool, agentId);
       const previousBoundary = previousCompaction ? previousCompaction.upToMessageId : 0;
@@ -717,7 +751,24 @@ function triggerCompactionIfNeeded(agent: Agent, pool: pg.Pool, agentId: number,
   })();
 }
 
-export async function handlePrompt(
+// The final assistant text is the joined text blocks of the last assistant
+// message. This is the text the queue forwards as the subagent's report, so the
+// nudge condition and the returned response use the same extraction.
+function extractFinalAssistantText(messages: AgentMessage[]): string {
+  const lastAssistantMessage = messages
+    .slice()
+    .reverse()
+    .find((message) => message.role === "assistant");
+  if (lastAssistantMessage === undefined) {
+    return "";
+  }
+  return lastAssistantMessage.content
+    .filter((block): block is TextContent => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+}
+
+export function handlePrompt(
   agent: Agent,
   pool: pg.Pool,
   userMessage: string | undefined,
@@ -725,7 +776,33 @@ export async function handlePrompt(
   routing: RoutingResult,
   source?: string,
   attachments?: FileAttachment[],
-  isRetry: boolean = false
+  isRetry: boolean = false,
+  participant?: Participant,
+): Promise<string> {
+  // The single shared Agent instance is only safe to drive one turn at a time.
+  // The queue serialises turns so this re-entrancy check should never fire; if
+  // it does, the queue's single-threading invariant has broken and we want to
+  // fail loud rather than let two turns corrupt agent.state concurrently.
+  if (handlePromptInProgress) {
+    throw new Error("handlePrompt re-entered while another turn is still in progress; this is a queue bug.");
+  }
+  handlePromptInProgress = true;
+  return runHandlePrompt(agent, pool, userMessage, config, routing, source, attachments, isRetry, participant)
+    .finally(() => {
+      handlePromptInProgress = false;
+    });
+}
+
+async function runHandlePrompt(
+  agent: Agent,
+  pool: pg.Pool,
+  userMessage: string | undefined,
+  config: Config,
+  routing: RoutingResult,
+  source?: string,
+  attachments?: FileAttachment[],
+  isRetry: boolean = false,
+  participant?: Participant,
 ): Promise<string> {
   pendingAutoSearchBlocks.delete(agent);
 
@@ -750,9 +827,6 @@ export async function handlePrompt(
     log.debug(`[solonbot] [debug] Reloaded ${conversationMessages.length} messages`);
   }
 
-  agent.state.messages = conversationMessages;
-  log.debug(`[solonbot] Loaded ${conversationMessages.length} messages for agent ${agentId}.`);
-
   const allPlugins = await fetchPluginList();
 
   // Load the subagent's DB row once here so it can be used for both system
@@ -761,17 +835,31 @@ export async function handlePrompt(
 
   let systemPrompt: string;
 
+  const memories = await loadAllMemories(pool, agentId);
+  const scratchpadTitles = await loadAllScratchpadTitles(pool, agentId);
+
   if (isMainAgent) {
-    const memories = await loadAllMemories(pool);
-    const scratchpadTitles = await loadAllScratchpadTitles(pool);
     systemPrompt = buildMainAgentSystemPrompt(config, allPlugins, memories, scratchpadTitles);
   } else {
-    systemPrompt = await buildSubagentSystemPrompt(config, subagentRow, allPlugins);
+    systemPrompt = await buildSubagentSystemPrompt(config, subagentRow, allPlugins, memories, scratchpadTitles);
   }
 
-  agent.state.systemPrompt = systemPrompt;
+  // Pi's transcript owns the system prompt now, and state.systemPrompt is
+  // read-only: the leading system message is the prompt. Rebuild that message
+  // along with the conversation history loaded from the database.
+  agent.state.messages = [
+    { role: "system", content: systemPrompt, timestamp: Date.now() },
+    ...conversationMessages,
+  ];
+  log.debug(`[solonbot] Loaded ${conversationMessages.length} messages for agent ${agentId}.`);
 
   let saveChain: Promise<unknown> = Promise.resolve();
+
+  // Tracks whether the subscribe callback persisted any message beyond the
+  // initial user row this turn. Declared out here (rather than next to the
+  // subscriber) so the post-prompt error handler can read it: if a turn fails
+  // after persisting progress, the queue must not retry it.
+  let progressPersistedThisTurn = false;
 
   let resolvedMessage = userMessage;
 
@@ -811,17 +899,26 @@ export async function handlePrompt(
     }
   }
 
-  // The try/finally starts here — after the auto-search block may have been
-  // set — so that pendingAutoSearchBlocks.delete(agent) runs on every exit
-  // path, including exceptions thrown by getApiKey, setTools, or subscribe
-  // before agent.prompt is reached.
+  // Capture the full tool list before any subagent filtering. The outer
+  // finally restores it on every exit path: the shared Agent instance outlives
+  // a single turn, and if a subagent's restricted list were left in place after
+  // an exception (getApiKey, saveMessage, the embedding insert, or subscribe can
+  // all throw after the swap but before the inner try), the next turn would run
+  // with the wrong tools.
+  const fullTools = agent.state.tools;
+  let toolsWereSwapped = false;
+
+  // This try/catch/finally wraps the entire turn body so that ANY error
+  // escaping after the subscribe callback persisted progress is wrapped in
+  // TurnProgressPersistedError (see the catch block). The finally deletes the
+  // pending auto-search block on every exit path, including exceptions thrown
+  // by getApiKey, setTools, or subscribe before agent.prompt is reached.
   try {
-    const messageToSend = formatUserMessage(resolvedMessage ?? "", source, senderLabel);
+    const messageToSend = formatUserMessage(resolvedMessage ?? "", source, senderLabel, participant);
 
     // Filter tools for subagents based on their allowed_tools list. The main
     // agent always gets the full tool set. For subagents, we temporarily swap
-    // the tool list before the prompt and restore it after.
-    const fullTools = agent.state.tools;
+    // the tool list here and restore it in the outer finally.
     if (!isMainAgent) {
       const allowedTools = subagentRow?.allowedTools ?? [];
       const allowedPlugins = subagentRow?.allowedPlugins ?? [];
@@ -829,6 +926,7 @@ export async function handlePrompt(
       if (!allowedTools.includes("*")) {
         const filteredTools = filterToolsForSubagent(fullTools, allowedTools, allowedPlugins);
         agent.state.tools = filteredTools;
+        toolsWereSwapped = true;
       }
     }
 
@@ -876,11 +974,20 @@ export async function handlePrompt(
     // messages that get saved without sender metadata.
     let initialPromptEventConsumed = false;
 
+    // Whether the model called a send tool in this turn. Any call counts, even
+    // one whose tool result is an error, because the person may still have seen
+    // an attempt to reach them. Used to nudge chat-triggered subagents that end
+    // their turn silently.
+    let sendToolCallObserved = false;
+
     const unsubscribe = agent.subscribe((event) => {
       if (event.type === "message_end") {
         const message = event.message;
         if (message.role === "assistant") {
           const assistantMessage = message as unknown as AssistantMessage;
+          if (assistantMessage.content.some((block) => block.type === "toolCall" && SEND_TOOL_NAMES.includes(block.name))) {
+            sendToolCallObserved = true;
+          }
           if (assistantMessage.stopReason === "error" || assistantMessage.stopReason === "aborted") {
             return;
           }
@@ -893,12 +1000,22 @@ export async function handlePrompt(
           if (message.role === "user" && !initialPromptEventConsumed) {
             // The initial prompt message_end event: already pre-saved above, skip it.
             initialPromptEventConsumed = true;
-          } else if (message.role === "user") {
-            // Steered messages injected mid-run: save without sender metadata since
-            // they come from the same owner session already established above.
-            saveChain = saveChain.then(() => saveMessage(pool, message, agentId));
           } else {
-            saveChain = saveChain.then(() => saveMessage(pool, message, agentId));
+            // Any persisted message here represents progress beyond the initial
+            // user row: a steered user message, an assistant turn, or a tool
+            // result. Steered messages are saved without sender metadata because
+            // they come from the same owner session already established above.
+            progressPersistedThisTurn = true;
+            // Attach a no-op rejection handler to each appended link so Node's
+            // default unhandled-rejection behaviour does not crash the process
+            // while agent.prompt() is still running (a turn can take minutes, so
+            // a save may reject long before the finally observes the chain). The
+            // real handling happens at `await saveChain` in the finally below,
+            // which still rethrows the first failure; the no-op catch only
+            // marks the intermediate link as observed.
+            const next = saveChain.then(() => saveMessage(pool, message, agentId));
+            void next.catch(() => {});
+            saveChain = next;
           }
         }
       }
@@ -910,68 +1027,91 @@ export async function handlePrompt(
       } else {
         await agent.prompt(messageToSend);
       }
-    } finally {
-      // Restore the full tool list if it was filtered for a subagent.
-      if (!isMainAgent) {
-        agent.state.tools = fullTools;
+
+      if (
+        !isMainAgent &&
+        source !== undefined &&
+        CHAT_TRIGGER_SOURCES.includes(source) &&
+        !sendToolCallObserved &&
+        !agent.state.errorMessage &&
+        shouldForwardSubagentFinalText(extractFinalAssistantText(agent.state.messages))
+      ) {
+        log.info(`[solonbot] Subagent ${agentId} ended a chat-triggered turn without a send tool call but left a report; nudging it to send any reply.`);
+        await agent.prompt(NO_SEND_NUDGE_TEXT);
       }
+    } finally {
       unsubscribe();
       await saveChain;
     }
+
+    if (agent.state.errorMessage) {
+      const errorJson = JSON.stringify(agent.state.errorMessage);
+      // Check if the error was caused by an intentional abort by looking at the
+      // last assistant message's stopReason. agent.state.error is a plain string
+      // (the error message), not the message object, so we must inspect the
+      // conversation history instead.
+      const wasAborted = agent.state.messages.some((message) => {
+        if (message.role !== "assistant") return false;
+        const assistantMessage = message as unknown as AssistantMessage;
+        return assistantMessage.stopReason === "aborted";
+      });
+      // Remove error/aborted assistant messages from in-memory state so the next
+      // prompt starts clean. These messages are stripped by the library's
+      // transformMessages anyway, but leaving them in state can orphan adjacent
+      // toolResult messages and cause 400 errors on subsequent prompts.
+      const cleanedMessages = agent.state.messages.filter((message) => {
+        if (message.role !== "assistant") return true;
+        const assistantMessage = message as unknown as AssistantMessage;
+        return assistantMessage.stopReason !== "error" && assistantMessage.stopReason !== "aborted";
+      });
+      agent.state.messages = cleanedMessages;
+      if (wasAborted) {
+        log.info("[solonbot] Agent aborted.");
+        const cancellationMessage = {
+          role: "user" as const,
+          content: [{ type: "text" as const, text: "[The user cancelled the previous request with /stop.]" }],
+          timestamp: Date.now(),
+        };
+        agent.state.messages = [...agent.state.messages, cancellationMessage];
+        await saveMessage(pool, cancellationMessage, agentId);
+        throw new AbortError();
+      }
+      log.error("[solonbot] Agent error:", errorJson);
+      // Throw a plain Error here. The outer catch wraps it in
+      // TurnProgressPersistedError when progress was already persisted, so a
+      // retry would not replay tool side effects.
+      throw new Error(`Agent error: ${errorJson}`);
+    }
+
+    const responseText = extractFinalAssistantText(agent.state.messages);
+
+    const compactionThreshold = agentCompactionThresholds.get(agent) ?? Math.floor(agent.state.model.contextWindow * COMPACTION_THRESHOLD_FRACTION);
+    void triggerCompactionIfNeeded(agent, pool, agentId, config, compactionThreshold);
+
+    return responseText;
+  } catch (error) {
+    // Any error escaping the turn after the subscribe callback persisted a
+    // message beyond the initial user row must not be retried: reloading that
+    // progress would replay every tool side effect (duplicate outbound
+    // messages, duplicate external calls). Wrap such errors so the queue can
+    // tell them apart from a clean failure. AbortError is excluded because an
+    // abort is a clean resolution with nothing to replay. AuthError is excluded
+    // because the queue already handles it without retrying and wrapping it
+    // would replace the login prompt with a generic failure message.
+    if (progressPersistedThisTurn && !(error instanceof AbortError) && !(error instanceof AuthError)) {
+      const originalMessage = error instanceof Error ? error.message : String(error);
+      throw new TurnProgressPersistedError(originalMessage);
+    }
+    throw error;
   } finally {
+    // Restore the full tool list if it was filtered for a subagent. This lives
+    // in the outer finally rather than the inner one so exceptions thrown
+    // before the inner try (getApiKey, saveMessage, embedding insert, subscribe)
+    // still restore the tools. Without this, the shared Agent instance would
+    // keep the subagent's filtered tools for the next turn.
+    if (toolsWereSwapped) {
+      agent.state.tools = fullTools;
+    }
     pendingAutoSearchBlocks.delete(agent);
   }
-
-  if (agent.state.errorMessage) {
-    const errorJson = JSON.stringify(agent.state.errorMessage);
-    // Check if the error was caused by an intentional abort by looking at the
-    // last assistant message's stopReason. agent.state.error is a plain string
-    // (the error message), not the message object, so we must inspect the
-    // conversation history instead.
-    const wasAborted = agent.state.messages.some((message) => {
-      if (message.role !== "assistant") return false;
-      const assistantMessage = message as unknown as AssistantMessage;
-      return assistantMessage.stopReason === "aborted";
-    });
-    // Remove error/aborted assistant messages from in-memory state so the next
-    // prompt starts clean. These messages are stripped by the library's
-    // transformMessages anyway, but leaving them in state can orphan adjacent
-    // toolResult messages and cause 400 errors on subsequent prompts.
-    const cleanedMessages = agent.state.messages.filter((message) => {
-      if (message.role !== "assistant") return true;
-      const assistantMessage = message as unknown as AssistantMessage;
-      return assistantMessage.stopReason !== "error" && assistantMessage.stopReason !== "aborted";
-    });
-    agent.state.messages = cleanedMessages;
-    if (wasAborted) {
-      log.info("[solonbot] Agent aborted.");
-      const cancellationMessage = {
-        role: "user" as const,
-        content: [{ type: "text" as const, text: "[The user cancelled the previous request with /stop.]" }],
-        timestamp: Date.now(),
-      };
-      agent.state.messages = [...agent.state.messages, cancellationMessage];
-      await saveMessage(pool, cancellationMessage, agentId);
-      throw new AbortError();
-    }
-    log.error("[solonbot] Agent error:", errorJson);
-    throw new Error(`Agent error: ${errorJson}`);
-  }
-
-  const lastAssistantMessage = agent.state.messages
-    .slice()
-    .reverse()
-    .find((message) => message.role === "assistant");
-
-  const responseText = lastAssistantMessage
-    ? lastAssistantMessage.content
-        .filter((block): block is TextContent => block.type === "text")
-        .map((block) => block.text)
-        .join("")
-    : "";
-
-  const compactionThreshold = agentCompactionThresholds.get(agent) ?? Math.floor(agent.state.model.contextWindow * COMPACTION_THRESHOLD_FRACTION);
-  triggerCompactionIfNeeded(agent, pool, agentId, config, compactionThreshold);
-
-  return responseText;
 }

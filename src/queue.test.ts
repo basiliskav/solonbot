@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type pg from "pg";
-import type { Agent } from "@mariozechner/pi-agent-core";
+import type { Agent } from "@earendil-works/pi-agent-core";
 import type { Config } from "./config.js";
 import { AuthError, invalidateCredentials } from "./auth.js";
-import { AbortError } from "./errors.js";
+import { AbortError, TurnProgressPersistedError } from "./errors.js";
 import type { RoutingResult } from "./queue.js";
 import { parseProviderErrorMessage } from "./queue.js";
 
@@ -39,15 +39,16 @@ vi.mock("./database.js", () => ({
 }));
 vi.mock("./allowlist.js", () => ({
   isInAllowlist: vi.fn().mockReturnValue(false),
+  recordRejectedSender: vi.fn(),
 }));
 
 import { handlePrompt, formatUserMessage } from "./agent/index.js";
 import { getMainAgentId, isOwnerIdentity, resolveInterlocutor } from "./database.js";
-import { isInAllowlist } from "./allowlist.js";
+import { isInAllowlist, recordRejectedSender } from "./allowlist.js";
 import { sendSignalMessage } from "./signal.js";
 import { sendTelegramMessage } from "./telegram-api.js";
 import { sendWhatsappTextMessage } from "./whatsapp-api.js";
-import { initializeQueue, enqueueMessage, MAX_RETRIES } from "./queue.js";
+import { initializeQueue, enqueueMessage, MAX_RETRIES, NOTHING_TO_REPORT } from "./queue.js";
 
 const mockInvalidateCredentials = vi.mocked(invalidateCredentials);
 const mockHandlePrompt = vi.mocked(handlePrompt);
@@ -56,6 +57,7 @@ const mockGetMainAgentId = vi.mocked(getMainAgentId);
 const mockIsOwnerIdentity = vi.mocked(isOwnerIdentity);
 const mockResolveInterlocutor = vi.mocked(resolveInterlocutor);
 const mockIsInAllowlist = vi.mocked(isInAllowlist);
+const mockRecordRejectedSender = vi.mocked(recordRejectedSender);
 const mockSendSignalMessage = vi.mocked(sendSignalMessage);
 const mockSendTelegramMessage = vi.mocked(sendTelegramMessage);
 const mockSendWhatsappTextMessage = vi.mocked(sendWhatsappTextMessage);
@@ -89,45 +91,43 @@ describe("processQueue non-retryable 400 error handling", () => {
     expect(mockHandlePrompt).toHaveBeenCalledTimes(1);
   });
 
-  it("sends the error message to the Signal channel on a 400 error", async () => {
+  it.each([
+    {
+      channel: "Signal",
+      source: "signal",
+      sender: "+1234567890",
+      config: stubConfig,
+      sendMock: mockSendSignalMessage,
+      expectedArgs: ["+1234567890", "Something went wrong: orphaned tool_result"],
+    },
+    {
+      channel: "Telegram",
+      source: "telegram",
+      sender: "987654321",
+      config: { ...stubConfig, telegram: { botToken: "bot-token" } } as unknown as Config,
+      sendMock: mockSendTelegramMessage,
+      expectedArgs: ["bot-token", "987654321", "Something went wrong: orphaned tool_result"],
+    },
+    {
+      channel: "WhatsApp",
+      source: "whatsapp",
+      sender: "+1234567890",
+      config: stubConfig,
+      sendMock: mockSendWhatsappTextMessage,
+      expectedArgs: ["+1234567890", "Something went wrong: orphaned tool_result"],
+    },
+  ])("sends the error message to the $channel channel on a 400 error", async ({ source, sender, config, sendMock, expectedArgs }) => {
+    initializeQueue(stubAgent, stubPool, config);
     // Use owner identity so the message bypasses the allowlist gate and reaches handlePrompt.
     mockIsOwnerIdentity.mockReturnValue(true);
     mockHandlePrompt.mockRejectedValueOnce(
       new Error('Agent error: "400 {"type":"error","error":{"type":"invalid_request_error","message":"orphaned tool_result"}}"'),
     );
 
-    await enqueueMessage("hello", "signal", "+1234567890");
+    await enqueueMessage("hello", source, sender);
 
-    expect(mockSendSignalMessage).toHaveBeenCalledOnce();
-    expect(mockSendSignalMessage).toHaveBeenCalledWith("+1234567890", "Something went wrong: orphaned tool_result");
-  });
-
-  it("sends the error message to the Telegram channel on a 400 error", async () => {
-    const configWithTelegram = { ...stubConfig, telegram: { botToken: "bot-token" } } as unknown as Config;
-    initializeQueue(stubAgent, stubPool, configWithTelegram);
-    // Use owner identity so the message bypasses the allowlist gate and reaches handlePrompt.
-    mockIsOwnerIdentity.mockReturnValue(true);
-    mockHandlePrompt.mockRejectedValueOnce(
-      new Error('Agent error: "400 {"type":"error","error":{"type":"invalid_request_error","message":"orphaned tool_result"}}"'),
-    );
-
-    await enqueueMessage("hello", "telegram", "987654321");
-
-    expect(mockSendTelegramMessage).toHaveBeenCalledOnce();
-    expect(mockSendTelegramMessage).toHaveBeenCalledWith("bot-token", "987654321", "Something went wrong: orphaned tool_result");
-  });
-
-  it("sends the error message to the WhatsApp channel on a 400 error", async () => {
-    // Use owner identity so the message bypasses the allowlist gate and reaches handlePrompt.
-    mockIsOwnerIdentity.mockReturnValue(true);
-    mockHandlePrompt.mockRejectedValueOnce(
-      new Error('Agent error: "400 {"type":"error","error":{"type":"invalid_request_error","message":"orphaned tool_result"}}"'),
-    );
-
-    await enqueueMessage("hello", "whatsapp", "+1234567890");
-
-    expect(mockSendWhatsappTextMessage).toHaveBeenCalledOnce();
-    expect(mockSendWhatsappTextMessage).toHaveBeenCalledWith("+1234567890", "Something went wrong: orphaned tool_result");
+    expect(sendMock).toHaveBeenCalledOnce();
+    expect(sendMock).toHaveBeenCalledWith(...expectedArgs);
   });
 
   it("retries when the error does not contain '400 {'", async () => {
@@ -171,33 +171,78 @@ describe("processQueue non-retryable 400 error handling", () => {
     expect(mockInvalidateCredentials).toHaveBeenCalledWith(stubConfig);
   });
 
-  it("resolves (does not reject) after exhausting retries and sends error to source channel", async () => {
-    // Use owner identity so the message bypasses the allowlist gate and reaches handlePrompt.
-    mockIsOwnerIdentity.mockReturnValue(true);
-    mockHandlePrompt.mockRejectedValue(new Error("network timeout"));
-    mockSendSignalMessage.mockResolvedValue("ok");
+  it("does not retry and resolves with the parsed message when handlePrompt throws TurnProgressPersistedError", async () => {
+    // Simulate a turn that already persisted tool results before failing: handlePrompt
+    // signals this by throwing TurnProgressPersistedError so the queue cannot retry.
+    mockHandlePrompt.mockRejectedValueOnce(
+      new TurnProgressPersistedError(
+        'Agent error: "500 {"type":"error","error":{"type":"internal_error","message":"provider overloaded"}}"',
+      ),
+    );
 
-    vi.useFakeTimers();
-    const resultPromise = enqueueMessage("hello", "signal", "+1234567890");
-    await vi.runAllTimersAsync();
-    vi.useRealTimers();
+    const result = await enqueueMessage("hello");
 
-    // Must resolve, not reject — no unhandled rejection.
-    const result = await resultPromise;
-    expect(result).toBe("Something went wrong: network timeout");
-    expect(mockHandlePrompt).toHaveBeenCalledTimes(MAX_RETRIES + 1);
-    expect(mockSendSignalMessage).toHaveBeenCalledOnce();
-    expect(mockSendSignalMessage).toHaveBeenCalledWith("+1234567890", "Something went wrong: network timeout");
+    expect(result).toBe("Something went wrong: provider overloaded");
+    // Exactly one attempt — the persisted-progress guard suppresses the retry loop.
+    expect(mockHandlePrompt).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves (does not reject) after exhausting retries and sends error to WhatsApp channel", async () => {
+  it("sends the TurnProgressPersistedError message to the originating channel", async () => {
+    // Use owner identity so the message bypasses the allowlist gate and reaches handlePrompt.
+    mockIsOwnerIdentity.mockReturnValue(true);
+    mockHandlePrompt.mockRejectedValueOnce(
+      new TurnProgressPersistedError(
+        'Agent error: "500 {"type":"error","error":{"type":"internal_error","message":"provider overloaded"}}"',
+      ),
+    );
+
+    await enqueueMessage("hello", "signal", "+1234567890");
+
+    expect(mockSendSignalMessage).toHaveBeenCalledOnce();
+    expect(mockSendSignalMessage).toHaveBeenCalledWith("+1234567890", "Something went wrong: provider overloaded");
+  });
+
+  it("invalidates credentials and resolves with the login message when TurnProgressPersistedError wraps a 401", async () => {
+    // A mid-turn 401 that only surfaces after progress was persisted is wrapped
+    // in TurnProgressPersistedError. The queue must still detect the 401 and take
+    // the invalidate + login path (rather than a generic failure message), and
+    // must not retry.
+    mockHandlePrompt.mockRejectedValueOnce(
+      new TurnProgressPersistedError(
+        'Agent error: "401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}"',
+      ),
+    );
+
+    const result = await enqueueMessage("hello");
+
+    expect(result).toContain("Authentication required");
+    expect(mockHandlePrompt).toHaveBeenCalledTimes(1);
+    expect(mockInvalidateCredentials).toHaveBeenCalledOnce();
+    expect(mockInvalidateCredentials).toHaveBeenCalledWith(stubConfig);
+  });
+
+  it.each([
+    {
+      channel: "signal",
+      source: "signal" as string | undefined,
+      sender: "+1234567890" as string | undefined,
+      sendMock: mockSendSignalMessage,
+      expectedArgs: ["+1234567890", "Something went wrong: network timeout"],
+    },
+    {
+      channel: "WhatsApp",
+      source: "whatsapp",
+      sender: "+1234567890",
+      sendMock: mockSendWhatsappTextMessage,
+      expectedArgs: ["+1234567890", "Something went wrong: network timeout"],
+    },
+  ])("resolves (does not reject) after exhausting retries and sends error to $channel channel", async ({ source, sender, sendMock, expectedArgs }) => {
     // Use owner identity so the message bypasses the allowlist gate and reaches handlePrompt.
     mockIsOwnerIdentity.mockReturnValue(true);
     mockHandlePrompt.mockRejectedValue(new Error("network timeout"));
-    mockSendWhatsappTextMessage.mockResolvedValue(undefined);
 
     vi.useFakeTimers();
-    const resultPromise = enqueueMessage("hello", "whatsapp", "+1234567890");
+    const resultPromise = enqueueMessage("hello", source, sender);
     await vi.runAllTimersAsync();
     vi.useRealTimers();
 
@@ -205,85 +250,55 @@ describe("processQueue non-retryable 400 error handling", () => {
     const result = await resultPromise;
     expect(result).toBe("Something went wrong: network timeout");
     expect(mockHandlePrompt).toHaveBeenCalledTimes(MAX_RETRIES + 1);
-    expect(mockSendWhatsappTextMessage).toHaveBeenCalledOnce();
-    expect(mockSendWhatsappTextMessage).toHaveBeenCalledWith("+1234567890", "Something went wrong: network timeout");
+    expect(sendMock).toHaveBeenCalledOnce();
+    expect(sendMock).toHaveBeenCalledWith(...expectedArgs);
   });
 });
 
 describe("parseProviderErrorMessage", () => {
-  it("extracts the message field from a 400 provider error JSON", () => {
-    const raw = 'Agent error: "400 {"type":"error","error":{"type":"invalid_request_error","message":"orphaned tool_result"}}"';
-    expect(parseProviderErrorMessage(raw)).toBe("orphaned tool_result");
+  it.each([
+    [
+      'Agent error: "400 {"type":"error","error":{"type":"invalid_request_error","message":"orphaned tool_result"}}"',
+      "orphaned tool_result",
+    ],
+    [
+      'Agent error: "429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit."}}"',
+      "This request would exceed your account's rate limit.",
+    ],
+  ])("extracts the message field from a provider error JSON (%#)", (raw, expected) => {
+    expect(parseProviderErrorMessage(raw)).toBe(expected);
   });
 
-  it("extracts the message field from a 429 provider error JSON", () => {
-    const raw = 'Agent error: "429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit."}}"';
-    expect(parseProviderErrorMessage(raw)).toBe("This request would exceed your account's rate limit.");
-  });
-
-  it("falls back to the raw error string when JSON is malformed", () => {
-    const raw = "Agent error: not json at all";
-    expect(parseProviderErrorMessage(raw)).toBe(raw);
-  });
-
-  it("falls back to the raw error string when the error object has no message field", () => {
-    const raw = 'Agent error: "400 {"type":"error","error":{"type":"invalid_request_error"}}"';
+  it.each([
+    ["Agent error: not json at all"],
+    ['Agent error: "400 {"type":"error","error":{"type":"invalid_request_error"}}"'],
+  ])("falls back to the raw error string (%#)", (raw) => {
     expect(parseProviderErrorMessage(raw)).toBe(raw);
   });
 });
 
 describe("message routing", () => {
-  it("routes CLI messages (no source) to the owner conversation", async () => {
-    await enqueueMessage("hello");
+  it.each([
+    { label: "CLI messages (no source)", message: "hello", source: undefined, attachments: undefined, senderLabel: "owner" },
+    { label: "cron messages", message: "reminder", source: "cron", attachments: undefined, senderLabel: "cron" },
+    { label: "coder messages", message: "task done", source: "coder", attachments: undefined, senderLabel: "coder" },
+    {
+      label: "upload messages",
+      message: undefined,
+      source: "upload",
+      attachments: [{ storedPath: "/tmp/upload-abc.jpg", originalFilename: "photo.jpg", mimeType: "image/jpeg", size: 1024 }],
+      senderLabel: "upload",
+    },
+    { label: "plugin:* messages", message: "result", source: "plugin:myplugin", attachments: undefined, senderLabel: "plugin:myplugin" },
+  ])("routes $label to the owner conversation", async ({ message, source, attachments, senderLabel }) => {
+    await enqueueMessage(message, source, undefined, attachments);
 
     expect(mockHandlePrompt).toHaveBeenCalledOnce();
     const routingArg = mockHandlePrompt.mock.calls[0][4] as RoutingResult;
     expect(routingArg.isMainAgent).toBe(true);
     expect(routingArg.agentId).toBe(1);
-    expect(routingArg.senderLabel).toBe("owner");
-    // resolveInterlocutor should not be called for CLI messages.
-    expect(mockResolveInterlocutor).not.toHaveBeenCalled();
-  });
-
-  it("routes cron messages to the owner conversation", async () => {
-    await enqueueMessage("reminder", "cron", undefined);
-
-    expect(mockHandlePrompt).toHaveBeenCalledOnce();
-    const routingArg = mockHandlePrompt.mock.calls[0][4] as RoutingResult;
-    expect(routingArg.isMainAgent).toBe(true);
-    expect(routingArg.senderLabel).toBe("cron");
-    expect(mockResolveInterlocutor).not.toHaveBeenCalled();
-  });
-
-  it("routes coder messages to the owner conversation", async () => {
-    await enqueueMessage("task done", "coder", undefined);
-
-    expect(mockHandlePrompt).toHaveBeenCalledOnce();
-    const routingArg = mockHandlePrompt.mock.calls[0][4] as RoutingResult;
-    expect(routingArg.isMainAgent).toBe(true);
-    expect(routingArg.senderLabel).toBe("coder");
-    expect(mockResolveInterlocutor).not.toHaveBeenCalled();
-  });
-
-  it("routes upload messages to the owner conversation", async () => {
-    const attachment = { storedPath: "/tmp/upload-abc.jpg", originalFilename: "photo.jpg", mimeType: "image/jpeg", size: 1024 };
-    await enqueueMessage(undefined, "upload", undefined, [attachment]);
-
-    expect(mockHandlePrompt).toHaveBeenCalledOnce();
-    const routingArg = mockHandlePrompt.mock.calls[0][4] as RoutingResult;
-    expect(routingArg.isMainAgent).toBe(true);
-    expect(routingArg.agentId).toBe(1);
-    expect(routingArg.senderLabel).toBe("upload");
-    expect(mockResolveInterlocutor).not.toHaveBeenCalled();
-  });
-
-  it("routes plugin:* messages to the owner conversation", async () => {
-    await enqueueMessage("result", "plugin:myplugin", undefined);
-
-    expect(mockHandlePrompt).toHaveBeenCalledOnce();
-    const routingArg = mockHandlePrompt.mock.calls[0][4] as RoutingResult;
-    expect(routingArg.isMainAgent).toBe(true);
-    expect(routingArg.senderLabel).toBe("plugin:myplugin");
+    expect(routingArg.senderLabel).toBe(senderLabel);
+    // resolveInterlocutor should not be called for internal sources.
     expect(mockResolveInterlocutor).not.toHaveBeenCalled();
   });
 
@@ -306,6 +321,7 @@ describe("message routing", () => {
       identityId: 10,
       agentId: 5,
       isOwner: false,
+      mentionsOnly: false,
       displayName: "Alice",
     });
 
@@ -320,14 +336,16 @@ describe("message routing", () => {
     expect(routingArg.senderIdentityId).toBe(10);
   });
 
-  it("drops messages from senders not in the allowlist", async () => {
+  it("drops messages from senders not in the allowlist and records the rejected sender", async () => {
     // isInAllowlist already returns false from beforeEach.
-    const result = await enqueueMessage("hi", "signal", "+0000000000");
+    const result = await enqueueMessage("hi", "signal", "+0000000000", undefined, undefined, undefined, "Unknown sender");
 
     expect(result).toBe("");
     expect(mockHandlePrompt).not.toHaveBeenCalled();
     // The message must be dropped before the DB lookup.
     expect(mockResolveInterlocutor).not.toHaveBeenCalled();
+    expect(mockRecordRejectedSender).toHaveBeenCalledOnce();
+    expect(mockRecordRejectedSender).toHaveBeenCalledWith("signal", "+0000000000", "Unknown sender");
   });
 
   it("drops messages from unknown interlocutors and resolves with empty string", async () => {
@@ -338,6 +356,121 @@ describe("message routing", () => {
 
     expect(result).toBe("");
     expect(mockHandlePrompt).not.toHaveBeenCalled();
+    // The soft gate drop must not be recorded as a rejected sender.
+    expect(mockRecordRejectedSender).not.toHaveBeenCalled();
+  });
+
+  it("drops a signal message from a mentions-only interlocutor when it does not address the bot", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      displayName: "Group chat",
+      mentionsOnly: true,
+    });
+
+    const result = await enqueueMessage("chatter", "signal", "group.abc123");
+
+    expect(result).toBe("");
+    expect(mockHandlePrompt).not.toHaveBeenCalled();
+    // The mentions-only gate is a quiet feature, not a rejected sender.
+    expect(mockRecordRejectedSender).not.toHaveBeenCalled();
+  });
+
+  it("delivers a signal message from a mentions-only interlocutor when it addresses the bot", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      displayName: "Group chat",
+      mentionsOnly: true,
+    });
+
+    await enqueueMessage("hey bot", "signal", "group.abc123", undefined, undefined, undefined, undefined, true);
+
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("delivers a telegram message from a mentions-only interlocutor when it addresses the bot", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      displayName: "Group chat",
+      mentionsOnly: true,
+    });
+
+    await enqueueMessage("hey bot", "telegram", "-100", undefined, undefined, undefined, undefined, true);
+
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("ignores mentions_only on sources that cannot detect a mention", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      displayName: "Alice",
+      mentionsOnly: true,
+    });
+
+    await enqueueMessage("hi", "email", "alice@example.com");
+
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("delivers unflagged group messages regardless of addressedToBot", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      displayName: "Group chat",
+      mentionsOnly: false,
+    });
+
+    await enqueueMessage("chatter", "signal", "group.abc123");
+
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("passes participant through to handlePrompt and does not pass senderLabel", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      mentionsOnly: false,
+      displayName: "Group chat",
+    });
+
+    await enqueueMessage("hi", "telegram", "-100", undefined, undefined, { id: "42", name: "Alice" }, "Platform label");
+
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+    // Arguments: agent, pool, message, config, routing, source, attachments, isRetry, participant.
+    expect(mockHandlePrompt.mock.calls[0][8]).toEqual({ id: "42", name: "Alice" });
+    expect(mockHandlePrompt).toHaveBeenCalledWith(
+      stubAgent,
+      stubPool,
+      "hi",
+      stubConfig,
+      expect.anything(),
+      "telegram",
+      undefined,
+      false,
+      { id: "42", name: "Alice" },
+    );
+    expect(mockHandlePrompt.mock.calls[0]).toHaveLength(9);
   });
 
   it("drops a non-internal message that has a source but no sender", async () => {
@@ -429,6 +562,114 @@ describe("/stop command", () => {
     expect(promptResult).toBe("Aborted.");
     expect(mockHandlePrompt).toHaveBeenCalledOnce();
   });
+
+  it("aborts the running turn for the owner's /stop from a direct chat on a channel", async () => {
+    mockIsOwnerIdentity.mockReturnValue(true);
+    mockHandlePrompt.mockImplementationOnce(
+      () => new Promise<string>((_, reject) => {
+        mockAbort.mockImplementationOnce(() => {
+          reject(new AbortError());
+        });
+      }),
+    );
+
+    const promptPromise = enqueueMessage("hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stopResult = await enqueueMessage("/stop", "telegram", "+1111111111");
+    expect(stopResult).toBe("Aborted.");
+    expect(mockAbort).toHaveBeenCalledOnce();
+
+    const promptResult = await promptPromise;
+    expect(promptResult).toBe("Aborted.");
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("does not abort for a non-owner direct sender's /stop and queues it as text", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 1,
+      isOwner: false,
+      mentionsOnly: false,
+      displayName: "Alice",
+    });
+    mockHandlePrompt.mockImplementationOnce(
+      () => new Promise<string>((resolve) => {
+        setTimeout(() => resolve("done"), 10);
+      }),
+    );
+
+    const promptPromise = enqueueMessage("hello", "signal", "+9876543210");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stopPromise = enqueueMessage("/stop", "signal", "+9876543210");
+    expect(mockAbort).not.toHaveBeenCalled();
+
+    await promptPromise;
+    expect(await stopPromise).toBe("");
+    expect(mockHandlePrompt).toHaveBeenCalledTimes(2);
+    expect(mockHandlePrompt.mock.calls[1][2]).toBe("/stop");
+  });
+
+  it("does not abort for a non-owner group participant's /stop and queues it as text", async () => {
+    const participant = { id: "99", name: "Alice" };
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 1,
+      isOwner: false,
+      mentionsOnly: false,
+      displayName: "Alice",
+    });
+    mockHandlePrompt.mockImplementationOnce(
+      () => new Promise<string>((resolve) => {
+        setTimeout(() => resolve("done"), 10);
+      }),
+    );
+
+    const promptPromise = enqueueMessage("hello", "signal", "group.abc123", undefined, undefined, participant);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stopPromise = enqueueMessage("/stop", "signal", "group.abc123", undefined, undefined, participant);
+    expect(mockAbort).not.toHaveBeenCalled();
+
+    await promptPromise;
+    expect(await stopPromise).toBe("");
+    expect(mockHandlePrompt).toHaveBeenCalledTimes(2);
+    expect(mockHandlePrompt.mock.calls[1][2]).toBe("/stop");
+  });
+
+  it("aborts the running turn when the owner sends /stop as a group participant", async () => {
+    mockIsOwnerIdentity.mockImplementation(
+      (_source: string, identifier: string) => identifier === "+1111111111" || identifier === "42",
+    );
+    mockHandlePrompt.mockImplementationOnce(
+      () => new Promise<string>((_, reject) => {
+        mockAbort.mockImplementationOnce(() => {
+          reject(new AbortError());
+        });
+      }),
+    );
+
+    const promptPromise = enqueueMessage("hello", "signal", "+1111111111");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stopResult = await enqueueMessage(
+      "/stop",
+      "signal",
+      "group.abc123",
+      undefined,
+      undefined,
+      { id: "42", name: "Owner" },
+    );
+    expect(stopResult).toBe("Aborted.");
+    expect(mockAbort).toHaveBeenCalledOnce();
+
+    await promptPromise;
+  });
 });
 
 describe("steering", () => {
@@ -501,6 +742,7 @@ describe("steering", () => {
       identityId: 10,
       agentId: 1,
       isOwner: false,
+      mentionsOnly: false,
       displayName: "Alice",
     });
     mockHandlePrompt.mockResolvedValue("done");
@@ -536,6 +778,7 @@ describe("steering", () => {
       identityId: 10,
       agentId: 2,
       isOwner: false,
+      mentionsOnly: false,
       displayName: "Alice",
     });
     mockHandlePrompt.mockImplementationOnce(
@@ -556,5 +799,157 @@ describe("steering", () => {
 
     await promptPromise;
     await ownerMessage;
+  });
+
+  it("queues rather than steers a group message whose participant is an owner, and records it when not allowlisted", async () => {
+    // The owner is recognised both by their own number and by the participant id.
+    mockIsOwnerIdentity.mockImplementation(
+      (_source: string, sender: string) => sender === "+1111111111" || sender === "42",
+    );
+    mockHandlePrompt.mockImplementationOnce(
+      () => new Promise<string>((resolve) => {
+        setTimeout(() => resolve("done"), 10);
+      }),
+    );
+
+    // The first message is from the owner, so the active turn is an owner conversation.
+    const ownerTurn = enqueueMessage("owner message", "signal", "+1111111111");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A group is routed by its group ID, so an owner participant does not make it steer.
+    const groupMessage = enqueueMessage(
+      "group message",
+      "signal",
+      "group.abc123",
+      undefined,
+      undefined,
+      { id: "42", name: "Owner" },
+      "The Group",
+    );
+
+    expect(mockSteer).not.toHaveBeenCalled();
+
+    await ownerTurn;
+    const groupResult = await groupMessage;
+
+    // isInAllowlist returns false by default, so the hard gate drops and records it.
+    expect(groupResult).toBe("");
+    expect(mockRecordRejectedSender).toHaveBeenCalledOnce();
+    expect(mockRecordRejectedSender).toHaveBeenCalledWith("signal", "group.abc123", "The Group");
+  });
+});
+
+describe("subagent final message forwarding", () => {
+  it("forwards a subagent's trimmed final text to the main agent as an agent message", async () => {
+    mockHandlePrompt.mockResolvedValueOnce("  Here is the result  ").mockResolvedValueOnce("ack");
+
+    // An agent-to-agent message targeting agent 2 makes agent 2 the subagent.
+    const result = await enqueueMessage("do the task", "agent", "1", undefined, 2);
+
+    expect(result).toBe("  Here is the result  ");
+
+    await vi.waitFor(() => expect(mockHandlePrompt).toHaveBeenCalledTimes(2));
+    const forwardedCall = mockHandlePrompt.mock.calls[1];
+    expect(forwardedCall[2]).toBe("Here is the result");
+    expect(forwardedCall[5]).toBe("agent");
+    const forwardedRouting = forwardedCall[4] as RoutingResult;
+    expect(forwardedRouting.agentId).toBe(1);
+    expect(forwardedRouting.isMainAgent).toBe(true);
+    expect(forwardedRouting.senderAgentId).toBe(2);
+  });
+
+  it("forwards a subagent final text of '/stop' literally without aborting", async () => {
+    mockHandlePrompt.mockResolvedValueOnce("/stop").mockResolvedValueOnce("ack");
+
+    const result = await enqueueMessage("do the task", "agent", "1", undefined, 2);
+
+    expect(result).toBe("/stop");
+    expect(mockAbort).not.toHaveBeenCalled();
+
+    await vi.waitFor(() => expect(mockHandlePrompt).toHaveBeenCalledTimes(2));
+    const forwardedCall = mockHandlePrompt.mock.calls[1];
+    expect(forwardedCall[2]).toBe("/stop");
+    expect(forwardedCall[5]).toBe("agent");
+    expect((forwardedCall[4] as RoutingResult).agentId).toBe(1);
+  });
+
+  it("forwards the final text of a subagent reached via an interlocutor message", async () => {
+    mockIsInAllowlist.mockReturnValue(true);
+    mockResolveInterlocutor.mockResolvedValue({
+      interlocutorId: 42,
+      identityId: 10,
+      agentId: 5,
+      isOwner: false,
+      mentionsOnly: false,
+      displayName: "Alice",
+    });
+    mockHandlePrompt.mockResolvedValueOnce("reply for Alice").mockResolvedValueOnce("ack");
+
+    await enqueueMessage("hi", "signal", "+9876543210");
+
+    await vi.waitFor(() => expect(mockHandlePrompt).toHaveBeenCalledTimes(2));
+    const forwardedCall = mockHandlePrompt.mock.calls[1];
+    expect(forwardedCall[2]).toBe("reply for Alice");
+    const forwardedRouting = forwardedCall[4] as RoutingResult;
+    expect(forwardedRouting.agentId).toBe(1);
+    expect(forwardedRouting.senderAgentId).toBe(5);
+  });
+
+  it.each(["", "   ", "\n\t  \n"])("does not forward an empty final text (%j)", async (finalText) => {
+    mockHandlePrompt.mockResolvedValueOnce(finalText);
+
+    const result = await enqueueMessage("do the task", "agent", "1", undefined, 2);
+
+    expect(result).toBe(finalText);
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it.each([NOTHING_TO_REPORT, "nothing_to_report", "  Nothing_To_Report \n"])(
+    "does not forward the NOTHING_TO_REPORT marker (%j)",
+    async (finalText) => {
+      mockHandlePrompt.mockResolvedValueOnce(finalText);
+
+      const result = await enqueueMessage("do the task", "agent", "1", undefined, 2);
+
+      expect(result).toBe(finalText);
+      expect(mockHandlePrompt).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("never forwards main agent turns", async () => {
+    mockHandlePrompt.mockResolvedValueOnce("a normal reply");
+
+    const result = await enqueueMessage("hello");
+
+    expect(result).toBe("a normal reply");
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("does not forward a failed subagent turn", async () => {
+    mockHandlePrompt.mockRejectedValueOnce(
+      new Error('Agent error: "400 {"type":"error","error":{"type":"invalid_request_error","message":"orphaned tool_result"}}"'),
+    );
+
+    const result = await enqueueMessage("do the task", "agent", "1", undefined, 2);
+
+    expect(result).toBe("Something went wrong: orphaned tool_result");
+    expect(mockHandlePrompt).toHaveBeenCalledOnce();
+  });
+
+  it("forwards exactly once when a subagent turn succeeds after a retry", async () => {
+    mockHandlePrompt
+      .mockRejectedValueOnce(new Error("network timeout"))
+      .mockResolvedValueOnce("done")
+      .mockResolvedValueOnce("ack");
+
+    vi.useFakeTimers();
+    const resultPromise = enqueueMessage("do the task", "agent", "1", undefined, 2);
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+
+    expect(await resultPromise).toBe("done");
+
+    await vi.waitFor(() => expect(mockHandlePrompt).toHaveBeenCalledTimes(3));
+    expect(mockHandlePrompt.mock.calls[2][2]).toBe("done");
   });
 });

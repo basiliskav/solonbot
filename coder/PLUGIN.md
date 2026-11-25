@@ -8,6 +8,8 @@ Stavrobot is a personal AI assistant that runs as a Docker-based service. It can
 
 A plugin is a directory (or git repository) containing one or more tools. Each tool is an executable script that receives JSON on stdin and writes JSON to stdout. Plugins are installed via the plugin-runner and placed in the `data/plugins/` directory.
 
+Some plugins are MCP servers: their manifest declares `"type": "mcp"`, and their tools come from a [Model Context Protocol](https://modelcontextprotocol.io) server instead of scripts. They are created and managed by the plugin-runner through the settings page, and the coder never edits them. The rest of this guide is about script plugins.
+
 ## Directory structure
 
 A plugin is typically a git repository. The plugin manifest lives at the repository root, and each tool is a subdirectory containing its own manifest and entrypoint.
@@ -31,21 +33,31 @@ When installed, the repository is cloned into `data/plugins/my-plugin/`.
 
 If creating a new plugin:
 
-1. Make sure the plugin directory is a git repository, named `plugin-<distinctive name>`.
-2. .gitignore config.json and all usual gitignored files for the stack (e.g.
-   __pycache__, .pyc, and other such files). NEVER READ config.json, it contains secrets.
-3. Delete/do not commit PLUGIN.md
-4. When done, if everything is working and tested, commit and push to that repo.
+1. Never read config.json. It contains secrets.
+2. You may use git in the plugin directory to track your work, but do not add a
+   remote and do not push anywhere.
+3. If you use git, .gitignore config.json and the usual ignored files for the stack
+   (e.g. __pycache__, .pyc). Do not commit PLUGIN.md.
 
 
 ## README
 
-Every plugin must include a `README.md` at the repository root. The README should contain:
+Every plugin must include a `README.md` at the repository root. It is published as the plugin's public page on `https://stavrobot.stavros.io/plugins/`, so write it for a person deciding whether to install the plugin.
 
-- A summary of what the plugin does and why a user would want to install it.
-- Installation instructions (e.g., "Tell Stavrobot to install <git URL>", or any required configuration values and how to obtain them).
+Cover these, in this order:
 
-This is the first thing a potential user sees when browsing the repository, so it should be concise and practical.
+- What the plugin does, in one or two sentences.
+- What the user needs before installing: an account, an API key, a service running on their network.
+- How to install it: "Tell Stavrobot to install `<git URL>`".
+- Each configuration key, what it is for, and where to get the value.
+- The tools the plugin provides, and what each one does.
+
+Keep it short. The reader is deciding whether they want the plugin, not learning to operate it. Anything that only a maintainer needs, such as repository layout or publishing steps, belongs in a separate file.
+
+Two constraints apply once the README is published:
+
+- Use markdown only. Raw HTML is escaped when the page is built and renders as visible text, so a `<div>` or an `<img>` tag will appear literally.
+- Links must use `http`, `https` or `mailto`. Any other scheme is replaced with `#`.
 
 ## Plugin manifest
 
@@ -54,7 +66,8 @@ The `manifest.json` at the root of the plugin directory describes the plugin:
 ```json
 {
   "name": "my-plugin",
-  "description": "A short description of what this plugin provides, in the imperative mood (e.g. 'Manage your Google Maps places').",
+  "description": "One short sentence on what this plugin is for (e.g. 'A plugin for your Google Maps places').",
+  "summary": "Manage your Google Maps places.",
   "instructions": "Optional setup notes or usage guidance for the user.",
   "init": {
     "entrypoint": "init.py",
@@ -64,11 +77,33 @@ The `manifest.json` at the root of the plugin directory describes the plugin:
 ```
 
 - `name` (string, required): The plugin's unique identifier. Used to namespace tools. Must contain only lowercase letters, digits, and hyphens (`[a-z0-9-]`).
-- `description` (string, required): A short description shown when listing plugins.
+- `description` (string, required): One short sentence on what the plugin is for. It is in the assistant's context on every turn. See "Writing the description and the summary" below.
+- `summary` (string, optional): A short one-line description (roughly under 80 characters) shown in the public plugin listing on stavrobot.stavros.io. Falls back to `description` when absent.
 - `instructions` (string, optional): Setup notes or usage guidance for the user. See "Plugin instructions" below.
 - `init` (object, optional): Declares an init script.
   - `entrypoint` (string, required): The filename of the executable script at the plugin root.
   - `async` (boolean, optional, defaults to false): If true, the init script runs in the background and does not block install/update.
+
+### Writing the description and the summary
+
+These two fields look similar but have different readers.
+
+`description` is in the assistant's context on every turn, next to the plugin's tool names. Its only job is to tell the assistant when to open the plugin. Keep it to one short sentence that says what the plugin is for: the service and the domain (e.g. "A plugin for the trip management app Wherewhen."). Do not put usage rules here.
+
+Put usage rules in the tool descriptions instead. The assistant reads them with `manage_plugins show` when it uses the plugin, so they cost nothing on other turns. If the assistant must do a specific action, give it a tool for that action. A tool name works better than a rule in prose.
+
+`summary` is read by a person scanning a table of every available plugin. One line, under 80 characters, no line breaks. The usual shape is a verb, an object, and the service:
+
+```
+Check weather forecasts via OpenMeteo
+Track packages via 17track
+Manage Google Calendar events
+Text-to-speech using ElevenLabs voices
+```
+
+Do not repeat the plugin's name in the summary, because it is already shown next to it. Do not end it with a full stop. Do not write "A plugin that..." or "This plugin lets you...", because every row in the table is a plugin.
+
+If `summary` is absent, the listing falls back to `description`. That works, but a description written to brief the assistant is usually too long for a table, so set `summary` if the plugin is published.
 
 ## Plugin configuration
 
@@ -130,7 +165,7 @@ Tools must not read or depend on the `permissions` key. It is reserved for the s
 
 The plugin manifest can include an optional `instructions` field containing setup notes, usage guidance, or other information intended for the end user.
 
-When a plugin is installed, updated, or inspected, the agent relays these instructions to the user verbatim. The agent will not follow the instructions itself.
+When a plugin is installed or inspected, the agent receives these instructions and relays them to the user verbatim. After an update, it receives and relays them only when the update changes them. The agent will not follow the instructions itself.
 
 Instructions longer than 5000 characters are truncated before being shown to the user.
 
@@ -138,7 +173,7 @@ Instructions longer than 5000 characters are truncated before being shown to the
 
 An init script is declared in the plugin manifest via the `init` field. The `entrypoint` value names the executable file at the plugin root. The script must be executable (`chmod +x`).
 
-The init script runs automatically after install and after update. It runs as the plugin's system user with the same restricted environment as tools. The working directory is the plugin root (not a tool subdirectory). It receives no stdin input.
+The init script runs automatically after install, and after an update that changes the plugin's commit. If an update finds the plugin already at the latest commit, it does nothing and does not run the init script. The init runs as the plugin's system user with the same restricted environment as tools. The working directory is the plugin root (not a tool subdirectory). It receives no stdin input.
 
 Anything the init script writes to stdout is captured and returned to the agent as `init_output` in the install/update response. Use this to report setup results, generated credentials, or other information the agent should see.
 
@@ -187,10 +222,12 @@ Each tool subdirectory contains its own `manifest.json`:
 ```
 
 - `name` (string, required): The tool's name within the plugin.
-- `description` (string, required): Shown when inspecting the plugin.
+- `description` (string, required): Shown when inspecting the plugin. This is the place for usage rules and caveats.
 - `entrypoint` (string, required): The filename of the executable script inside the tool directory.
 - `async` (boolean, optional, defaults to false): If true, the tool runs asynchronously and the result is delivered via callback instead of inline.
-- `parameters` (object, required): Parameter schema. Each key is a parameter name; each value has `type` (`string`, `integer`, `number`, `boolean`, or `file`) and `description`. Use an empty object `{}` if the tool takes no parameters. See "Receiving files" for how `file` parameters work.
+- `parameters` (object, required): Parameter definitions. Each key is a parameter name; each value requires string `type` and `description` fields. Any string is accepted for `type`, including `string`, `integer`, `number`, `boolean`, `file`, `array`, and `object`. Use an empty object `{}` if the tool takes no parameters. See "Receiving files" for how `file` parameters work.
+- Nested keys within a parameter definition, such as `items`, `properties`, and `required`, are preserved but not enforced. `manage_plugins` with `action: "show"` exposes definitions to the model as TOON text, not provider tool JSON Schema.
+- `run_plugin_tool` accepts arguments as a JSON-encoded `parameters` string.
 
 ### Async tools
 
@@ -198,12 +235,14 @@ Only set `async: true` for tools that are expected to run for more than 30 secon
 
 ## Producing files
 
-Synchronous tools can produce files by writing them to `/tmp/<plugin_name>/` (where `<plugin_name>` is the plugin's `name` from the manifest). After the tool exits, the plugin-runner scans that directory and transports any files it finds to the main app. The agent is told the directory where the files were saved and can construct the full path.
+Tools can produce files by writing them to the directory named by the `STAVROBOT_TEMP_DIR` environment variable (in Python, `os.environ["STAVROBOT_TEMP_DIR"]`). The plugin-runner creates this directory fresh for every tool run, owns it as the plugin's user, and restricts it to that user. After the tool exits, the plugin-runner scans the directory and transports any files it finds to the main app. The agent is told the directory where the files were saved and can construct the full path.
 
 Rules:
 
 - Only top-level files are transported. Subdirectories are ignored.
-- The directory is cleared before and after each tool run. Do not rely on files persisting between runs.
+- `STAVROBOT_TEMP_DIR` is different for every run and is deleted after the run. Do not hardcode `/tmp/<plugin_name>/` or rely on files persisting between runs.
+- The directory is private to the run: parallel runs of the same plugin each get their own directory, so they cannot see or delete each other's files.
+- Do not write outputs to `/tmp/<plugin_name>/`. That legacy path is not transported; the runner warns and deletes it after the run.
 - Maximum total file size per tool run is 25 MB. If the limit is exceeded, no files are transported and a warning is logged.
 - File transport works for both synchronous and asynchronous tools. For async tools, the files are delivered as attachments alongside the callback message.
 
@@ -220,6 +259,7 @@ Common use cases: TTS audio, generated images, exported data files.
 # ///
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -230,8 +270,7 @@ def main() -> None:
 
     from gtts import gTTS
 
-    output_dir = Path("/tmp/my-plugin")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(os.environ["STAVROBOT_TEMP_DIR"])
     tts = gTTS(params["text"])
     tts.save(output_dir / "output.mp3")
     json.dump({"file": "output.mp3"}, sys.stdout)
@@ -242,14 +281,15 @@ main()
 
 ## Receiving files
 
-To accept a file from the user, declare a parameter with `"type": "file"` in the tool manifest. When the LLM calls `run_plugin_tool`, it passes the absolute path to the file (e.g. a path it received from an incoming attachment or from `manage_files`). The system reads the file, transports it to the plugin-runner container, and writes it into the plugin's temp directory (`/tmp/<plugin_name>/`). At runtime, the parameter value in the JSON on stdin will be the materialized file path (e.g., `/tmp/my-plugin/voice-note.ogg`), ready to read.
+To accept a file from the user, declare a parameter with `"type": "file"` in the tool manifest. When the LLM calls `run_plugin_tool`, it passes the absolute path to the file (e.g. a path it received from an incoming attachment or from `manage_files`). The system reads the file, transports it to the plugin-runner container, and writes it into the run's temp directory (the path in `STAVROBOT_TEMP_DIR`). At runtime, the parameter value in the JSON on stdin will be the materialized file path (e.g., `/tmp/stavrobot-run-<uuid>/voice-note.ogg`), ready to read.
 
 Use `"type": "file"` any time a tool needs to operate on a file the user has sent (audio, images, documents, etc.) rather than asking the user to provide the file contents as text.
 
 Rules:
 
-- The same `/tmp/<plugin_name>/` directory is used for both input and output files. Input files are written before the tool runs; output files are scanned after.
-- The directory is cleared before each tool run, so input files from a previous run are not present.
+- Input and output files share the same per-run directory, also available as `STAVROBOT_TEMP_DIR`. Input files are written before the tool runs; output files are scanned after.
+- Each run gets a fresh, private directory, so input files from a previous or parallel run are never present.
+- Read input files through the path in the parameter. Do not assume a fixed `/tmp/<plugin_name>/` path.
 - The same 25 MB size limit applies to input files.
 
 ### Example: a tool that receives an audio file
@@ -301,14 +341,14 @@ main()
 Plugin tools run inside the `plugin-runner` Docker container, which is completely separate from the main app container. This means:
 
 - Tools cannot access the app's filesystem, source code, secrets, or config.
-- Each plugin runs as its own dedicated system user (`plug_<name>`). Plugin directories are restricted with `chmod 700`, so a plugin cannot read or write any other plugin's files or configuration. A plugin can only access its own directory (e.g., `/plugins/my-plugin/`) and its temporary output directory (`/tmp/<plugin_name>/`).
+- Each plugin runs as its own dedicated system user (`plug_<name>`). Plugin directories are restricted with `chmod 700`, so a plugin cannot read or write any other plugin's files or configuration. A plugin can only access its own directory (e.g., `/plugins/my-plugin/`) and the private temp directory for its current run (the path in `STAVROBOT_TEMP_DIR`, e.g. `/tmp/stavrobot-run-<uuid>/`).
 - Tools can make outbound network requests (there is no network isolation).
 
 The following runtimes and tools are available in the container:
 
 - `uv` (with a pre-installed Python)
 - `python3`
-- `node` (Node.js 22)
+- `node` (Node.js 26)
 - `git`
 - `ssh` / `openssh-client`
 - `curl`
@@ -369,12 +409,12 @@ Any executable works — use a shebang line. Node.js and Python are available in
 
 ## Parameter validation
 
-The plugin runner automatically validates parameters before the tool script runs:
+The plugin runner performs limited top-level validation before the tool script runs:
 
-- Unknown keys (not declared in the tool manifest's `parameters`) are rejected with HTTP 400. The error response includes the full parameter schema so the caller can self-correct.
-- Wrong types are rejected for `string`, `number`, `integer`, and `boolean` parameters. `file` parameters are exempt because they are already handled by the file materialization code.
+- Unknown top-level keys (not declared in the tool manifest's `parameters`) are rejected with HTTP 400. The error response includes the full parameter schema so the caller can self-correct.
+- Values declared as `string`, `number`, `integer`, or `boolean` are type-checked. `file` parameters use separate materialization and handling; other accepted type strings, including `array` and `object`, are not type-checked.
 
-Tools no longer need to implement unknown-parameter rejection or type validation themselves. Existing validation code in tools is harmless and can be left in place, but new tools do not need it.
+Tools must validate missing parameters and every constraint beyond these checks, including constraints expressed by nested keys.
 
 ## Example: a complete tool
 

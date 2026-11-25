@@ -8,7 +8,7 @@ import {
 } from "@whiskeysockets/baileys";
 import type { Boom } from "@hapi/boom";
 import type { WhatsappConfig } from "./config.js";
-import { isInAllowlist } from "./allowlist.js";
+import { isInAllowlist, recordRejectedSender } from "./allowlist.js";
 import { enqueueMessage } from "./queue.js";
 import { saveAttachment, type FileAttachment } from "./uploads.js";
 import { setWhatsappSocket, getWhatsappSocket, jidToE164, e164ToJid } from "./whatsapp-api.js";
@@ -91,15 +91,11 @@ export async function initializeWhatsApp(config: WhatsappConfig): Promise<void> 
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-  // Workaround for Baileys 7.0.0-rc.9 hardcoding an outdated WA protocol version
-  // that WhatsApp rejects with a 405. Remove this once Baileys ships a fix
-  // (see https://github.com/WhiskeySockets/Baileys/issues/2376).
   const socket = makeWASocket({
     auth: state,
     logger: silentLogger,
     // Disable link previews to avoid the link-preview-js peer dependency.
     generateHighQualityLinkPreview: false,
-    version: [2, 3000, 1034074495],
   });
 
   setWhatsappSocket(socket);
@@ -209,6 +205,9 @@ async function processInboundMessage(waMessage: WAMessage): Promise<void> {
   const phoneNumber = jidToE164(effectiveJid);
 
   if (!isInAllowlist("whatsapp", phoneNumber)) {
+    const pushName = waMessage.pushName;
+    const senderLabel = typeof pushName === "string" && pushName.trim() !== "" ? pushName : undefined;
+    recordRejectedSender("whatsapp", phoneNumber, senderLabel);
     log.info("[solonbot] WhatsApp message from disallowed number:", phoneNumber);
     return;
   }
