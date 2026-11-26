@@ -71,6 +71,12 @@ services:
       - ./data/main:/root/config:ro
       - ./data/plugins:/plugins
       - ./cache/plugins:/cache
+    # Deliberate fork change (not in upstream): the fitness-db plugin connects to
+    # Postgres directly as the restricted role fitness_plugin. Other plugins have no
+    # DB credentials. Keep this on upstream syncs.
+    networks:
+      - default
+      - database
 
   coder:
     build: ./coder
@@ -122,9 +128,9 @@ services:
         condition: service_started
 
 networks:
-  # Only the app and the backup container need the database. Keeping Postgres on its
-  # own network means the containers that run untrusted code (python-runner,
-  # plugin-runner, coder), which stay on the default network, cannot resolve or reach
-  # it. The network is internal because neither Postgres nor pg-backup needs internet.
+  # Only the app, the backup container and (in this fork) plugin-runner need the
+  # database. Keeping Postgres on its own network means the containers that run
+  # untrusted code (python-runner, coder), which stay on the default network, cannot
+  # resolve or reach it. The network is internal because neither Postgres nor pg-backup needs internet.
   database:
     internal: true

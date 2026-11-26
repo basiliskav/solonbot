@@ -13,14 +13,14 @@ arbitrary scripts in isolated Unix user accounts.
 |---|---|---|---|---|
 | `postgres` | `pgvector/pgvector:pg17` | internal | `database` | Primary database (with pgvector extension) |
 | `app` | `./Dockerfile` | 10567→3000 | `default`, `database` | Main HTTP server + LLM agent |
-| `plugin-runner` | `./plugin-runner` | internal:3003 | `default` | Executes plugin scripts |
+| `plugin-runner` | `./plugin-runner` | internal:3003 | `default`, `database` | Executes plugin scripts |
 | `coder` | `./coder` | internal:3002 | `default` | Runs `claude -p` for plugin authoring (optional, `coder` profile) |
 | `python-runner` | `./python-runner` | internal | `default` | Executes Python snippets |
 | `pg-backup` | `pgvector/pgvector:pg17` | — | `database` | Hourly pg_dump to `./data/db-backups` |
 | `signal-bridge` | `./signal-bridge` | internal:8081 | `default` | Signal protocol bridge (optional profile) |
 
-`postgres` is only on the `database` network, and only `app` and `pg-backup` join it.
-The containers that run untrusted code (`python-runner`, `plugin-runner`, `coder`) and
+`postgres` is only on the `database` network. `app` and `pg-backup` join it, and so
+does `plugin-runner` in this fork (see Security model). `python-runner`, `coder` and
 `signal-bridge` are only on the default network, so they cannot resolve or connect to
 the database. `app` joins both networks, so it can still reach the runners by service
 name. The `database` network is `internal: true`, so it has no route to the internet;
@@ -404,12 +404,14 @@ Plugins live in `/plugins/<name>/` (shared volume between `plugin-runner` and `c
   (manifest defaults are stripped) and `set` is a boolean per key. Saving still goes
   through `POST /configure`, which accepts values and merges them server-side.
 - The Docker socket is never mounted into any container.
-- Only `app` and `pg-backup` join the `database` network, which is `internal: true`.
-  `postgres` is attached to that network alone, so the containers that run untrusted
-  code (`python-runner`, `plugin-runner`, `coder`) cannot resolve the `postgres` hostname
-  or open a connection to it, even though they share the default network with `app`.
-  `pg-backup` needs the database to dump it; nothing else that runs LLM-controlled code
-  does.
+- `app` and `pg-backup` join the `database` network, which is `internal: true`.
+  `postgres` is attached to that network alone, so `python-runner` and `coder` cannot
+  resolve the `postgres` hostname or open a connection to it, even though they share the
+  default network with `app`. Fork-specific exception: `plugin-runner` also joins the
+  `database` network because the fitness-db plugin connects to Postgres directly as the
+  restricted role `fitness_plugin`. Plugins can therefore reach the port, but only that
+  plugin has credentials; plugin config is `chmod 700` per plugin user and the main DB
+  password is not available to `plugin-runner`.
 
 ### Tool execution (sync)
 - `plugin-runner` receives `POST /bundles/<plugin>/tools/<tool>/run` with JSON body.

@@ -11,6 +11,7 @@ The project's GitHub URL is https://github.com/skorokithakis/stavrobot/.
 - Renamed to solonbot: log tags (`[solonbot]`, `[solonbot-coder]`, `[solonbot-plugin-runner]`); Postgres default user/password/db in `docker-compose.yml`, `docker-compose.harbormaster.yml`, `env.example` and `src/config.ts`; `pg-backup.sh` filename prefix; "You are Solonbot" in prompts; Basic auth realm; user-visible UI product name; MCP client name; `upload.py` and `signal-bridge/bridge.py` docstrings.
 - Kept as stavrobot: `STAVROBOT_TEMP_DIR` (plugin API contract), `STAVROBOT_LOG_LEVEL`, `/tmp/stavrobot-temp`, the `stavrobot-run-` prefix, package names, `stavrobot.stavros.io` and `github.com/stavrobot` URLs (real external resources), docs (README body, `ARCHITECTURE.md`, `coder/PLUGIN.md`, `misc/SKILL-AUTHORING.md`), and `design/` mockups.
 - Other fork-specific change: the app port is bound to localhost in `docker-compose.yml` (`127.0.0.1:10567:3000`); keep it.
+- Other fork-specific change: `plugin-runner` joins the `database` network in `docker-compose.yml` (in addition to default) so the fitness-db plugin can reach Postgres as role `fitness_plugin`; keep it on upstream syncs, and after each sync verify fitness-db `describe_schema` still connects. `python-runner` and `coder` must stay off that network.
 
 ## Architecture reference
 
