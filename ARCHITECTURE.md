@@ -9,15 +9,22 @@ arbitrary scripts in isolated Unix user accounts.
 
 ## Containers (docker-compose.yml)
 
-| Service | Image / Build | Port | Role |
-|---|---|---|---|
-| `postgres` | `pgvector/pgvector:pg17` | internal | Primary database (with pgvector extension) |
-| `app` | `./Dockerfile` | 10567→3000 | Main HTTP server + LLM agent |
-| `plugin-runner` | `./plugin-runner` | internal:3003 | Executes plugin scripts |
-| `coder` | `./coder` | internal:3002 | Runs `claude -p` for plugin authoring (optional, `coder` profile) |
-| `python-runner` | `./python-runner` | internal | Executes Python snippets |
-| `pg-backup` | `pgvector/pgvector:pg17` | — | Hourly pg_dump to `./data/db-backups` |
-| `signal-bridge` | `./signal-bridge` | internal:8081 | Signal protocol bridge (optional profile) |
+| Service | Image / Build | Port | Networks | Role |
+|---|---|---|---|---|
+| `postgres` | `pgvector/pgvector:pg17` | internal | `database` | Primary database (with pgvector extension) |
+| `app` | `./Dockerfile` | 10567→3000 | `default`, `database` | Main HTTP server + LLM agent |
+| `plugin-runner` | `./plugin-runner` | internal:3003 | `default` | Executes plugin scripts |
+| `coder` | `./coder` | internal:3002 | `default` | Runs `claude -p` for plugin authoring (optional, `coder` profile) |
+| `python-runner` | `./python-runner` | internal | `default` | Executes Python snippets |
+| `pg-backup` | `pgvector/pgvector:pg17` | — | `database` | Hourly pg_dump to `./data/db-backups` |
+| `signal-bridge` | `./signal-bridge` | internal:8081 | `default` | Signal protocol bridge (optional profile) |
+
+`postgres` is only on the `database` network, and only `app` and `pg-backup` join it.
+The containers that run untrusted code (`python-runner`, `plugin-runner`, `coder`) and
+`signal-bridge` are only on the default network, so they cannot resolve or connect to
+the database. `app` joins both networks, so it can still reach the runners by service
+name. The `database` network is `internal: true`, so it has no route to the internet;
+neither `postgres` nor `pg-backup` needs one.
 
 The app mounts `./data/main` read-write at `/app/config` so its configuration editor can
 update `config.toml`. `plugin-runner`, `coder`, `signal-bridge`, and `python-runner`
@@ -164,9 +171,10 @@ After seeding, the ID is cached in a module-level variable and exposed via
 `getMainAgentId()` (also in `src/database.ts`). All routing, permission checks, and
 user-facing strings use `getMainAgentId()` rather than the literal `1`. The only places
 the literal `1` appears are the seed INSERT itself (`src/database.ts`) and the baseline
-migration's `memories`/`scratchpad` `agent_id` backfill, which runs before `seedOwner()`
-and therefore cannot call `getMainAgentId()`. Because that migration may run on a database
-that has memory or scratchpad rows but no agents yet, it inserts the same main agent row
+migration's `memories`/`scratchpad`/`cron_entries` `agent_id` backfill, which runs
+before `seedOwner()` and therefore cannot call `getMainAgentId()`. Because that migration
+may run on a database that has memory, scratchpad, or cron rows but no agents yet, it
+inserts the same main agent row
 first (`ON CONFLICT (id) DO NOTHING`) so the backfill satisfies the foreign key; the
 `seedOwner()` upsert still sets the final values. Because explicit IDs do not advance the
 `agents.id` sequence, `seedOwner()` then calls `setval` to move the sequence to
@@ -189,6 +197,10 @@ Subagents never get `send_agent_message`, even if `allowed_tools` lists it. They
 to the main agent through their final text response (see "Subagent reports" below).
 `manage_knowledge` is always granted to every subagent in full, regardless of
 `allowed_tools`, so each agent can keep private memories and a scratchpad.
+`manage_cron` can be granted through `allowed_tools`; a subagent can then only create,
+list, update, and delete its own cron entries. Ownership is taken from the turn context,
+so passing `agent_id` is rejected for subagents. Only the main agent sees all entries and
+can create or reassign an entry for any agent.
 
 ### Subagent reports
 When a subagent turn ends successfully, `processQueue` (`src/queue.ts`) forwards the
@@ -392,6 +404,12 @@ Plugins live in `/plugins/<name>/` (shared volume between `plugin-runner` and `c
   (manifest defaults are stripped) and `set` is a boolean per key. Saving still goes
   through `POST /configure`, which accepts values and merges them server-side.
 - The Docker socket is never mounted into any container.
+- Only `app` and `pg-backup` join the `database` network, which is `internal: true`.
+  `postgres` is attached to that network alone, so the containers that run untrusted
+  code (`python-runner`, `plugin-runner`, `coder`) cannot resolve the `postgres` hostname
+  or open a connection to it, even though they share the default network with `app`.
+  `pg-backup` needs the database to dump it; nothing else that runs LLM-controlled code
+  does.
 
 ### Tool execution (sync)
 - `plugin-runner` receives `POST /bundles/<plugin>/tools/<tool>/run` with JSON body.
@@ -447,7 +465,7 @@ Plugins live in `/plugins/<name>/` (shared volume between `plugin-runner` and `c
 | `memories` | Per-agent always-injected knowledge (agent_id FK; short facts, full text in system prompt every turn) |
 | `compactions` | Summarised history snapshots (up_to_message_id boundary); only the latest row per agent is retained |
 | `scratchpad` | Per-agent on-demand knowledge (agent_id FK; title injected, body fetched on read via manage_knowledge) |
-| `cron_entries` | Scheduled entries (cron expression or one-shot fire_at) |
+| `cron_entries` | Per-agent scheduled entries (agent_id FK; cron expression or one-shot fire_at). Fired entries are routed to their owning agent. |
 | `pages` | LLM-authored pages (path, mimetype, data BYTEA, is_public, queries JSONB, mutations JSONB, version INTEGER); append-only versioning — each update inserts a new row; empty `data` is a tombstone |
 | `agents` | Subagent definitions (name, system_prompt, allowed_tools TEXT[], allowed_plugins TEXT[]) |
 | `interlocutors` | Contact records (display_name, owner bool, enabled bool, mentions_only bool, agent_id FK) |
@@ -666,10 +684,12 @@ to the endpoint (as `reasoning_effort` for `openai-completions`). It is ignored 
 | `"agent"` | Main agent to subagent message, or a forwarded subagent final response |
 | `"upload"` | File upload trigger |
 
-Internal sources (`cli`, `cron`, `coder`, `plugin:*`, `upload`) always route to the
-main agent. External sources (`signal`, `telegram`, `whatsapp`, `email`) go through
-allowlist + interlocutor lookup to determine the target agent. The Basic-authenticated
-`pebble-index` source routes directly to the main agent without those gates.
+Internal sources (`cli`, `cron`, `coder`, `plugin:*`, `upload`) route to the main agent
+by default. Cron entries carry an explicit target agent (the entry's owner), so a fired
+entry goes to that agent instead. External sources (`signal`, `telegram`, `whatsapp`,
+`email`) go through allowlist + interlocutor lookup to determine the target agent. The
+Basic-authenticated `pebble-index` source routes directly to the main agent without those
+gates.
 
 ---
 
